@@ -1,0 +1,256 @@
+const std = @import("std");
+const zul = @import("zul");
+const logz = @import("logz");
+const httpz = @import("httpz");
+const validate = @import("validate");
+
+const logdk = @import("../logdk.zig");
+
+const App = logdk.App;
+const Env = logdk.Env;
+
+const datasets = @import("datasets/_datasets.zig");
+
+// every request gets a request_id, any log message created from a request-specific
+// logger will include this id
+var request_counter: u32 = 0;
+
+pub fn init(allocator: std.mem.Allocator) !void {
+	 _ = allocator;
+	// const builder = try allocator.create(Validate.Builder);
+	// builder.* = try Validate.Builder.init(allocator);
+	// try datasets.init(builder);
+}
+
+pub fn start(app: *App, config: *const logdk.Config) !void {
+	const allocator = app.allocator;
+
+	// The dispatcher's job is to execute the action, it's essentially how we inject
+	// app-specific data into actions.
+	const dispatcher = &Dispatcher{
+		.app = app,
+		.log_request = config.log_http,
+	};
+
+	const http_config = config.http;
+	var server = try httpz.ServerCtx(*const Dispatcher, *Env).init(allocator, http_config, dispatcher);
+	defer server.deinit();
+
+	server.dispatcher(Dispatcher.dispatch);
+	server.notFound(routerNotFound);
+	server.errorHandler(errorHandler);
+
+	const router = server.router();
+
+	{
+		var routes = router.group("/api/1", .{});
+		datasets.routes(&routes);
+	}
+	router.getC("/metrics", metrics, .{.dispatcher = server.dispatchUndefined()});
+
+	logz.info().ctx("http.listen").fmt("listen", "http://{s}:{d}", .{server.config.address.?, server.config.port.?}).boolean("log_http", config.log_http).log();
+	// blocks
+	try server.listen();
+}
+
+const Dispatcher = struct {
+	app: *App,
+	log_request: bool = false,
+
+	pub fn dispatch(self: *const Dispatcher, action: httpz.Action(*Env), req: *httpz.Request, res: *httpz.Response) !void {
+		const start_time = std.time.milliTimestamp();
+
+		res.content_type = .JSON;
+
+		const request_id = @atomicRmw(u32, &request_counter, .Add, 1, .monotonic);
+		// every log message generated with env.logger will include this $rid
+		var logger = logz.logger().int("$rid", request_id).multiuse();
+
+		const app = self.app;
+
+		var env = Env{
+			.app = app,
+			.logger = logger,
+		};
+		defer env.deinit();
+
+		var code: i32 = 0;
+		var log_request = self.log_request;
+
+		action(&env, req, res) catch |err| switch (err) {
+			error.BrokenPipe, error.ConnectionResetByPeer => code = logdk.codes.CONNECTION_RESET,
+			error.InvalidJson => code = errors.InvalidJson.write(res),
+			error.Validation => {
+				code = logdk.codes.VALIDATION_ERROR;
+				res.status = 400;
+				try res.json(.{
+					.err = "validation error",
+					.code = code,
+					.validation = env._validator.?.errors(),
+				}, .{.emit_null_optional_fields = false});
+			},
+			else => {
+				code = logdk.codes.INTERNAL_SERVER_ERROR_CAUGHT;
+				const error_id = zul.UUID.v4().toHexAlloc(res.arena, .lower) catch "00000000-0000-0000-0000-000000000000";
+				res.status = 500;
+				res.header("Error-Id", error_id);
+				try res.json(.{
+					.code = code,
+					.error_id = error_id,
+					.err = "internal server error",
+				}, .{});
+
+				log_request = true;
+				_ = logger.stringSafe("error_id", error_id).err(err);
+			}
+		};
+
+		if (log_request) {
+			logger.
+				stringSafe("@l", "REQ").
+				stringSafe("method", @tagName(req.method)).
+				string("path", req.url.path).
+				int("status", res.status).
+				int("code", code).
+				int("ms", std.time.milliTimestamp() - start_time).
+				log();
+		}
+	}
+};
+
+// Helpers for validations
+pub const Validate = struct {
+	pub const Object = validate.Object(void);
+	pub const Builder = validate.Builder(void);
+};
+
+pub fn metrics(_: *Env, _: *httpz.Request, res: *httpz.Response) !void {
+	const writer = res.writer();
+	try httpz.writeMetrics(writer);
+	try logz.writeMetrics(writer);
+}
+
+// An application-related 404. The given method+path was valid. This could be
+// something like trying to request a non-existent package.
+pub fn notFound(res: *httpz.Response, comptime desc: []const u8) !void {
+	const body = std.fmt.comptimePrint("{{\"code\": {d}, \"err\": \"not found\", \"desc\": \"{s}\"}}", .{logdk.codes.NOT_FOUND, desc});
+	res.content_type = .JSON;
+	res.status = 404;
+	res.body = body;
+}
+
+// A routing-related 404 (as opposed to an application-specific one, like a
+// request for a non-existent package). This is passed to the httpz library
+// as a fallback route when no matching route is found.
+fn routerNotFound(_: *const Dispatcher, _: *httpz.Request, res: *httpz.Response) !void {
+	_ = errors.RouterNotFound.write(res);
+}
+
+// Dispatcher.dispatch handles any action-related errors (it executes the action
+// with a catch and handles all possibilities.) This is for an error that happens
+// outside of the action, either in the Dispatcher itself or in the underlying
+// httpz library. This should not happen.
+fn errorHandler(_: *const Dispatcher, req: *httpz.Request, res: *httpz.Response, err: anyerror) void {
+	const code = errors.ServerError.write(res);
+	logz.err().err(err).ctx("errorHandler").string("path", req.url.raw).int("code", code).log();
+}
+
+// pre-generated error messages
+pub const Error = struct {
+	code: i32,
+	status: u16,
+	body: []const u8,
+
+	fn init(status: u16, comptime code: i32, comptime message: []const u8) Error {
+		const body = std.fmt.comptimePrint("{{\"code\": {d}, \"err\": \"{s}\"}}", .{code, message});
+		return .{
+			.code = code,
+			.body = body,
+			.status = status,
+		};
+	}
+
+	pub fn write(self: Error, res: *httpz.Response) i32 {
+		res.status = self.status;
+		res.content_type = httpz.ContentType.JSON;
+		res.body = self.body;
+		return self.code;
+	}
+};
+
+// bunch of static errors that we can serialize at comptime
+pub const errors = struct {
+	const codes = logdk.codes;
+	pub const ServerError = Error.init(500, codes.INTERNAL_SERVER_ERROR_UNCAUGHT, "internal server error");
+	pub const RouterNotFound = Error.init(404, codes.ROUTER_NOT_FOUND, "not found");
+	pub const InvalidJson = Error.init(400, codes.INVALID_JSON, "invalid JSON");
+};
+
+const t = logdk.testing;
+test "dispatcher: handles action error" {
+	var tc = t.context(.{});
+	defer tc.deinit();
+
+	logz.setLevel(.None);
+	defer logz.setLevel(.Warn);
+
+	const dispatcher = testDispatcher(tc);
+	try dispatcher.dispatch(testErrorAction, tc.web.req, tc.web.res);
+	try tc.web.expectStatus(500);
+	try tc.web.expectJson(.{.code = 1});
+}
+
+test "dispatcher: dispatch to actions" {
+	var tc = t.context(.{});
+	defer tc.deinit();
+
+	tc.web.url("/test_1");
+
+	request_counter = 958589;
+	const dispatcher = testDispatcher(tc);
+	try dispatcher.dispatch(callableAction, tc.web.req, tc.web.res);
+	try tc.web.expectStatus(200);
+	try tc.web.expectJson(.{.url = "/test_1"});
+}
+
+test "web: Error.write" {
+	var tc = t.context(.{});
+	defer tc.deinit();
+
+	try t.expectEqual(2, errors.ServerError.write(tc.web.res));
+	try tc.web.expectStatus(500);
+	try tc.web.expectJson(.{.code = 2, .err = "internal server error"});
+}
+
+test "web: notFound" {
+	var tc = t.context(.{});
+	defer tc.deinit();
+
+	try notFound(tc.web.res, "no spice");
+	try tc.web.expectStatus(404);
+	try tc.web.expectJson(.{.code = 4, .err = "not found", .desc = "no spice"});
+}
+
+fn testDispatcher(tc: *t.Context) Dispatcher {
+	return .{
+		.app = tc.app,
+		.log_request = false,
+	};
+}
+
+fn testErrorAction(_: *Env, _: *httpz.Request, _: *httpz.Response) !void {
+	return error.Nope;
+}
+
+fn callableAction(env: *Env, req: *httpz.Request, res: *httpz.Response) !void {
+	var arr = std.ArrayList(u8).init(t.allocator);
+	defer arr.deinit();
+
+	if (std.mem.eql(u8, req.url.path, "/test_1")) {
+		try env.logger.logTo(arr.writer());
+		try t.expectEqual("@ts=9999999999999 $rid=958589\n", arr.items);
+	} else {
+		unreachable;
+	}
+	return res.json(.{.url = req.url.path}, .{});
+}
