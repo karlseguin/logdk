@@ -17,7 +17,7 @@ pub const DataSet = struct {
 	conn: *zuckdb.Conn,
 	insert_one: zuckdb.Stmt,
 	arena: *ArenaAllocator,
-	columns: std.StringHashMap(Column),
+	columns: []Column,
 
 	pub const Dispatcher = module.Dispatcher;
 
@@ -28,10 +28,12 @@ pub const DataSet = struct {
 		const allocator = arena.child_allocator;
 		arena.deinit();
 		allocator.destroy(arena);
+		allocator.destroy(self);
 	}
 
 	pub fn columnsFromEvent(allocator: Allocator, event: *const Event) ![]Column {
 		var columns = try allocator.alloc(Column, event.fields.len);
+		errdefer allocator.free(columns);
 
 		for (event.fields, event.values, 0..) |field, value, i| {
 			const event_type = std.meta.activeTag(value);
@@ -42,7 +44,6 @@ pub const DataSet = struct {
 
 			columns[i] = .{
 				.name = field,
-				.position = @intCast(i),
 				.is_list = event_type == .list,
 				.nullable = event_type == .null,
 				.data_type = column_type,
@@ -55,36 +56,29 @@ pub const DataSet = struct {
 	fn record(self: *DataSet, event: *Event) !void {
 		defer event.deinit();
 
-		var dataset_changed = false;
-
-		const columns = &self.columns;
 		const insert = &self.insert_one;
 		try insert.clearBindings();
 
-
-		for (event.fields, event.values) |field, value| {
-			if (columns.getPtr(field)) |column| {
-				const param_index = column.position;
-				switch (value) {
-					.list => unreachable, // TODO
-					.null => {
-						if (column.nullable == false) {
-							dataset_changed = true;
-						} else {
-							try insert.bindValue(param_index, null);
-						}
-					},
-					inline else => |scalar| {
-						const ct = compatibleDataType(column.data_type, value);
-						if (ct.target == column.data_type) {
-							try insert.bindValue(param_index, scalar);
-						} else {
-							dataset_changed = true;
-						}
-					},
-				}
-			} else {
-				dataset_changed = true;
+		var dataset_changed = false;
+		for (self.columns, 0..) |column, param_index| {
+			const value = event.get(column.name) orelse Event.Value{.null = {}};
+			switch (value) {
+				.list => unreachable, // TODO
+				.null => {
+					if (column.nullable == false) {
+						dataset_changed = true;
+					} else {
+						try insert.bindValue(param_index, null);
+					}
+				},
+				inline else => |scalar| {
+					const ct = compatibleDataType(column.data_type, value);
+					if (ct.target == column.data_type) {
+						try insert.bindValue(param_index, scalar);
+					} else {
+						dataset_changed = true;
+					}
+				},
 			}
 		}
 
@@ -101,7 +95,6 @@ const Column = struct {
 	nullable: bool,
 	is_list: bool,
 	data_type: DataType,
-	position: u16,
 
 	pub const DataType = enum {
 		tinyint,
@@ -434,28 +427,22 @@ fn dataSetFromRow(allocator: Allocator, row: anytype, conn: *zuckdb.Conn) !*Data
 
 	const name = try aa.dupe(u8, row.get([]const u8, 0));
 
-	const column_list = try std.json.parseFromSliceLeaky([]Column, aa, row.get([]const u8, 1), .{});
-	var column_lookup = std.StringHashMap(Column).init(aa);
-	try column_lookup.ensureUnusedCapacity(@intCast(column_list.len));
-	for (column_list) |column| {
-		column_lookup.putAssumeCapacity(column.name, column);
-	}
-
+	const columns = try std.json.parseFromSliceLeaky([]Column, aa, row.get([]const u8, 1), .{});
 	const insert_one = blk: {
 		var sb = zul.StringBuilder.init(allocator);
 		defer sb.deinit();
-		try generateInsertSQL(&sb, name, column_list);
+		try generateInsertSQL(&sb, name, columns);
 		break :blk conn.prepare(sb.string(), .{.auto_release = false}) catch |err| {
 			return logdk.dbErr("dataSetFromRow", err, conn, logz.err().string("sql", sb.string()));
 		};
 	};
 
-	const dataset = try aa.create(DataSet);
+	const dataset = try allocator.create(DataSet);
 	dataset.* = .{
 		.name = name,
 		.conn = conn,
 		.arena = arena,
-		.columns = column_lookup,
+		.columns = columns,
 		.insert_one = insert_one,
 	};
 	return dataset;
@@ -582,21 +569,21 @@ test "Column: writeDDL" {
 
 	{
 		buf.clearRetainingCapacity();
-		const c = Column{.name = "id", .nullable = false, .is_list = false, .data_type = .integer, .position = 0};
+		const c = Column{.name = "id", .nullable = false, .is_list = false, .data_type = .integer};
 		try c.writeDDL(buf.writer());
 		try t.expectEqual("\"id\" integer not null", buf.string());
 	}
 
 	{
 		buf.clearRetainingCapacity();
-		const c = Column{.name = "names", .nullable = true, .is_list = true, .data_type = .text, .position = 0};
+		const c = Column{.name = "names", .nullable = true, .is_list = true, .data_type = .text};
 		try c.writeDDL(buf.writer());
 		try t.expectEqual("\"names\" text[] null", buf.string());
 	}
 
 	{
 		buf.clearRetainingCapacity();
-		const c = Column{.name = "details", .nullable = false, .is_list = false, .data_type = .unknown, .position = 0};
+		const c = Column{.name = "details", .nullable = false, .is_list = false, .data_type = .unknown};
 		try c.writeDDL(buf.writer());
 		try t.expectEqual("\"details\" text not null", buf.string());
 	}
@@ -749,9 +736,9 @@ test "DataSet: columnsFromEvent" {
 	defer t.allocator.free(columns);
 
 	try t.expectEqual(5, columns.len);
-	try t.expectEqual(.{.name = "id", .is_list = false, .nullable = false, .data_type = .ubigint, .position = 0}, columns[0]);
-	try t.expectEqual(.{.name = "name", .is_list = false, .nullable = false, .data_type = .text, .position = 1}, columns[1]);
-	try t.expectEqual(.{.name = "details", .is_list = false, .nullable = false, .data_type = .json, .position = 2}, columns[2]);
+	try t.expectEqual(.{.name = "id", .is_list = false, .nullable = false, .data_type = .ubigint}, columns[0]);
+	try t.expectEqual(.{.name = "name", .is_list = false, .nullable = false, .data_type = .text}, columns[1]);
+	try t.expectEqual(.{.name = "details", .is_list = false, .nullable = false, .data_type = .json}, columns[2]);
 }
 
 test "DataSet: record simple" {
@@ -759,31 +746,45 @@ test "DataSet: record simple" {
 	defer tc.deinit();
 
 	const ds = try testDataSet(tc);
-	const event = try Event.parse(t.allocator,
-		\\ {
-		\\    "id": 393,
-		\\    "system": "catalog",
-		\\    "active": true,
-		\\    "record": 0.932,
-		\\    "category": null
-		\\ }
-	);
-	// record frees the event
-	try ds.record(event);
 
-	var row = (try ds.conn.row("select * from dataset_test", .{})).?;
-	defer row.deinit();
+	{
+		const event = try Event.parse(t.allocator, "{\"id\": 1, \"system\": \"catalog\", \"active\": true, \"record\": 0.932, \"category\": null}");
+		try ds.record(event);
 
-	// $id column
-	try t.expectEqual(1, row.get(i32, 0));
-	// $inserted
-	try t.expectDelta(std.time.microTimestamp(), row.get(i64, 1), 5000);
+		var row = (try ds.conn.row("select * from dataset_test where id =  1", .{})).?;
+		defer row.deinit();
 
-	try t.expectEqual(393, row.get(u16, 2));
-	try t.expectEqual("catalog", row.get([]const u8, 3));
-	try t.expectEqual(true, row.get(bool, 4));
-	try t.expectEqual(0.932, row.get(f64, 5));
-	try t.expectEqual(null, row.get(?[]u8, 6));
+		// $id column
+		try t.expectEqual(1, row.get(i32, 0));
+		// $inserted
+		try t.expectDelta(std.time.microTimestamp(), row.get(i64, 1), 5000);
+
+		try t.expectEqual(1, row.get(u16, 2));
+		try t.expectEqual("catalog", row.get([]const u8, 3));
+		try t.expectEqual(true, row.get(bool, 4));
+		try t.expectEqual(0.932, row.get(f64, 5));
+		try t.expectEqual(null, row.get(?[]u8, 6));
+	}
+
+	{
+		// infer null from missing event field
+		const event = try Event.parse(t.allocator, "{\"id\": 2, \"system\": \"other\", \"active\": false, \"record\": 4}");
+		try ds.record(event);
+
+		var row = (try ds.conn.row("select * from dataset_test where id =  2", .{})).?;
+		defer row.deinit();
+
+		// $id column
+		try t.expectEqual(2, row.get(i32, 0));
+		// $inserted
+		try t.expectDelta(std.time.microTimestamp(), row.get(i64, 1), 5000);
+
+		try t.expectEqual(2, row.get(u16, 2));
+		try t.expectEqual("other", row.get([]const u8, 3));
+		try t.expectEqual(false, row.get(bool, 4));
+		try t.expectEqual(4, row.get(f64, 5));
+		try t.expectEqual(null, row.get(?[]u8, 6));
+	}
 }
 
 // This is one of those things. It's hard to create a DataSet since it requires

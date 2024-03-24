@@ -12,6 +12,15 @@ pub const Event = struct {
 	fields: []const []const u8,
 	_arena: *std.heap.ArenaAllocator,
 
+	pub fn get(self: *const Event, needle: []const u8) ?Value {
+		for (self.fields, 0..) |field, i| {
+			if (std.mem.eql(u8, field, needle)) {
+				return self.values[i];
+			}
+		}
+		return null;
+	}
+
 	pub const DataType = enum {
 		tinyint,
 		smallint,
