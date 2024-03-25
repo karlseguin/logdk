@@ -80,13 +80,12 @@ pub const DataSet = struct {
 					}
 				},
 				inline else => |scalar| {
-					const ct = compatibleDataType(column.data_type, value);
-					if (ct.target == column.data_type) {
+					const target_type = compatibleDataType(column.data_type, value);
+					if (target_type == column.data_type) {
 						try insert.bindValue(param_index, scalar);
 					} else {
 						std.debug.assert(retry == false);
-						mutator.mutated = true;
-						// TODO:
+						try mutator.alterType(column, target_type);
 					}
 				},
 			}
@@ -119,6 +118,14 @@ pub const DataSet = struct {
 			const sql = try self.print("alter table \"{s}\" alter column \"{s}\" drop not null", .{self.dataset.name, column.name});
 			_ = try self.exec(sql, .{});
 			column.nullable = true;
+		}
+
+		fn alterType(self: *Mutator, column: *Column, target_type: Column.DataType) !void {
+			try self.begin();
+			std.debug.assert(target_type != .unknown);
+			const sql = try self.print("alter table \"{s}\" alter column \"{s}\" set type {s}", .{self.dataset.name, column.name, @tagName(target_type)});
+			_ = try self.exec(sql, .{});
+			column.data_type = target_type;
 		}
 
 		fn begin(self: *Mutator) !void {
@@ -249,7 +256,7 @@ fn columnTypeForEventList(list: []const Event.Value) Column.DataType {
 	const first = list[0];
 	var candidate = columnTypeFromEventScalar(std.meta.activeTag(first));
 	for (list[1..]) |value| {
-		candidate = compatibleDataType(candidate, value).target;
+		candidate = compatibleDataType(candidate, value);
 	}
 	return candidate;
 }
@@ -269,120 +276,120 @@ const TypeCompatibilityResult = struct {
 // could be holding values from 0-255. if max(column) <= 127, we could use a tinyint.
 // If max(column) >= 128, we have to use a smallint. This could be solved by
 // tracking (or fetching) max(column).
-fn compatibleDataType(column_type: Column.DataType, value: Event.Value) TypeCompatibilityResult {
+fn compatibleDataType(column_type: Column.DataType, value: Event.Value) Column.DataType {
 	switch (column_type) {
 		.bool => switch (value) {
-			.bool => return .{.target = .bool},
-			.json => return .{.target = .json},
+			.bool => return .bool,
+			.json => return .json,
 			.null, .list => unreachable,
-			else => return .{.target = .text},
+			else => return .text,
 		},
 		.tinyint => switch (value) {
-			.tinyint => return .{.target = .tinyint},
-			.smallint => return .{.target = .smallint},
-			.integer => return .{.target = .integer},
-			.bigint => return .{.target = .bigint},
-			.double => return .{.target = .double},
-			.utinyint => |v| return if (v <= 127) .{.target = .tinyint} else .{.target = .smallint},
-			.usmallint => |v| return if (v <= 32767) .{.target = .smallint} else .{.target = .integer},
-			.uinteger => |v| return if (v <= 2147483647) .{.target = .integer} else .{.target = .bigint},
-			.ubigint => |v| return if (v <= 9223372036854775807) .{.target = .bigint} else .{.target = .text},
-			.text, .bool => return .{.target = .text},
-			.json => return .{.target = .json},
+			.tinyint => return .tinyint,
+			.smallint => return .smallint,
+			.integer => return .integer,
+			.bigint => return .bigint,
+			.double => return .double,
+			.utinyint => |v| return if (v <= 127) .tinyint else .smallint,
+			.usmallint => |v| return if (v <= 32767) .smallint else .integer,
+			.uinteger => |v| return if (v <= 2147483647) .integer else .bigint,
+			.ubigint => |v| return if (v <= 9223372036854775807) .bigint else .text,
+			.text, .bool => return .text,
+			.json => return .json,
 			.null, .list => unreachable,
 		},
 		.utinyint => switch (value) {
-			.utinyint => return .{.target = .utinyint},
-			.usmallint => return .{.target = .usmallint},
-			.uinteger => return .{.target = .uinteger},
-			.ubigint => return .{.target = .ubigint},
-			.double => return .{.target = .double},
-			.tinyint, .smallint => return .{.target = .smallint},
-			.integer => return .{.target = .integer},
-			.bigint => return .{.target = .bigint},
-			.text, .bool => return .{.target = .text},
-			.json => return .{.target = .json},
+			.utinyint => return .utinyint,
+			.usmallint => return .usmallint,
+			.uinteger => return .uinteger,
+			.ubigint => return .ubigint,
+			.double => return .double,
+			.tinyint, .smallint => return .smallint,
+			.integer => return .integer,
+			.bigint => return .bigint,
+			.text, .bool => return .text,
+			.json => return .json,
 			.null, .list => unreachable,
 		},
 		.smallint => switch (value) {
-			.utinyint, .tinyint, .smallint => return .{.target = .smallint},
-			.integer => return .{.target = .integer},
-			.bigint => return .{.target = .bigint},
-			.double => return .{.target = .double},
-			.usmallint => |v| return if (v <= 32767) .{.target = .smallint} else .{.target = .integer},
-			.uinteger => |v| return if (v <= 2147483647) .{.target = .integer} else .{.target = .bigint},
-			.ubigint => |v| return if (v <= 9223372036854775807) .{.target = .bigint} else .{.target = .text},
-			.text, .bool => return .{.target = .text},
-			.json => return .{.target = .json},
+			.utinyint, .tinyint, .smallint => return .smallint,
+			.integer => return .integer,
+			.bigint => return .bigint,
+			.double => return .double,
+			.usmallint => |v| return if (v <= 32767) .smallint else .integer,
+			.uinteger => |v| return if (v <= 2147483647) .integer else .bigint,
+			.ubigint => |v| return if (v <= 9223372036854775807) .bigint else .text,
+			.text, .bool => return .text,
+			.json => return .json,
 			.null, .list => unreachable,
 		},
 		.usmallint => switch (value) {
-			.utinyint, .usmallint => return .{.target = .usmallint},
-			.uinteger => return .{.target = .uinteger},
-			.ubigint => return .{.target = .ubigint},
-			.double => return .{.target = .double},
-			.tinyint, .smallint, .integer => return .{.target = .integer},
-			.bigint => return .{.target = .bigint},
-			.text, .bool => return .{.target = .text},
-			.json => return .{.target = .json},
+			.utinyint, .usmallint => return .usmallint,
+			.uinteger => return .uinteger,
+			.ubigint => return .ubigint,
+			.double => return .double,
+			.tinyint, .smallint, .integer => return .integer,
+			.bigint => return .bigint,
+			.text, .bool => return .text,
+			.json => return .json,
 			.null, .list => unreachable,
 		},
 		.integer => switch (value) {
-			.utinyint, .tinyint, .smallint, .usmallint, .integer => return .{.target = .integer},
-			.bigint => return .{.target = .bigint},
-			.double => return .{.target = .double},
-			.uinteger => |v| return if (v <= 2147483647) .{.target = .integer} else .{.target = .bigint},
-			.ubigint => |v| return if (v <= 9223372036854775807) .{.target = .bigint} else .{.target = .text},
-			.text, .bool => return .{.target = .text},
-			.json => return .{.target = .json},
+			.utinyint, .tinyint, .smallint, .usmallint, .integer => return .integer,
+			.bigint => return .bigint,
+			.double => return .double,
+			.uinteger => |v| return if (v <= 2147483647) .integer else .bigint,
+			.ubigint => |v| return if (v <= 9223372036854775807) .bigint else .text,
+			.text, .bool => return .text,
+			.json => return .json,
 			.null, .list => unreachable,
 		},
 		.uinteger => switch (value) {
-			.utinyint, .usmallint, .uinteger => return .{.target = .uinteger},
-			.ubigint => return .{.target = .ubigint},
-			.double => return .{.target = .double},
-			.tinyint, .smallint, .integer, .bigint => return .{.target = .bigint},
-			.text, .bool => return .{.target = .text},
-			.json => return .{.target = .json},
+			.utinyint, .usmallint, .uinteger => return .uinteger,
+			.ubigint => return .ubigint,
+			.double => return .double,
+			.tinyint, .smallint, .integer, .bigint => return .bigint,
+			.text, .bool => return .text,
+			.json => return .json,
 			.null, .list => unreachable,
 		},
 		.bigint => switch (value) {
-			.utinyint, .tinyint, .smallint, .usmallint, .integer, .uinteger, .bigint => return .{.target = .bigint},
-			.double => return .{.target = .double},
-			.ubigint => |v| return if (v <= 9223372036854775807) .{.target = .bigint} else .{.target = .text},
-			.text, .bool => return .{.target = .text},
-			.json => return .{.target = .json},
+			.utinyint, .tinyint, .smallint, .usmallint, .integer, .uinteger, .bigint => return .bigint,
+			.double => return .double,
+			.ubigint => |v| return if (v <= 9223372036854775807) .bigint else .text,
+			.text, .bool => return .text,
+			.json => return .json,
 			.null, .list => unreachable,
 		},
 		.ubigint => switch (value) {
-			.utinyint, .usmallint, .uinteger, .ubigint => return .{.target = .ubigint},
-			.double => return .{.target = .double},
-			.tinyint, .smallint, .integer, .bigint => return .{.target = .bigint},
-			.text, .bool => return .{.target = .text},
-			.json => return .{.target = .json},
+			.utinyint, .usmallint, .uinteger, .ubigint => return .ubigint,
+			.double => return .double,
+			.tinyint, .smallint, .integer, .bigint => return .bigint,
+			.text, .bool => return .text,
+			.json => return .json,
 			.null, .list => unreachable,
 		},
 		.double => switch (value) {
-			.tinyint, .utinyint, .smallint, .usmallint, .integer, .uinteger, .bigint, .ubigint, .double => return .{.target = .double},
-			.text, .bool => return .{.target = .text},
-			.json => return .{.target = .json},
+			.tinyint, .utinyint, .smallint, .usmallint, .integer, .uinteger, .bigint, .ubigint, .double => return .double,
+			.text, .bool => return .text,
+			.json => return .json,
 			.null, .list => unreachable,
 		},
-		.text => return .{.target = .text},
-		.json => return .{.target = .json},
+		.text => return .text,
+		.json => return .json,
 		.unknown => switch (value) {
-			.tinyint => return .{.target = .tinyint},
-			.utinyint => return .{.target = .utinyint},
-			.smallint => return .{.target = .smallint},
-			.usmallint => return .{.target = .usmallint},
-			.integer => return .{.target = .integer},
-			.uinteger => return .{.target = .uinteger},
-			.bigint => return .{.target = .bigint},
-			.ubigint => return .{.target = .ubigint},
-			.double => return .{.target = .double},
-			.text => return .{.target = .text},
-			.bool => return .{.target = .bool},
-			.json => return .{.target = .json},
+			.tinyint => return .tinyint,
+			.utinyint => return .utinyint,
+			.smallint => return .smallint,
+			.usmallint => return .usmallint,
+			.integer => return .integer,
+			.uinteger => return .uinteger,
+			.bigint => return .bigint,
+			.ubigint => return .ubigint,
+			.double => return .double,
+			.text => return .text,
+			.bool => return .bool,
+			.json => return .json,
 			.null, .list => unreachable,
 		}
 	}
@@ -876,7 +883,7 @@ test "DataSet: record" {
 		const event = try Event.parse(t.allocator, "{\"id\": null, \"system\": null, \"active\": null, \"record\": null}");
 		try ds.record(event, false);
 
-		var row = (try ds.conn.row("select \"$id\", \"$inserted\", id, system, active, record, category from dataset_test where id is  null", .{})).?;
+		var row = (try ds.conn.row("select \"$id\", \"$inserted\", id, system, active, record, category from dataset_test where id is null", .{})).?;
 		defer row.deinit();
 
 		try t.expectEqual(3, row.get(i32, 0));
@@ -890,6 +897,23 @@ test "DataSet: record" {
 		for (ds.columns) |c| {
 			try t.expectEqual(true, c.nullable);
 		}
+	}
+
+	{
+		// alter type
+		const event = try Event.parse(t.allocator, "{\"id\": -1003843293448, \"system\": 43, \"active\": \"maybe\", \"record\": 229, \"category\": -2}");
+		try ds.record(event, false);
+
+		var row = (try ds.conn.row("select \"$id\", \"$inserted\", id, system, active, record, category from dataset_test where id = -1003843293448", .{})).?;
+		defer row.deinit();
+
+		try t.expectEqual(4, row.get(i32, 0));
+		try t.expectDelta(std.time.microTimestamp(), row.get(i64, 1), 5000);
+		try t.expectEqual(-1003843293448, row.get(i64, 2));
+		try t.expectEqual("43", row.get([]const u8, 3));
+		try t.expectEqual("maybe", row.get([]const u8, 4));
+		try t.expectEqual(229, row.get(f64, 5));
+		try t.expectEqual(-2, row.get(i8, 6));
 	}
 }
 
