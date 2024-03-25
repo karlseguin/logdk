@@ -328,8 +328,13 @@ test "App: createDataSet success" {
 		try t.expectEqual("metrics_1", ds.name);
 
 		try t.expectEqual(4, ds.columns.len);
-		try t.expectEqual(.{.name = "id", .nullable = false, .is_list = false, .data_type = .text}, ds.columns[0]);
-		try t.expectEqual(.{.name = "tags", .nullable = true, .is_list = false, .data_type = .unknown}, ds.columns[1]);
+
+		// The order is only semi-reliable. As long as the order here matches the order of the describe (tested
+		// a few lines down), we're happy. But, since our json parser parses the input in order and puts it
+		// into the map in that same order, the order _is_ predictable so long as the std.HashMap implementation
+		// doesn't change.
+		try t.expectEqual(.{.name = "tags", .nullable = true, .is_list = false, .data_type = .unknown}, ds.columns[0]);
+		try t.expectEqual(.{.name = "id", .nullable = false, .is_list = false, .data_type = .text}, ds.columns[1]);
 		try t.expectEqual(.{.name = "monitor", .nullable = false, .is_list = false, .data_type = .bool}, ds.columns[2]);
 		try t.expectEqual(.{.name = "flags", .nullable = false, .is_list = true, .data_type = .integer}, ds.columns[3]);
 	}
@@ -361,9 +366,9 @@ test "App: createDataSet success" {
 
 	{
 		const row = (try rows.next()).?;
-		try t.expectEqual("id", row.get([]u8, 0));  // name
+		try t.expectEqual("tags", row.get([]u8, 0));  // name
 		try t.expectEqual("VARCHAR", row.get([]u8, 1));  // type
-		try t.expectEqual("NO", row.get([]u8, 2));  // nullable
+		try t.expectEqual("YES", row.get([]u8, 2));  // nullable
 		try t.expectEqual(null, row.get(?[]u8, 3));  // key
 		try t.expectEqual(null, row.get(?[]u8, 4));  // default
 		try t.expectEqual(null, row.get(?[]u8, 5));  // extra
@@ -371,9 +376,9 @@ test "App: createDataSet success" {
 
 	{
 		const row = (try rows.next()).?;
-		try t.expectEqual("tags", row.get([]u8, 0));  // name
+		try t.expectEqual("id", row.get([]u8, 0));  // name
 		try t.expectEqual("VARCHAR", row.get([]u8, 1));  // type
-		try t.expectEqual("YES", row.get([]u8, 2));  // nullable
+		try t.expectEqual("NO", row.get([]u8, 2));  // nullable
 		try t.expectEqual(null, row.get(?[]u8, 3));  // key
 		try t.expectEqual(null, row.get(?[]u8, 4));  // default
 		try t.expectEqual(null, row.get(?[]u8, 5));  // extra

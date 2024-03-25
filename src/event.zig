@@ -8,17 +8,15 @@ const ParseOptions = json.ParseOptions;
 const MAX_FLATTEN_DEPTH = 3;
 
 pub const Event = struct {
-	values: []const Value,
-	fields: []const []const u8,
+	map: std.StringHashMapUnmanaged(Value),
 	_arena: *std.heap.ArenaAllocator,
 
-	pub fn get(self: *const Event, needle: []const u8) ?Value {
-		for (self.fields, 0..) |field, i| {
-			if (std.mem.eql(u8, field, needle)) {
-				return self.values[i];
-			}
-		}
-		return null;
+	pub fn get(self: *const Event, field: []const u8) ?Value {
+		return self.map.get(field);
+	}
+
+	pub fn fieldCount(self: *const Event) usize {
+		return @intCast(self.map.count());
 	}
 
 	pub const DataType = enum {
@@ -70,7 +68,8 @@ pub const Event = struct {
 		errdefer arena.deinit();
 
 		const aa = arena.allocator();
-		var scanner = json.Scanner.initCompleteInput(allocator, input);
+
+		var scanner = json.Scanner.initCompleteInput(aa, input);
 		defer scanner.deinit();
 
 		if (try scanner.next() != .object_begin) {
@@ -79,16 +78,14 @@ pub const Event = struct {
 
 		var parser = Parser{
 			.allocator = aa,
-			.values = std.ArrayList(Value).init(aa),
-			.fields = std.ArrayList([]const u8).init(aa),
+			.map = std.StringHashMapUnmanaged(Value){},
 		};
 
 		try parser.parseObject(aa, &scanner);
 		const event = try aa.create(Event);
 		event.* = .{
 			._arena = arena,
-			.values = parser.values.items,
-			.fields = parser.fields.items,
+			.map = parser.map,
 		};
 
 		return event;
@@ -99,19 +96,14 @@ const Parser = struct {
 	depth: usize = 0,
 	allocator: Allocator,
 	stack: [MAX_FLATTEN_DEPTH][]const u8 = undefined,
-	fields: std.ArrayList([]const u8),
-	values: std.ArrayList(Event.Value),
+	map: std.StringHashMapUnmanaged(Event.Value),
 
 	const Error = json.ParseError(json.Scanner);
 
 	fn add(self: *Parser, value: Event.Value) !void {
-		try self.values.append(value);
 		const depth = self.depth;
-		if (depth == 0) {
-			try self.fields.append(self.stack[0]);
-		} else {
-			try self.fields.append(try std.mem.join(self.allocator, ".", self.stack[0..depth+1]));
-		}
+		const field_name = if (depth == 0) self.stack[0] else try std.mem.join(self.allocator, ".", self.stack[0..depth+1]);
+		try self.map.put(self.allocator, field_name, value);
 	}
 
 	fn parseObject(self: *Parser, allocator: Allocator, scanner: *json.Scanner) Error!void {
@@ -294,7 +286,7 @@ test "Event: parse empty array" {
 test "Event: parse empty" {
 	const event = try Event.parse(t.allocator, "{}");
 	defer event.deinit();
-	try t.expectEqual(0, event.fields.len);
+	try t.expectEqual(0, event.fieldCount());
 }
 
 test "Event: parse simple" {
@@ -309,26 +301,10 @@ test "Event: parse simple" {
 	defer event.deinit();
 
 	try assertEvent(.{
-		.fields = &[_][]const u8{
-			"key_1", "another_key", "key_3", "key_4",
-			"a", "b", "c", "d", "e",   // ints
-			"f1", "f2", "f3", "f4"
-		},
-		.values = &[_]Event.Value{
-			.{.bool = true},
-			.{.bool = false},
-			.{.null = {}},
-			.{.text = "over 9000!!"},
-			.{.utinyint = 0},
-			.{.utinyint = 1},
-			.{.ubigint = 6999384751},
-			.{.tinyint = -1},
-			.{.integer = -867211},
-			.{.double = 0.0},
-			.{.double = -0.0},
-			.{.double = 99.33929191},
-			.{.double = -1.49E10},
-		},
+		.key_1 = Event.Value{.bool = true}, .another_key = Event.Value{.bool = false},
+		.key_3 = Event.Value{.null = {}}, .key_4 = Event.Value{.text = "over 9000!!"},
+		.a = Event.Value{.utinyint = 0}, .b = Event.Value{.utinyint = 1}, .c = Event.Value{.ubigint = 6999384751}, .d = Event.Value{.tinyint = -1}, .e = Event.Value{.integer = -867211}, // ints
+		.f1 = Event.Value{.double = 0.0}, .f2 = Event.Value{.double = -0.0}, .f3 = Event.Value{.double = 99.33929191}, .f4 = Event.Value{.double = -1.49E10}
 	}, event);
 }
 
@@ -348,18 +324,10 @@ test "Event: parse nesting" {
 	defer event.deinit();
 
 	try assertEvent(.{
-		.fields = &[_][]const u8{
-			"key_2.sub_1",
-			"key_2.sub_2",
-			"key_2.sub_3.other",
-			"key_2.sub_3.too_deep"
-		},
-		.values = &[_]Event.Value{
-			.{.bool = true},
-			.{.text = "hello"},
-			.{.usmallint = 12345},
-			.{.json =  "{  \"handle \":  1, \"x\": {\"even\": \"more\", \"ok\": true}}"},
-		},
+		.@"key_2.sub_1" = Event.Value{.bool = true},
+		.@"key_2.sub_2" = Event.Value{.text = "hello"},
+		.@"key_2.sub_3.other" = Event.Value{.usmallint = 12345},
+		.@"key_2.sub_3.too_deep" = Event.Value{.json =  "{  \"handle \":  1, \"x\": {\"even\": \"more\", \"ok\": true}}"},
 	}, event);
 }
 
@@ -367,47 +335,33 @@ test "Event: parse list" {
 	const event = try Event.parse(t.allocator, "{\"a\": [1, -9000], \"b\": {\"values\": [true, 56.78912, null, {\"abc\": \"123\"}]}}");
 	defer event.deinit();
 	try assertEvent(.{
-		.fields = &[_][]const u8{"a", "b.values"},
-		.values = &[_]Event.Value{
-			.{.list = &[_]Event.Value{.{.utinyint = 1}, .{.smallint = -9000}}},
-			.{.list = &[_]Event.Value{.{.bool = true}, .{.double = 56.78912}, .{.null = {}}, .{.json = "{\"abc\": \"123\"}"}}}
-		},
+		.a = Event.Value{.list = &[_]Event.Value{.{.utinyint = 1}, .{.smallint = -9000}}},
+		.@"b.values" = Event.Value{.list = &[_]Event.Value{.{.bool = true}, .{.double = 56.78912}, .{.null = {}}, .{.json = "{\"abc\": \"123\"}"}}},
 	}, event);
 }
 
 test "Event: parse nested list" {
 	const event = try Event.parse(t.allocator, "{\"a\": [1, [true, null, \"hi\"]]}");
 	defer event.deinit();
-	try assertEvent(.{
-		.fields = &[_][]const u8{"a"},
-		.values = &[_]Event.Value{.{.json = "[1, [true, null, \"hi\"]]"}},
-	}, event);
+	try assertEvent(.{.a = Event.Value{.json = "[1, [true, null, \"hi\"]]"}}, event);
 }
 
 test "Event: parse list simple" {
 	const event = try Event.parse(t.allocator, "{\"a\": [9999, -128]}");
 	defer event.deinit();
-	try assertEvent(.{
-		.fields = &[_][]const u8{"a"},
-		.values = &[_]Event.Value{
-			.{.list = &[_]Event.Value{.{.usmallint = 9999}, .{.tinyint = -128}}},
-		},
-	}, event);
+	try assertEvent(.{.a = Event.Value{.list = &[_]Event.Value{.{.usmallint = 9999}, .{.tinyint = -128}}}}, event);
 }
 
 test "Event: parse positive integer" {
 	const event = try Event.parse(t.allocator, "{\"pos\": [0, 1, 255, 256, 65535, 65536, 4294967295, 4294967296, 18446744073709551615]}");
 	defer event.deinit();
 	try assertEvent(.{
-		.fields = &[_][]const u8{"pos"},
-		.values = &[_]Event.Value{
-			.{.list = &[_]Event.Value{
-				.{.utinyint = 0}, .{.utinyint = 1}, .{.utinyint = 255},
-				.{.usmallint = 256}, .{.usmallint = 65535},
-				.{.uinteger = 65536}, .{.uinteger = 4294967295},
-				.{.ubigint = 4294967296}, .{.ubigint = 18446744073709551615}
-			}},
-		},
+		.pos = Event.Value{.list = &[_]Event.Value{
+			.{.utinyint = 0}, .{.utinyint = 1}, .{.utinyint = 255},
+			.{.usmallint = 256}, .{.usmallint = 65535},
+			.{.uinteger = 65536}, .{.uinteger = 4294967295},
+			.{.ubigint = 4294967296}, .{.ubigint = 18446744073709551615}
+		}}
 	}, event);
 }
 
@@ -415,15 +369,12 @@ test "Event: parse negative integer" {
 	const event = try Event.parse(t.allocator, "{\"neg\": [-0, -1, -128, -129, -32768 , -32769, -2147483648, -2147483649, -9223372036854775807, -9223372036854775808]}");
 	defer event.deinit();
 	try assertEvent(.{
-		.fields = &[_][]const u8{"neg"},
-		.values = &[_]Event.Value{
-			.{.list = &[_]Event.Value{
-				.{.double = -0.0}, .{.tinyint = -1}, .{.tinyint = -128},
-				.{.smallint = -129}, .{.smallint = -32768},
-				.{.integer = -32769}, .{.integer = -2147483648},
-				.{.bigint = -2147483649}, .{.bigint = -9223372036854775807}, .{.bigint = -9223372036854775808}
-			}},
-		},
+		.neg = Event.Value{.list = &[_]Event.Value{
+			.{.double = -0.0}, .{.tinyint = -1}, .{.tinyint = -128},
+			.{.smallint = -129}, .{.smallint = -32768},
+			.{.integer = -32769}, .{.integer = -2147483648},
+			.{.bigint = -2147483649}, .{.bigint = -9223372036854775807}, .{.bigint = -9223372036854775808}
+		}},
 	}, event);
 }
 
@@ -432,19 +383,18 @@ test "Event: parse integer overflow" {
 }
 
 fn assertEvent(expected: anytype, actual: *Event) !void {
-	try t.expectEqual(actual.fields.len, actual.values.len);
-	try t.expectEqual(expected.fields.len, actual.fields.len);
+	const fields = @typeInfo(@TypeOf(expected)).Struct.fields;
+	try t.expectEqual(fields.len, actual.fieldCount());
 
-	for (0..expected.fields.len) |i| {
-		try t.expectEqual(expected.fields[i], actual.fields[i]);
-		switch (expected.values[i]) {
+	inline for (fields) |f| {
+		const field_name = f.name;
+		switch (@field(expected, field_name)) {
 			.list => |expected_list| {
-				for (expected_list, actual.values[i].list) |expect_list_value, actual_list_value| {
+				for (expected_list, actual.map.get(field_name).?.list) |expect_list_value, actual_list_value| {
 					try t.expectEqual(expect_list_value, actual_list_value);
 				}
 			},
-			else => |ex| try t.expectEqual(ex, actual.values[i]),
+			else => |expected_value| try t.expectEqual(expected_value, actual.map.get(field_name).?),
 		}
-
 	}
 }

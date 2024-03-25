@@ -32,10 +32,13 @@ pub const DataSet = struct {
 	}
 
 	pub fn columnsFromEvent(allocator: Allocator, event: *const Event) ![]Column {
-		var columns = try allocator.alloc(Column, event.fields.len);
+		var columns = try allocator.alloc(Column, event.fieldCount());
 		errdefer allocator.free(columns);
 
-		for (event.fields, event.values, 0..) |field, value, i| {
+		var i: usize = 0;
+		var it = event.map.iterator();
+		while (it.next()) |kv| {
+			const value = kv.value_ptr.*;
 			const event_type = std.meta.activeTag(value);
 			const column_type = switch (value) {
 				.list => |list| columnTypeForEventList(list),
@@ -43,11 +46,12 @@ pub const DataSet = struct {
 			};
 
 			columns[i] = .{
-				.name = field,
+				.name = kv.key_ptr.*,
 				.is_list = event_type == .list,
 				.nullable = event_type == .null,
 				.data_type = column_type,
 			};
+			i += 1;
 		}
 
 		return columns;
@@ -718,27 +722,27 @@ test "columnTypeForEventList" {
 fn testColumnTypeEventList(comptime event_value: []const u8) Column.DataType {
 	const event = Event.parse(t.allocator, "{\"list\": [" ++ event_value ++ "]}") catch unreachable;
 	defer event.deinit();
-	return columnTypeForEventList(event.values[0].list);
+	return columnTypeForEventList(event.map.get("list").?.list);
 }
 
 test "DataSet: columnsFromEvent" {
-	const columns = try DataSet.columnsFromEvent(t.allocator, &.{
-		._arena = undefined,
-		.fields = &[_][]const u8{"id", "name", "details", "l1", "l2"},
-		.values = &[_]Event.Value{
-			.{.ubigint = 99999},
-			.{.text = "teg"},
-			.{.json =  "{\"handle \": 9001}"},
-			.{.list = &[_]Event.Value{.{.utinyint = 1}, .{.smallint = -9000}, .{.integer = 293000}}},
-			.{.list = &[_]Event.Value{.{.bool = true}, .{.integer = 123}}},
-		}
-	});
+	const event = try Event.parse(t.allocator,
+	  \\ {
+	  \\   "id": 99999, "name": "teg", "details": {"handle": 9001},
+	  \\   "l1": [1, -9000, 293000], "l2": [true, [123]]
+	  \\ }
+	);
+	defer event.deinit();
+
+	const columns = try DataSet.columnsFromEvent(t.allocator, event);
 	defer t.allocator.free(columns);
 
 	try t.expectEqual(5, columns.len);
-	try t.expectEqual(.{.name = "id", .is_list = false, .nullable = false, .data_type = .ubigint}, columns[0]);
-	try t.expectEqual(.{.name = "name", .is_list = false, .nullable = false, .data_type = .text}, columns[1]);
-	try t.expectEqual(.{.name = "details", .is_list = false, .nullable = false, .data_type = .json}, columns[2]);
+	try t.expectEqual(.{.name = "l2", .is_list = false, .nullable = false, .data_type = .json}, columns[0]);
+	try t.expectEqual(.{.name = "id", .is_list = false, .nullable = false, .data_type = .uinteger}, columns[1]);
+	try t.expectEqual(.{.name = "name", .is_list = false, .nullable = false, .data_type = .text}, columns[2]);
+	try t.expectEqual(.{.name = "l1", .is_list = true, .nullable = false, .data_type = .integer}, columns[3]);
+	try t.expectEqual(.{.name = "details.handle", .is_list = false, .nullable = false, .data_type = .usmallint}, columns[4]);
 }
 
 test "DataSet: record simple" {
@@ -751,14 +755,11 @@ test "DataSet: record simple" {
 		const event = try Event.parse(t.allocator, "{\"id\": 1, \"system\": \"catalog\", \"active\": true, \"record\": 0.932, \"category\": null}");
 		try ds.record(event);
 
-		var row = (try ds.conn.row("select * from dataset_test where id =  1", .{})).?;
+		var row = (try ds.conn.row("select \"$id\", \"$inserted\", id, system, active, record, category from dataset_test where id =  1", .{})).?;
 		defer row.deinit();
 
-		// $id column
 		try t.expectEqual(1, row.get(i32, 0));
-		// $inserted
 		try t.expectDelta(std.time.microTimestamp(), row.get(i64, 1), 5000);
-
 		try t.expectEqual(1, row.get(u16, 2));
 		try t.expectEqual("catalog", row.get([]const u8, 3));
 		try t.expectEqual(true, row.get(bool, 4));
@@ -771,14 +772,11 @@ test "DataSet: record simple" {
 		const event = try Event.parse(t.allocator, "{\"id\": 2, \"system\": \"other\", \"active\": false, \"record\": 4}");
 		try ds.record(event);
 
-		var row = (try ds.conn.row("select * from dataset_test where id =  2", .{})).?;
+		var row = (try ds.conn.row("select \"$id\", \"$inserted\", id, system, active, record, category from dataset_test where id =  2", .{})).?;
 		defer row.deinit();
 
-		// $id column
 		try t.expectEqual(2, row.get(i32, 0));
-		// $inserted
 		try t.expectDelta(std.time.microTimestamp(), row.get(i64, 1), 5000);
-
 		try t.expectEqual(2, row.get(u16, 2));
 		try t.expectEqual("other", row.get([]const u8, 3));
 		try t.expectEqual(false, row.get(bool, 4));
