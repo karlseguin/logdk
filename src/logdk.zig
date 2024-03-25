@@ -8,6 +8,8 @@ pub const DataSet = @import("dataset.zig").DataSet;
 
 pub const testing = @import("t.zig");
 
+pub const MAX_IDENTIFIER_LEN = 250;
+
 pub const codes = struct {
 	pub const CONNECTION_RESET = 0;
 	pub const INTERNAL_SERVER_ERROR_CAUGHT = 1;
@@ -41,11 +43,11 @@ pub const Validate = struct {
 			return error.Validation;
 		}
 
-		if (value.len > 250) {
+		if (value.len > MAX_IDENTIFIER_LEN) {
 			context.addInvalidField(.{
 				.field = field,
-				.err = "name cannot be longer than 250 characters",
 				.code = INVALID_IDENTIFIER_LEN,
+				.err = std.fmt.comptimePrint("name cannot be longer than {d} characters", .{MAX_IDENTIFIER_LEN}),
 			});
 			return error.Validation;
 		}
@@ -82,11 +84,11 @@ pub const Validate = struct {
 			return error.Validation;
 		}
 
-		if (name.len > 250) {
+		if (name.len > MAX_IDENTIFIER_LEN) {
 			context.addInvalidField(.{
 				.field = name,
-				.err = "column name cannot be longer than 250 characters",
 				.code = INVALID_IDENTIFIER_LEN,
+				.err = std.fmt.comptimePrint("column name cannot be longer than {d} characters", .{MAX_IDENTIFIER_LEN}),
 			});
 			return error.Validation;
 		}

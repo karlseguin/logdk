@@ -13,11 +13,12 @@ const ArenaAllocator = std.heap.ArenaAllocator;
 const module = @This();
 
 pub const DataSet = struct {
+	arena: *ArenaAllocator,
 	name: []const u8,
+	columns: []Column,
 	conn: *zuckdb.Conn,
 	insert_one: zuckdb.Stmt,
-	arena: *ArenaAllocator,
-	columns: []Column,
+	scrap: []u8,
 
 	pub const Dispatcher = module.Dispatcher;
 
@@ -57,20 +58,23 @@ pub const DataSet = struct {
 		return columns;
 	}
 
-	fn record(self: *DataSet, event: *Event) !void {
-		defer event.deinit();
+	fn record(self: *DataSet, event: *Event, retry: bool) !void {
+		defer if (retry == false) event.deinit();
 
 		const insert = &self.insert_one;
 		try insert.clearBindings();
 
-		var dataset_changed = false;
-		for (self.columns, 0..) |column, param_index| {
+		var mutator = Mutator{.dataset = self};
+		errdefer if (mutator.mutated) mutator.rollback();
+
+		for (self.columns, 0..) |*column, param_index| {
 			const value = event.get(column.name) orelse Event.Value{.null = {}};
 			switch (value) {
 				.list => unreachable, // TODO
 				.null => {
 					if (column.nullable == false) {
-						dataset_changed = true;
+						std.debug.assert(retry == false);
+						try mutator.nullable(column);
 					} else {
 						try insert.bindValue(param_index, null);
 					}
@@ -80,18 +84,100 @@ pub const DataSet = struct {
 					if (ct.target == column.data_type) {
 						try insert.bindValue(param_index, scalar);
 					} else {
-						dataset_changed = true;
+						std.debug.assert(retry == false);
+						mutator.mutated = true;
+						// TODO:
 					}
 				},
 			}
 		}
 
-		if (dataset_changed == false) {
+		if (mutator.mutated == false) {
 			const inserted = try insert.exec();
 			std.debug.assert(inserted == 1);
 			return;
 		}
+
+		if (retry) {
+			unreachable;
+		}
+
+		try mutator.finalize();
+
+		// We should be able to record this event now. We could slightly optimize
+		// this, because at this point the event should be insertable without any
+		// mutation. But it's easier to call this recursively.
+		return self.record(event, true);
 	}
+
+	const Mutator = struct {
+		mutated: bool = false,
+		dataset: *DataSet,
+
+		fn nullable(self: *Mutator, column: *Column) !void {
+			try self.begin();
+			const sql = try self.print("alter table \"{s}\" alter column \"{s}\" drop not null", .{self.dataset.name, column.name});
+			_ = try self.exec(sql, .{});
+			column.nullable = true;
+		}
+
+		fn begin(self: *Mutator) !void {
+			if (self.mutated) {
+				// mutation was already started from a previous field, nothing to do
+				return;
+			}
+
+			self.mutated = true;
+			_ = try self.exec("begin", .{});
+		}
+
+		fn print(self: *Mutator, comptime format: []const u8, args: anytype) ![]const u8 {
+			return std.fmt.bufPrint(self.dataset.scrap, format, args) catch |err| {
+				logz.err().ctx("Mutator.print").string("name", self.dataset.name).string("format", format).err(err).log();
+				return err;
+			};
+		}
+
+		fn exec(self: *Mutator, sql: []const u8, args: anytype) !usize {
+			const dataset = self.dataset;
+			return dataset.conn.exec(sql, args) catch |err| {
+				return logdk.dbErr("Mutator.exec", err, dataset.conn, logz.err().string("sql", sql));
+			};
+		}
+
+		fn rollback(self: *Mutator) void {
+			std.debug.assert(self.mutated);
+			_ = self.exec("rollback", .{}) catch {};
+		}
+
+		// This function is a bit much. First, the above methods mutated the dataset's columns.
+		// These changes now need to be saved in logdk.datasets. Second, we need to commit
+		// all the DDLs we did, as well as the logdk.datasets update. Finally, we have
+		// to destroy our existing prepared statement and re-create it (this might not be
+		// needed for all mutations, I'm not sure, but we do it all the time for now).s
+		fn finalize(self: *Mutator) !void {
+			std.debug.assert(self.mutated);
+
+			var dataset = self.dataset;
+
+			// This is bad. This is our app.allocator GPA, but what an awful way to get it
+			const allocator = dataset.arena.child_allocator;
+			const serialized_columns = try std.json.stringifyAlloc(allocator, dataset.columns, .{});
+			defer allocator.free(serialized_columns);
+
+			const n = try self.exec("update logdk.datasets set columns = $2 where name = $1", .{dataset.name, serialized_columns});
+			std.debug.assert(n == 1);
+
+			_ = try self.exec("commit", .{});
+
+			const insert_one = try generateInsertOnePrepared(allocator, dataset.conn, dataset.name, dataset.columns);
+
+			// safe to delete our existing one now
+			dataset.insert_one.deinit();
+
+			dataset.insert_one = insert_one;
+		}
+	};
 };
 
 const Column = struct {
@@ -411,7 +497,7 @@ pub const Dispatcher = struct {
 					.stop => return,
 					.event => |event| {
 						var ds = msg.dataset.?;
-					ds.record(event) catch |err| logdk.dbErr("DataSet.record.event", err, ds.conn, logz.err().string("name", ds.name)) catch {};
+						ds.record(event, false) catch |err| logdk.dbErr("DataSet.record.event", err, ds.conn, logz.err().string("name", ds.name)) catch {};
 					}
 				}
 			}
@@ -432,14 +518,7 @@ fn dataSetFromRow(allocator: Allocator, row: anytype, conn: *zuckdb.Conn) !*Data
 	const name = try aa.dupe(u8, row.get([]const u8, 0));
 
 	const columns = try std.json.parseFromSliceLeaky([]Column, aa, row.get([]const u8, 1), .{});
-	const insert_one = blk: {
-		var sb = zul.StringBuilder.init(allocator);
-		defer sb.deinit();
-		try generateInsertSQL(&sb, name, columns);
-		break :blk conn.prepare(sb.string(), .{.auto_release = false}) catch |err| {
-			return logdk.dbErr("dataSetFromRow", err, conn, logz.err().string("sql", sb.string()));
-		};
-	};
+	const insert_one = try generateInsertOnePrepared(allocator, conn, name, columns);
 
 	const dataset = try allocator.create(DataSet);
 	dataset.* = .{
@@ -448,11 +527,15 @@ fn dataSetFromRow(allocator: Allocator, row: anytype, conn: *zuckdb.Conn) !*Data
 		.arena = arena,
 		.columns = columns,
 		.insert_one = insert_one,
+		.scrap = try aa.alloc(u8, logdk.MAX_IDENTIFIER_LEN * 2 + 512), // more than enough for an alter table T alter column C ...
 	};
 	return dataset;
 }
 
-fn generateInsertSQL(sb: *zul.StringBuilder, name: []const u8, columns: []Column) !void {
+fn generateInsertOnePrepared(allocator: Allocator, conn: *zuckdb.Conn, name: []const u8, columns: []Column) !zuckdb.Stmt {
+	var sb = zul.StringBuilder.init(allocator);
+	defer sb.deinit();
+
 	try sb.write("insert into ");
 	try sb.write(name);
 	try sb.write(" (");
@@ -472,6 +555,10 @@ fn generateInsertSQL(sb: *zul.StringBuilder, name: []const u8, columns: []Column
 	// strip out the trailing comma + space
 	sb.truncate(2);
 	try sb.writeByte(')');
+
+	return conn.prepare(sb.string(), .{.auto_release = false}) catch |err| {
+		return logdk.dbErr("dataSetFromRow", err, conn, logz.err().string("sql", sb.string()));
+	};
 }
 
 const Message = struct {
@@ -745,7 +832,7 @@ test "DataSet: columnsFromEvent" {
 	try t.expectEqual(.{.name = "details.handle", .is_list = false, .nullable = false, .data_type = .usmallint}, columns[4]);
 }
 
-test "DataSet: record simple" {
+test "DataSet: record" {
 	var tc = t.context(.{});
 	defer tc.deinit();
 
@@ -753,7 +840,7 @@ test "DataSet: record simple" {
 
 	{
 		const event = try Event.parse(t.allocator, "{\"id\": 1, \"system\": \"catalog\", \"active\": true, \"record\": 0.932, \"category\": null}");
-		try ds.record(event);
+		try ds.record(event, false);
 
 		var row = (try ds.conn.row("select \"$id\", \"$inserted\", id, system, active, record, category from dataset_test where id =  1", .{})).?;
 		defer row.deinit();
@@ -770,7 +857,7 @@ test "DataSet: record simple" {
 	{
 		// infer null from missing event field
 		const event = try Event.parse(t.allocator, "{\"id\": 2, \"system\": \"other\", \"active\": false, \"record\": 4}");
-		try ds.record(event);
+		try ds.record(event, false);
 
 		var row = (try ds.conn.row("select \"$id\", \"$inserted\", id, system, active, record, category from dataset_test where id =  2", .{})).?;
 		defer row.deinit();
@@ -782,6 +869,27 @@ test "DataSet: record simple" {
 		try t.expectEqual(false, row.get(bool, 4));
 		try t.expectEqual(4, row.get(f64, 5));
 		try t.expectEqual(null, row.get(?[]u8, 6));
+	}
+
+	{
+		// makes a column nullable
+		const event = try Event.parse(t.allocator, "{\"id\": null, \"system\": null, \"active\": null, \"record\": null}");
+		try ds.record(event, false);
+
+		var row = (try ds.conn.row("select \"$id\", \"$inserted\", id, system, active, record, category from dataset_test where id is  null", .{})).?;
+		defer row.deinit();
+
+		try t.expectEqual(3, row.get(i32, 0));
+		try t.expectDelta(std.time.microTimestamp(), row.get(i64, 1), 5000);
+		try t.expectEqual(null, row.get(?u16, 2));
+		try t.expectEqual(null, row.get(?[]const u8, 3));
+		try t.expectEqual(null, row.get(?bool, 4));
+		try t.expectEqual(null, row.get(?f64, 5));
+		try t.expectEqual(null, row.get(?[]u8, 6));
+
+		for (ds.columns) |c| {
+			try t.expectEqual(true, c.nullable);
+		}
 	}
 }
 
