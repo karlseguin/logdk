@@ -172,6 +172,18 @@ pub const DataSet = struct {
 		_ = try self.exec("begin", .{});
 		errdefer _ = self.exec("rollback", .{}) catch {};
 
+		const original_column_count = self.columns.items.len;
+
+		var columns_added = false;
+		errdefer if (columns_added) {
+			// We need to revere potential changes we made to our columns and columnsLookup
+			self.columns.shrinkRetainingCapacity(original_column_count);
+			self.columnLookup.clearRetainingCapacity();
+			for (self.columns.items) |*c| {
+				self.columnLookup.putAssumeCapacity(c.name, {});
+			}
+		};
+
 		var used_fields = used_fields_;
 
 		// this is null if the only change is column addition. At this point, we don't
@@ -192,18 +204,9 @@ pub const DataSet = struct {
 			}
 		}
 
-		if (used_fields != event.fieldCount()) {
-			const original_column_count = self.columns.items.len;
-			errdefer {
-				// if anything here fails, it's a pain since we've alrady mutated
-				// self.columns and self.columnLookup. We need to revert those to
-				// their original state.
-				self.columns.shrinkRetainingCapacity(original_column_count);
-				self.columnLookup.clearRetainingCapacity();
-				for (self.columns.items) |*c| {
-					self.columnLookup.putAssumeCapacity(c.name, {});
-				}
-			}
+		const new_column_count = event.fieldCount() - used_fields;
+		if (new_column_count > 0) {
+			columns_added = true;
 
 			var buffer = &self.buffer;
 			buffer.clearRetainingCapacity();
@@ -213,6 +216,8 @@ pub const DataSet = struct {
 			try buffer.write(self.name);
 			try buffer.write("\" add column ");
 			const buffer_pos = buffer.len();
+
+			var added: usize = 0;
 
 			const aa = self.arena.allocator();
 			var it = event.map.iterator();
@@ -234,9 +239,16 @@ pub const DataSet = struct {
 				_ = try self.exec(buffer.string(), .{});
 				try self.columns.append(column);
 				try self.columnLookup.put(aa, column.name, {});
+
+				added += 1;
+				if (added == new_column_count) {
+					// optimization, we know there are `new_column_count` columns to add
+					// and once we've added that number, we can stop iterating through
+					// events
+					break;
+				}
 			}
 		}
-
 
 		// This is bad. This is our app.allocator GPA, but what an awful way to get it
 		const allocator = self.arena.child_allocator;
