@@ -8,6 +8,22 @@ const ParseOptions = json.ParseOptions;
 const MAX_FLATTEN_DEPTH = 3;
 
 pub const Event = struct {
+	// // This is part of detecting whether our Event has new fields that need to
+	// // be added as columns to our DataSet. Essentially, DataSet.record "consumes"
+	// // fields based on its []Columns. If at the end of that,
+	// //   event.consumed < event.map.count()
+	// // then we know we have new fields in Event. We don't know _which_ field is
+	// // new, we just know there's `event.map.count() - event.consumed` new fields.
+	// // I know, you're thinking, why not just delete the fields from map when we
+	// // consume them? Then we'd know which are the new fields! The issue is with how
+	// // DataSet.record is implemented, and how it's optimized for the common case
+	// // where the event can be inserted as-is, without altering the dataset.
+	// // DataSet.record might need to re-bind the prepared statement twice. The first
+	// // time is the optimized case where it assumes there's no modification to make
+	// // But if we do have to make a modification, then we need to re-create and
+	// // re-bind the prepared statement. Which means, we can't start deleting fields.
+	// consumed: usize,
+
 	map: std.StringHashMapUnmanaged(Value),
 	_arena: *std.heap.ArenaAllocator,
 

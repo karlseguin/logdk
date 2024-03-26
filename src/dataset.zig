@@ -13,12 +13,32 @@ const ArenaAllocator = std.heap.ArenaAllocator;
 const module = @This();
 
 pub const DataSet = struct {
+	// misc scrap, currently used to generate alter table T alter column C DDLs as needed
+	buffer: zul.StringBuilder,
+
+	// This entire DataSet is contained in this arena. After initialization, it will
+	// keep growing if new columns are added, but that should be pretty minor.
 	arena: *ArenaAllocator,
+
+	// The name of the dataset, this is the name of the table.
 	name: []const u8,
-	columns: []Column,
+
+	// The DataSet is a pseudo Actor. Its main methods always run on the same
+	// threads. This makes _everything_ so much easier. It also means all the
+	// datasets running on 1 thread can share a connection. This makes prepared
+	// statements easy to manage.
 	conn: *zuckdb.Conn,
+
+	// Our prepared statement for inserting 1 row.
 	insert_one: zuckdb.Stmt,
-	scrap: []u8,
+
+	// The columns. In an ArrayList because we might have to add columns, and
+	// that makes everything easier.
+	columns: std.ArrayList(Column),
+
+	// Used when seeing what column we need to add, key is owned by the Column
+	// in the columns array.
+	columnLookup: std.StringHashMapUnmanaged(void),
 
 	pub const Dispatcher = module.Dispatcher;
 
@@ -39,152 +59,233 @@ pub const DataSet = struct {
 		var i: usize = 0;
 		var it = event.map.iterator();
 		while (it.next()) |kv| {
-			const value = kv.value_ptr.*;
-			const event_type = std.meta.activeTag(value);
-			const column_type = switch (value) {
-				.list => |list| columnTypeForEventList(list),
-				else => columnTypeFromEventScalar(event_type),
-			};
-
-			columns[i] = .{
-				.name = kv.key_ptr.*,
-				.is_list = event_type == .list,
-				.nullable = event_type == .null,
-				.data_type = column_type,
-			};
+			columns[i] = Column.fromEventValue(kv.key_ptr.*, kv.value_ptr.*);
 			i += 1;
 		}
 
 		return columns;
 	}
 
-	fn record(self: *DataSet, event: *Event, retry: bool) !void {
-		defer if (retry == false) event.deinit();
+	// This is part of the hot path. It should be optimized in the future to
+	// do bulk-inserts (via a multi-values prepared statement) and possibly using
+	// duckdb's appender if the C api ever solves a number of issues (no support for
+	// defaults or complex types).
+	// What makes this code complicated is that we might need to alter the dataset
+	// and thus the underlying table. We might need to make a column nullable, or
+	// change its type, or add a column.
+	// But, because this is the hot path and because we expect most events not
+	// to require any alterations, it's written in a way that assumes that the
+	// event can be inserted as-is. We don't loop through the event first to
+	// detect if there's a alteration. Instead, we start to bind our prepare
+	// statement, and if, in doing so, we need to alter, things get a bit messy.
+	// One issue with altering is that we need to re-prepare our insert statement
+	// so it pretty much resets everything. Also, detecting new columns (fields in
+	// event that aren't a known column) is particularly inefficient, but again
+	// something we don't expect to have to do often.
+	fn record(self: *DataSet, event: *Event) !void {
+		defer event.deinit();
 
-		const insert = &self.insert_one;
+		var insert = &self.insert_one;
 		try insert.clearBindings();
 
-		var mutator = Mutator{.dataset = self};
-		errdefer if (mutator.mutated) mutator.rollback();
 
-		for (self.columns, 0..) |*column, param_index| {
-			const value = event.get(column.name) orelse Event.Value{.null = {}};
-			switch (value) {
-				.list => unreachable, // TODO
-				.null => {
-					if (column.nullable == false) {
-						std.debug.assert(retry == false);
-						try mutator.nullable(column);
-					} else {
+		// first_pass is an attempt to bind the event values to our prepared
+		// statement as-is. This is the optimized case where we don't need to
+		// alter the dataset and underlying table. If we succeed, we'll return
+		// at the end of first_pass and are done.
+		// If we do detect the need for an alteration, we switch to a slow-path.
+		// Specifically, we'll apply any alternation needed, then break out of
+		// first_pass, and execute our second pass (which should be guaranteed to
+		// work since all necessary alterations should have been applied)
+		first_pass: {
+			// Used to track if we've used up all of the events fields. If we haven't
+			// then we had new columns to add.
+			var used_fields: usize = 0;
+
+			for (self.columns.items, 0..) |*column, param_index| {
+				const value = if (event.get(column.name)) |value| blk: {
+					used_fields += 1;
+					break :blk value;
+				} else blk: {
+					break :blk Event.Value{.null = {}};
+				};
+
+				switch (value) {
+					.list => unreachable, // TODO
+					.null => {
+						if (column.nullable == false) {
+							try self.alter(param_index, value, event, used_fields);
+							break :first_pass;
+						}
 						try insert.bindValue(param_index, null);
-					}
-				},
-				inline else => |scalar| {
-					const target_type = compatibleDataType(column.data_type, value);
-					if (target_type == column.data_type) {
+					},
+					inline else => |scalar| {
+						const target_type = compatibleDataType(column.data_type, value);
+						if (target_type != column.data_type) {
+							try self.alter(param_index, value, event, used_fields);
+							break :first_pass;
+						}
 						try insert.bindValue(param_index, scalar);
-					} else {
-						std.debug.assert(retry == false);
-						try mutator.alterType(column, target_type);
-					}
-				},
+					},
+				}
 			}
-		}
 
-		if (mutator.mutated == false) {
+			if (used_fields < event.fieldCount()) {
+				try self.alter(self.columns.items.len, null, event, used_fields);
+				break: first_pass;
+			}
+
+			// If we made it all the way here, then the event fit into our dataset
+			// as-is (without any alternation) and thus we can finish our insert)
 			const inserted = try insert.exec();
 			std.debug.assert(inserted == 1);
 			return;
 		}
 
-		if (retry) {
-			unreachable;
+		// We can only be here because first_pass made alterations to the dataset
+		// and underlying table. This also means our insert_one prepared statement
+		// was re-generated. At this point, it should be possible to insert our
+		// event as-is, using the new prepared statement.
+
+		insert = &self.insert_one;
+		try insert.clearBindings();
+		for (self.columns.items, 0..) |*column, param_index| {
+			const value = event.get(column.name) orelse Event.Value{.null = {}};
+			switch (value) {
+				.list => unreachable, // TODO
+				.null => {
+					std.debug.assert(column.nullable);
+					try insert.bindValue(param_index, null);
+				},
+				inline else => |scalar| {
+					std.debug.assert(compatibleDataType(column.data_type, value) == column.data_type);
+					try insert.bindValue(param_index, scalar);
+				},
+			}
 		}
 
-		try mutator.finalize();
-
-		// We should be able to record this event now. We could slightly optimize
-		// this, because at this point the event should be insertable without any
-		// mutation. But it's easier to call this recursively.
-		return self.record(event, true);
+		const inserted = try insert.exec();
+		std.debug.assert(inserted == 1);
 	}
 
-	const Mutator = struct {
-		mutated: bool = false,
-		dataset: *DataSet,
+	fn alter(self: *DataSet, start_index: usize, value_: ?Event.Value, event: *const Event, used_fields_: usize) !void {
+		_ = try self.exec("begin", .{});
+		errdefer _ = self.exec("rollback", .{}) catch {};
 
-		fn nullable(self: *Mutator, column: *Column) !void {
-			try self.begin();
-			const sql = try self.print("alter table \"{s}\" alter column \"{s}\" drop not null", .{self.dataset.name, column.name});
-			_ = try self.exec(sql, .{});
-			column.nullable = true;
+		var used_fields = used_fields_;
+
+		// this is null if the only change is column addition. At this point, we don't
+		// know what columns to add, but we know there's at least 1.
+		if (value_) |value| {
+			// we know this column/value mismatch since that's what triggered entering
+			// this alter function.
+			try self.alterColumn(&self.columns.items[start_index], value);
+
+			for (self.columns.items[start_index+1..]) |*column| {
+				const v = if (event.get(column.name)) |v| blk: {
+					used_fields += 1;
+					break :blk v;
+				} else blk: {
+					break :blk Event.Value{.null = {}};
+				};
+				try self.alterColumn(column, v);
+			}
 		}
 
-		fn alterType(self: *Mutator, column: *Column, target_type: Column.DataType) !void {
-			try self.begin();
-			std.debug.assert(target_type != .unknown);
-			const sql = try self.print("alter table \"{s}\" alter column \"{s}\" set type {s}", .{self.dataset.name, column.name, @tagName(target_type)});
-			_ = try self.exec(sql, .{});
-			column.data_type = target_type;
-		}
-
-		fn begin(self: *Mutator) !void {
-			if (self.mutated) {
-				// mutation was already started from a previous field, nothing to do
-				return;
+		if (used_fields != event.fieldCount()) {
+			const original_column_count = self.columns.items.len;
+			errdefer {
+				// if anything here fails, it's a pain since we've alrady mutated
+				// self.columns and self.columnLookup. We need to revert those to
+				// their original state.
+				self.columns.shrinkRetainingCapacity(original_column_count);
+				self.columnLookup.clearRetainingCapacity();
+				for (self.columns.items) |*c| {
+					self.columnLookup.putAssumeCapacity(c.name, {});
+				}
 			}
 
-			self.mutated = true;
-			_ = try self.exec("begin", .{});
+			var buffer = &self.buffer;
+			buffer.clearRetainingCapacity();
+
+			// this is shared by all columns being added
+			try buffer.write("alter table \"");
+			try buffer.write(self.name);
+			try buffer.write("\" add column ");
+			const buffer_pos = buffer.len();
+
+			const aa = self.arena.allocator();
+			var it = event.map.iterator();
+			while (it.next()) |kv| {
+				if (self.columnLookup.contains(kv.key_ptr.*)) {
+					// we already know this field/column
+					continue;
+				}
+
+				var column = Column.fromEventValue(kv.key_ptr.*, kv.value_ptr.*);
+
+				// a column added after initial creation is always nullable, since
+				// existing events won't have a value.
+				column.nullable = true;
+
+				buffer.pos = buffer_pos;
+				try column.writeDDL(buffer.writer());
+
+				_ = try self.exec(buffer.string(), .{});
+				try self.columns.append(column);
+				try self.columnLookup.put(aa, column.name, {});
+			}
 		}
 
-		fn print(self: *Mutator, comptime format: []const u8, args: anytype) ![]const u8 {
-			return std.fmt.bufPrint(self.dataset.scrap, format, args) catch |err| {
-				logz.err().ctx("Mutator.print").string("name", self.dataset.name).string("format", format).err(err).log();
-				return err;
-			};
+
+		// This is bad. This is our app.allocator GPA, but what an awful way to get it
+		const allocator = self.arena.child_allocator;
+		const serialized_columns = try std.json.stringifyAlloc(allocator, self.columns.items, .{});
+		defer allocator.free(serialized_columns);
+
+		const n = try self.exec("update logdk.datasets set columns = $2 where name = $1", .{self.name, serialized_columns});
+		std.debug.assert(n == 1);
+
+		_ = try self.exec("commit", .{});
+
+		const insert_one = try generateInsertOnePrepared(allocator, self.conn, self.name, self.columns.items);
+		// safe to delete our existing one now
+		self.insert_one.deinit();
+		self.insert_one = insert_one;
+	}
+
+	fn alterColumn(self: *DataSet, column: *Column, value: Event.Value) !void {
+		switch (value) {
+			.list => unreachable, // TODO
+			.null => if (column.nullable == false) {
+				_ = try self.execFmt("alter table \"{s}\" alter column \"{s}\" drop not null", .{self.name, column.name}, .{});
+				column.nullable = true;
+			},
+			else => {
+				const target_type = compatibleDataType(column.data_type, value);
+				if (target_type != column.data_type) {
+					_ = try self.execFmt("alter table \"{s}\" alter column \"{s}\" set type {s}", .{self.name, column.name, @tagName(target_type)}, .{});
+					column.data_type = target_type;
+				}
+			},
 		}
+	}
 
-		fn exec(self: *Mutator, sql: []const u8, args: anytype) !usize {
-			const dataset = self.dataset;
-			return dataset.conn.exec(sql, args) catch |err| {
-				return logdk.dbErr("Mutator.exec", err, dataset.conn, logz.err().string("sql", sql));
-			};
-		}
+	fn exec(self: *DataSet, sql: []const u8, args: anytype) !usize {
+		return self.conn.exec(sql, args) catch |err| {
+			return logdk.dbErr("DataSet.exec", err, self.conn, logz.err().string("sql", sql));
+		};
+	}
 
-		fn rollback(self: *Mutator) void {
-			std.debug.assert(self.mutated);
-			_ = self.exec("rollback", .{}) catch {};
-		}
-
-		// This function is a bit much. First, the above methods mutated the dataset's columns.
-		// These changes now need to be saved in logdk.datasets. Second, we need to commit
-		// all the DDLs we did, as well as the logdk.datasets update. Finally, we have
-		// to destroy our existing prepared statement and re-create it (this might not be
-		// needed for all mutations, I'm not sure, but we do it all the time for now).s
-		fn finalize(self: *Mutator) !void {
-			std.debug.assert(self.mutated);
-
-			var dataset = self.dataset;
-
-			// This is bad. This is our app.allocator GPA, but what an awful way to get it
-			const allocator = dataset.arena.child_allocator;
-			const serialized_columns = try std.json.stringifyAlloc(allocator, dataset.columns, .{});
-			defer allocator.free(serialized_columns);
-
-			const n = try self.exec("update logdk.datasets set columns = $2 where name = $1", .{dataset.name, serialized_columns});
-			std.debug.assert(n == 1);
-
-			_ = try self.exec("commit", .{});
-
-			const insert_one = try generateInsertOnePrepared(allocator, dataset.conn, dataset.name, dataset.columns);
-
-			// safe to delete our existing one now
-			dataset.insert_one.deinit();
-
-			dataset.insert_one = insert_one;
-		}
-	};
+	fn execFmt(self: *DataSet, comptime fmt: []const u8, fmt_args: anytype, args: anytype) !usize {
+		var buffer = &self.buffer;
+		buffer.clearRetainingCapacity();
+		std.fmt.format(buffer.writer(), fmt, fmt_args) catch |err| {
+			logz.err().ctx("DataSet.execFmt").string("fmt", fmt).err(err).log();
+			return err;
+		};
+		return self.exec(buffer.string(), args);
+	}
 };
 
 const Column = struct {
@@ -229,6 +330,21 @@ const Column = struct {
 		} else {
 			try writer.writeAll(" not null");
 		}
+	}
+
+	pub fn fromEventValue(name: []const u8, value: Event.Value) Column {
+		const event_type = std.meta.activeTag(value);
+		const column_type = switch (value) {
+			.list => |list| columnTypeForEventList(list),
+			else => columnTypeFromEventScalar(event_type),
+		};
+
+		return .{
+			.name = name,
+			.is_list = event_type == .list,
+			.nullable = event_type == .null,
+			.data_type = column_type,
+		};
 	}
 };
 
@@ -504,7 +620,7 @@ pub const Dispatcher = struct {
 					.stop => return,
 					.event => |event| {
 						var ds = msg.dataset.?;
-						ds.record(event, false) catch |err| logdk.dbErr("DataSet.record.event", err, ds.conn, logz.err().string("name", ds.name)) catch {};
+						ds.record(event) catch |err| logdk.dbErr("DataSet.record.event", err, ds.conn, logz.err().string("name", ds.name)) catch {};
 					}
 				}
 			}
@@ -527,14 +643,21 @@ fn dataSetFromRow(allocator: Allocator, row: anytype, conn: *zuckdb.Conn) !*Data
 	const columns = try std.json.parseFromSliceLeaky([]Column, aa, row.get([]const u8, 1), .{});
 	const insert_one = try generateInsertOnePrepared(allocator, conn, name, columns);
 
+	var columnLookup = std.StringHashMapUnmanaged(void){};
+	try columnLookup.ensureTotalCapacity(aa, @intCast(columns.len));
+	for (columns) |c| {
+		columnLookup.putAssumeCapacity(c.name, {});
+	}
+
 	const dataset = try allocator.create(DataSet);
 	dataset.* = .{
 		.name = name,
 		.conn = conn,
 		.arena = arena,
-		.columns = columns,
 		.insert_one = insert_one,
-		.scrap = try aa.alloc(u8, logdk.MAX_IDENTIFIER_LEN * 2 + 512), // more than enough for an alter table T alter column C ...
+		.columnLookup = columnLookup,
+		.columns = std.ArrayList(Column).fromOwnedSlice(aa, columns),
+		.buffer = zul.StringBuilder.fromOwnedSlice(aa, try aa.alloc(u8, logdk.MAX_IDENTIFIER_LEN * 2 + 512)), // more than enough for an alter table T alter column C ...
 	};
 	return dataset;
 }
@@ -839,7 +962,7 @@ test "DataSet: columnsFromEvent" {
 	try t.expectEqual(.{.name = "details.handle", .is_list = false, .nullable = false, .data_type = .usmallint}, columns[4]);
 }
 
-test "DataSet: record" {
+test "DataSet: record simple" {
 	var tc = t.context(.{});
 	defer tc.deinit();
 
@@ -847,7 +970,7 @@ test "DataSet: record" {
 
 	{
 		const event = try Event.parse(t.allocator, "{\"id\": 1, \"system\": \"catalog\", \"active\": true, \"record\": 0.932, \"category\": null}");
-		try ds.record(event, false);
+		try ds.record(event);
 
 		var row = (try ds.conn.row("select \"$id\", \"$inserted\", id, system, active, record, category from dataset_test where id =  1", .{})).?;
 		defer row.deinit();
@@ -864,7 +987,7 @@ test "DataSet: record" {
 	{
 		// infer null from missing event field
 		const event = try Event.parse(t.allocator, "{\"id\": 2, \"system\": \"other\", \"active\": false, \"record\": 4}");
-		try ds.record(event, false);
+		try ds.record(event);
 
 		var row = (try ds.conn.row("select \"$id\", \"$inserted\", id, system, active, record, category from dataset_test where id =  2", .{})).?;
 		defer row.deinit();
@@ -881,7 +1004,7 @@ test "DataSet: record" {
 	{
 		// makes a column nullable
 		const event = try Event.parse(t.allocator, "{\"id\": null, \"system\": null, \"active\": null, \"record\": null}");
-		try ds.record(event, false);
+		try ds.record(event);
 
 		var row = (try ds.conn.row("select \"$id\", \"$inserted\", id, system, active, record, category from dataset_test where id is null", .{})).?;
 		defer row.deinit();
@@ -894,7 +1017,7 @@ test "DataSet: record" {
 		try t.expectEqual(null, row.get(?f64, 5));
 		try t.expectEqual(null, row.get(?[]u8, 6));
 
-		for (ds.columns) |c| {
+		for (ds.columns.items) |c| {
 			try t.expectEqual(true, c.nullable);
 		}
 	}
@@ -902,7 +1025,7 @@ test "DataSet: record" {
 	{
 		// alter type
 		const event = try Event.parse(t.allocator, "{\"id\": -1003843293448, \"system\": 43, \"active\": \"maybe\", \"record\": 229, \"category\": -2}");
-		try ds.record(event, false);
+		try ds.record(event);
 
 		var row = (try ds.conn.row("select \"$id\", \"$inserted\", id, system, active, record, category from dataset_test where id = -1003843293448", .{})).?;
 		defer row.deinit();
@@ -915,6 +1038,79 @@ test "DataSet: record" {
 		try t.expectEqual(229, row.get(f64, 5));
 		try t.expectEqual(-2, row.get(i8, 6));
 	}
+}
+
+test "DataSet: record add column" {
+	var tc = t.context(.{});
+	defer tc.deinit();
+
+	const ds = try testDataSet(tc);
+
+	{
+		const event = try Event.parse(t.allocator, "{\"id\": 5, \"new\": true}");
+		try ds.record(event);
+
+		var row = (try ds.conn.row("select \"$id\", \"$inserted\", id, system, active, record, category, new from dataset_test where id =  5", .{})).?;
+		defer row.deinit();
+
+		try t.expectEqual(1, row.get(i32, 0));
+		try t.expectDelta(std.time.microTimestamp(), row.get(i64, 1), 5000);
+		try t.expectEqual(5, row.get(u16, 2));
+		try t.expectEqual(null, row.get(?[]const u8, 3));
+		try t.expectEqual(null, row.get(?bool, 4));
+		try t.expectEqual(null, row.get(?f64, 5));
+		try t.expectEqual(null, row.get(?[]u8, 6));
+		try t.expectEqual(true, row.get(bool, 7));
+
+		try t.expectEqual("new", ds.columns.items[5].name);
+		try t.expectEqual(true, ds.columns.items[5].nullable);
+		try t.expectEqual(false, ds.columns.items[5].is_list);
+		try t.expectEqual(.bool, ds.columns.items[5].data_type);
+		try t.expectEqual(true, ds.columnLookup.contains("new"));
+	}
+
+	{
+		// no other difference, except for 2 new columns
+		const event = try Event.parse(t.allocator, \\ {
+		\\    "id": 6,
+		\\    "system": "catalog",
+		\\    "active": true,
+		\\    "record": 0.932,
+		\\    "category": null,
+		\\    "new": false,
+		\\    "tag1": "ok",
+		\\    "tag2": -9999
+		\\ }
+		);
+		try ds.record(event);
+
+		var row = (try ds.conn.row("select \"$id\", \"$inserted\", id, system, active, record, category, new, tag1, tag2 from dataset_test where id =  6", .{})).?;
+		defer row.deinit();
+
+		try t.expectEqual(2, row.get(i32, 0));
+		try t.expectDelta(std.time.microTimestamp(), row.get(i64, 1), 5000);
+		try t.expectEqual(6, row.get(u16, 2));
+		try t.expectEqual("catalog", row.get([]const u8, 3));
+		try t.expectEqual(true, row.get(bool, 4));
+		try t.expectEqual(0.932, row.get(f64, 5));
+		try t.expectEqual(null, row.get(?[]u8, 6));
+		try t.expectEqual(false, row.get(bool, 7));
+		try t.expectEqual("ok", row.get([]const u8, 8));
+		try t.expectEqual(-9999, row.get(i16, 9));
+
+		try t.expectEqual("tag1", ds.columns.items[6].name);
+		try t.expectEqual(true, ds.columns.items[6].nullable);
+		try t.expectEqual(false, ds.columns.items[6].is_list);
+		try t.expectEqual(.text, ds.columns.items[6].data_type);
+		try t.expectEqual(true, ds.columnLookup.contains("tag1"));
+
+		try t.expectEqual("tag2", ds.columns.items[7].name);
+		try t.expectEqual(true, ds.columns.items[7].nullable);
+		try t.expectEqual(false, ds.columns.items[7].is_list);
+		try t.expectEqual(.smallint, ds.columns.items[7].data_type);
+		try t.expectEqual(true, ds.columnLookup.contains("tag2"));
+	}
+
 }
 
 // This is one of those things. It's hard to create a DataSet since it requires
