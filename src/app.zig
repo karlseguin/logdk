@@ -6,6 +6,8 @@ const logdk = @import("logdk.zig");
 const Env = logdk.Env;
 const Event = logdk.Event;
 const DataSet = logdk.DataSet;
+const Meta = @import("meta.zig").Meta;
+const d = logdk.dispatcher;
 
 const Thread = std.Thread;
 const Allocator = std.mem.Allocator;
@@ -14,25 +16,55 @@ const ArenaAllocator = std.heap.ArenaAllocator;
 const ValidatorPool = @import("validate").Pool;
 const BufferPool = @import("zul").StringBuilder.Pool;
 
-pub const App = struct {
-	settings: Settings,
-	allocator: Allocator,
-	db: *zuckdb.Pool,
-	create_lock: std.Thread.Mutex,
-	buffers: *BufferPool,
-	validators: ValidatorPool(void),
+pub const Queues = struct {
+	meta: []d.Queue(Meta),
+	dataset: []d.Queue(DataSet),
 
-	// protects the dispatcher And the datasets lookup when adding datasets
-	lock: Thread.RwLock,
+	pub fn init(allocator: Allocator) !Queues {
+		return .{
+			.meta = try d.createQueue(allocator, Meta, 1),
+			.dataset = try d.createQueue(allocator, DataSet, 4),
+		};
+	}
+};
+
+pub const App = struct {
+	// Because of the actor-ish nature of DataSets, our meta holds a snapshot
+	// of the current configuration. This largely exists to satisfy the important
+	// GET /describe endpoint.
+	meta: *Meta,
+
+	// Pool of DuckDB Connections. Note that each DataSet worker (which handles
+	// the inserts and any alter statement) has its own dedicate connetion that
+	// lives outside of the pool.
+	db: *zuckdb.Pool,
+
+	settings: Settings,
+
+	allocator: Allocator,
+
+	// We can only create 1 dataset at a time. This ensures we don't create the
+	// same dataset (same name) from 2 concurrent requests.
+	create_lock: std.Thread.Mutex,
+
+	// Thread-safe pool of pre-generated []u8 for whatever we need. Currently only
+	// used when creating a dataset (for the create table DDL).
+	buffers: *BufferPool,
+
+	validators: ValidatorPool(void),
 
 	// We have a pseudo actor-model thing going on. DataSets can only be modified
 	// or acted on from a single thread. This ensures that we can mutate the
 	// dataset (e.g. add a column) while safely processing inserts. To achieve
-	// this, all behavior is sent as Mesasges, to the DataSet, via the dispatcher.
+	// this, all behavior is sent as Messages to the DataSet via the dispatcher.
+	dispatcher: d.Dispatcher(Queues),
+
+	// protects datasets when adding/getting datasets
+	_dataset_lock: Thread.RwLock,
+
 	// This is a name => actor_id lookup, we use the actor_id to send a message
 	// to the dataset via the dispatcher.
-	dispatcher: DataSet.Dispatcher,
-	datasets: std.StringHashMap(usize),
+	_datasets: std.StringHashMap(usize),
 
 	pub fn init(allocator: Allocator, config: logdk.Config) !App{
 		var open_err: ?[]u8 = null;
@@ -52,45 +84,51 @@ pub const App = struct {
 			try @import("migrations/migrations.zig").run(conn);
 		}
 
-		const dispatcher = try DataSet.Dispatcher.init(allocator, &db, config.workers);
-
 		var validator_pool = try ValidatorPool(void).init(allocator, config.validator);
 		errdefer validator_pool.deinit();
 
-		// A pool of pre-generated []u8 for whatever we need
 		var buffers = try BufferPool.init(allocator, 32, 8_192);
 		errdefer buffers.deinit();
+
+		var dispatcher = try d.Dispatcher(Queues).init(allocator);
+		errdefer dispatcher.deinit();
+
+		const meta_actor = try dispatcher.create(Meta);
+		meta_actor.value = try Meta.init(allocator, meta_actor.queue);
+		errdefer meta_actor.value.deinit();
 
 		return .{
 			.create_lock = .{},
 			.allocator = allocator,
+			.meta = &meta_actor.value,
 			.validators = validator_pool,
 			.settings = .{
 				._dynamic_dataset_creation = false,
 			},
-			.lock = .{},
 			.db = db_pool,
 			.buffers = buffers,
 			.dispatcher = dispatcher,
-			.datasets = std.StringHashMap(usize).init(allocator),
+			._dataset_lock = .{},
+			._datasets = std.StringHashMap(usize).init(allocator),
 		};
 	}
 
 	pub fn deinit(self: *App) void {
-		// This is a bit ugly. The DataSets are somewhat intentionally, not easily
-		// reachable. (because we really want to make sure any modifications are done
-		// via the disaptcher to ensure single-threaded access). So we have this.
-		var it = self.datasets.valueIterator();
-		while (it.next()) |value| {
-			actorToDataSet(value.*).deinit();
-		}
-
-		self.datasets.deinit();
+		self.deinitDataSets();
+		self.meta.deinit();
 		self.dispatcher.deinit();
 
 		self.db.deinit();
 		self.buffers.deinit();
 		self.validators.deinit();
+	}
+
+	fn deinitDataSets(self: *App) void {
+		var it = self._datasets.valueIterator();
+		while (it.next()) |value| {
+			self.dispatcher.unsafeInstance(DataSet, value.*).deinit();
+		}
+		self._datasets.deinit();
 	}
 
 	pub fn createDataSet(self: *App, env: *Env, name: []const u8, event: *const Event) !usize {
@@ -102,18 +140,17 @@ pub const App = struct {
 
 		const allocator = arena.allocator();
 
+		// We could prepare everything we need before taking this lock, like
+		// building our columns, turning them into json, and writing our SQL strings.
+		// But this lock is under very low contention, and if there IS contention,
+		// it very well could be multiple threads trying to create the same dataset
+		// so a long lock seems fine.
+		self.create_lock.lock();
+		defer self.create_lock.unlock();
+
 		{
-			// We could prepare everything we need before taking this lock, like
-			// building our columns, turning them into json, and writing our SQL strings.
-			// But this lock is under very low contention, and if there IS contention,
-			// it very well could be multiple threads trying to create the same dataset
-			// so a long lock seems fine.
-
-			self.create_lock.lock();
-			defer self.create_lock.unlock();
-
 			// under our create_lock, this check is definitive.
-			if (self.datasets.get(name)) |q| {
+			if (self._datasets.get(name)) |q| {
 				return q;
 			}
 
@@ -172,7 +209,7 @@ pub const App = struct {
 	}
 
 	fn loadDataSet(self: *App, env: *Env, name: []const u8) !usize {
-		const result = blk: {
+		var dataset = blk: {
 			var conn = try self.db.acquire();
 			defer conn.release();
 
@@ -181,13 +218,15 @@ pub const App = struct {
 			} orelse return error.DataSetNotFound;
 			defer row.deinit();
 
-			break :blk try self.dispatcher.add(self.allocator, row);
+			break :blk try DataSet.init(self, row);
 		};
+		errdefer dataset.deinit();
+		const actor_id = try self.dispatcher.add(dataset);
 
-		self.lock.lock();
-		defer self.lock.unlock();
-		try self.datasets.put(result.name, result.actor_id);
-		return result.actor_id;
+		self._dataset_lock.lock();
+		defer self._dataset_lock.unlock();
+		try self._datasets.put(dataset.name, actor_id);
+		return actor_id;
 	}
 
 	pub fn loadDataSets(self: *App) !void {
@@ -199,15 +238,20 @@ pub const App = struct {
 		};
 		defer rows.deinit();
 
-		self.lock.lock();
-		defer self.lock.unlock();
+		errdefer self.deinitDataSets();
+
+		self._dataset_lock.lock();
+		defer self._dataset_lock.unlock();
 
 		while (try rows.next()) |row| {
-			const result = try self.dispatcher.add(self.allocator, row);
-			try self.datasets.put(result.name, result.actor_id);
+			var dataset = try DataSet.init(self, row);
+			errdefer dataset.deinit();
+
+			const actor_id = try self.dispatcher.add(dataset);
+			try self._datasets.put(dataset.name, actor_id);
 		}
 
-		logz.info().ctx("App.loadDataSets").int("count", self.datasets.count()).log();
+		logz.info().ctx("App.loadDataSets").int("count", self._datasets.count()).log();
 	}
 
 	// The app settings can be changed during runtime, so we need to encapsulate
@@ -220,12 +264,6 @@ pub const App = struct {
 		}
 	};
 };
-
-// THIS SHOULD NOT BE CALLED.
-// It's should only be used in `app.deinit`, and tests.
-fn actorToDataSet(actor_id: usize) *DataSet {
-	return @as(*DataSet.Dispatcher.Actor, @ptrFromInt(actor_id)).dataset;
-}
 
 const t = logdk.testing;
 test "App: loadDataSets" {
@@ -245,7 +283,7 @@ test "App: loadDataSets" {
 	var app = tc.app;
 	try app.loadDataSets();
 
-	const ds = actorToDataSet(app.datasets.get("system").?);
+	const ds = app.dispatcher.unsafeInstance(DataSet, app._datasets.get("system").?);
 	try t.expectEqual("system", ds.name);
 	try t.expectEqual(4, ds.columns.items.len);
 	try t.expectEqual(.{.name = "id", .nullable = false, .is_list = false, .data_type = .integer}, ds.columns.items[0]);
@@ -322,9 +360,9 @@ test "App: createDataSet success" {
 
 	{
 		const actor_id = try tc.app.createDataSet(tc.env(), "metrics_1", event);
-		try t.expectEqual(actor_id, tc.app.datasets.get("metrics_1").?);
+		try t.expectEqual(actor_id, tc.app._datasets.get("metrics_1").?);
 
-		const ds = actorToDataSet(actor_id);
+		const ds = tc.app.dispatcher.unsafeInstance(DataSet, actor_id);
 		try t.expectEqual("metrics_1", ds.name);
 
 		try t.expectEqual(4, ds.columns.items.len);

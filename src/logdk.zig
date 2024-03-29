@@ -1,5 +1,7 @@
 const std = @import("std");
 pub const web = @import("web/web.zig");
+pub const dispatcher = @import("dispatcher.zig");
+
 pub const App = @import("app.zig").App;
 pub const Env = @import("env.zig").Env;
 pub const Event = @import("event.zig").Event;

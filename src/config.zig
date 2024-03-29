@@ -18,8 +18,6 @@ pub const Config = struct {
 	logger: logz.Config = .{},
 	validator: validate.Config = .{},
 
-	workers: u8 = 2,
-
 	const DB = struct {
 		path: []const u8,
 		pool_size: u16 = 20,

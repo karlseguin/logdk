@@ -29,7 +29,6 @@ pub fn context(_: Context.Config) *Context {
 	const app = aa.create(App) catch unreachable;
 	app.* = App.init(allocator, .{
 		.log_http = false,
-		.workers = 1,
 		.db = .{
 			.pool_size = 1,
 			.pool_timeout = 1000,

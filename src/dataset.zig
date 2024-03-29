@@ -4,15 +4,18 @@ const logz = @import("logz");
 const zuckdb = @import("zuckdb");
 const logdk = @import("logdk.zig");
 
+const App = logdk.App;
 const Event = logdk.Event;
 
 const Thread = std.Thread;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 
-const module = @This();
-
 pub const DataSet = struct {
+	// DataSet doesn't usually need anything from the app, except when it modifies
+	// itself, it needs to inform app.meta of the change.
+	app: *App,
+
 	// misc scrap, currently used to generate alter table T alter column C DDLs as needed
 	buffer: zul.StringBuilder,
 
@@ -40,16 +43,52 @@ pub const DataSet = struct {
 	// in the columns array.
 	columnLookup: std.StringHashMapUnmanaged(void),
 
-	pub const Dispatcher = module.Dispatcher;
+	// row could be either a *zuckdb.Row or a *zuckdb.OwningRow
+	pub fn init(app: *App, row: anytype) !DataSet {
+		const allocator = app.allocator;
+		const arena = try allocator.create(ArenaAllocator);
+		errdefer allocator.destroy(arena);
+
+		arena.* = ArenaAllocator.init(allocator);
+		errdefer arena.deinit();
+
+		const aa = arena.allocator();
+
+		const conn = try aa.create(zuckdb.Conn);
+		conn.* = try app.db.newConn();
+		errdefer conn.deinit();
+
+		const name = try aa.dupe(u8, row.get([]const u8, 0));
+
+		const columns = try std.json.parseFromSliceLeaky([]Column, aa, row.get([]const u8, 1), .{});
+		const insert_one = try generateInsertOnePrepared(allocator, conn, name, columns);
+
+		var columnLookup = std.StringHashMapUnmanaged(void){};
+		try columnLookup.ensureTotalCapacity(aa, @intCast(columns.len));
+		for (columns) |c| {
+			columnLookup.putAssumeCapacity(c.name, {});
+		}
+
+		return .{
+			.app = app,
+			.name = name,
+			.conn = conn,
+			.arena = arena,
+			.insert_one = insert_one,
+			.columnLookup = columnLookup,
+			.columns = std.ArrayList(Column).fromOwnedSlice(aa, columns),
+			.buffer = zul.StringBuilder.fromOwnedSlice(aa, try aa.alloc(u8, logdk.MAX_IDENTIFIER_LEN * 2 + 512)), // more than enough for an alter table T alter column C ...
+		};
+	}
 
 	pub fn deinit(self: *DataSet) void {
 		self.insert_one.deinit();
+		self.conn.deinit();
 
 		const arena = self.arena;
 		const allocator = arena.child_allocator;
 		arena.deinit();
 		allocator.destroy(arena);
-		allocator.destroy(self);
 	}
 
 	pub fn columnsFromEvent(allocator: Allocator, event: *const Event) ![]Column {
@@ -64,6 +103,16 @@ pub const DataSet = struct {
 		}
 
 		return columns;
+	}
+
+	pub const Message = union(enum) {
+		record: *Event,
+	};
+
+	pub fn handle(self: *DataSet, message: Message) !void {
+		switch (message) {
+			.record => |event| return self.record(event),
+		}
 	}
 
 	// This is part of the hot path. It should be optimized in the future to
@@ -166,6 +215,7 @@ pub const DataSet = struct {
 
 		const inserted = try insert.exec();
 		std.debug.assert(inserted == 1);
+		try self.app.meta.datasetChanged(self);
 	}
 
 	fn alter(self: *DataSet, start_index: usize, value_: ?Event.Value, event: *const Event, used_fields_: usize) !void {
@@ -306,22 +356,6 @@ const Column = struct {
 	is_list: bool,
 	data_type: DataType,
 
-	pub const DataType = enum {
-		tinyint,
-		smallint,
-		integer,
-		bigint,
-		utinyint,
-		usmallint,
-		uinteger,
-		ubigint,
-		double,
-		bool,
-		text,
-		json,
-		unknown,
-	};
-
 	pub fn writeDDL(self: *const Column, writer: anytype) !void {
 		// name should always be a valid identifier without quoting
 		try writer.writeByte('"');
@@ -360,7 +394,23 @@ const Column = struct {
 	}
 };
 
-fn columnTypeFromEventScalar(event_type: Event.DataType) Column.DataType {
+pub const DataType = enum {
+	tinyint,
+	smallint,
+	integer,
+	bigint,
+	utinyint,
+	usmallint,
+	uinteger,
+	ubigint,
+	double,
+	bool,
+	text,
+	json,
+	unknown,
+};
+
+fn columnTypeFromEventScalar(event_type: Event.DataType) DataType {
 	return switch (event_type) {
 		.tinyint => .tinyint,
 		.smallint => .smallint,
@@ -379,7 +429,7 @@ fn columnTypeFromEventScalar(event_type: Event.DataType) Column.DataType {
 	};
 }
 
-fn columnTypeForEventList(list: []const Event.Value) Column.DataType {
+fn columnTypeForEventList(list: []const Event.Value) DataType {
 	if (list.len == 0) return .text;
 	const first = list[0];
 	var candidate = columnTypeFromEventScalar(std.meta.activeTag(first));
@@ -388,10 +438,6 @@ fn columnTypeForEventList(list: []const Event.Value) Column.DataType {
 	}
 	return candidate;
 }
-
-const TypeCompatibilityResult = struct {
-	target: Column.DataType,
-};
 
 // It's impossible to get a null or list value since we expect that to already be
 // special-cased by the caller.
@@ -404,7 +450,7 @@ const TypeCompatibilityResult = struct {
 // could be holding values from 0-255. if max(column) <= 127, we could use a tinyint.
 // If max(column) >= 128, we have to use a smallint. This could be solved by
 // tracking (or fetching) max(column).
-fn compatibleDataType(column_type: Column.DataType, value: Event.Value) Column.DataType {
+fn compatibleDataType(column_type: DataType, value: Event.Value) DataType {
 	switch (column_type) {
 		.bool => switch (value) {
 			.bool => return .bool,
@@ -523,157 +569,6 @@ fn compatibleDataType(column_type: Column.DataType, value: Event.Value) Column.D
 	}
 }
 
-// We have N worker threads handling M datasets. For every worker, we have a
-// Queue and a zuckdb.Conn. Messages for a dataset are always processed on
-// the same thread, which makes thread-safety a non-issue. A dataset doesn't
-// "own" a Queue, but it is associated with its Worker's Queue.
-// The zuckdb.Conn is important for a few reasons. First, we avoid contention
-// on the zuckdb.Pool. But, more importantly, it allows us to easily manage
-// prepared statements - because, again, 1 worker owns 1 conn, which means
-// a dataset always gets the same conn.
-pub const Dispatcher = struct {
-	queues: []Queue,
-	threads: []Thread,
-	arena: ArenaAllocator,
-	conns: []zuckdb.Conn,
-
-	// the index @mod(next, queues.len) to add the next dataset to.
-	next: usize,
-
-	pub const Actor = struct {
-		queue: *Queue,
-		dataset: *DataSet,
-	};
-
-	pub fn init(allocator: Allocator, db: *const zuckdb.DB, worker_count: usize) !Dispatcher {
-		var arena = ArenaAllocator.init(allocator);
-		errdefer arena.deinit();
-
-		const aa = arena.allocator();
-
-		const count = @max(worker_count, 1);
-		var conns = try aa.alloc(zuckdb.Conn, count);
-		var queues = try aa.alloc(Queue, count);
-		var threads = try aa.alloc(Thread, count);
-
-		var started: usize = 0;
-		errdefer for (0..started) |i| {
-			queues[i].enqueue(.{.dataset = null, .task = .{.stop = {}}});
-			threads[i].join();
-			conns[i].deinit();
-		};
-
-		for (queues, threads, conns) |*queue, *thread, *conn| {
-			conn.* = try db.conn();
-			errdefer conn.deinit();
-
-			queue.* = try Queue.init(aa, 1000);
-			thread.* = try Thread.spawn(.{}, Dispatcher.workerLoop, .{queue});
-			started += 1;
-		}
-
-		logz.info().ctx("Dispatcher.init").int("workers", count).log();
-
-		return .{
-			.next = 0,
-			.conns = conns,
-			.arena = arena,
-			.queues = queues,
-			.threads = threads,
-		};
-	}
-
-	pub fn deinit(self: *Dispatcher) void {
-		for (self.queues, self.threads, self.conns) |*queue, thread, *conn| {
-			queue.enqueue(.{.dataset = null, .task = .{.stop = {}}});
-			thread.join();
-			conn.deinit();
-		}
-		self.arena.deinit();
-	}
-
-	const AddResult = struct {
-		name: []const u8,
-		actor_id: usize,
-	};
-
-	pub fn add(self: *Dispatcher, allocator: Allocator, row: anytype) !AddResult {
-		const next = self.next;
-		const index = @mod(next, self.queues.len);
-
-		const dataset = try dataSetFromRow(allocator, row, &self.conns[index]);
-		errdefer dataset.deinit();
-
-		const actor = try self.arena.allocator().create(Actor);
-		actor.* = .{
-			.dataset = dataset,
-			.queue = &self.queues[index],
-		};
-
-		self.next = next + 1;
-		return .{
-			.name = dataset.name,
-			.actor_id = @intFromPtr(actor),
-		};
-	}
-
-	pub fn send(_: *Dispatcher, actor_id: usize, task: Message.Task) void {
-		const actor: *Actor = @ptrFromInt(actor_id);
-		actor.queue.enqueue(.{
-			.task = task,
-			.dataset = actor.dataset,
-		});
-	}
-
-	fn workerLoop(queue: *Queue) void {
-		while (true) {
-			for (queue.next()) |msg| {
-				switch (msg.task) {
-					.stop => return,
-					.event => |event| {
-						var ds = msg.dataset.?;
-						ds.record(event) catch |err| logdk.dbErr("DataSet.record.event", err, ds.conn, logz.err().string("name", ds.name)) catch {};
-					}
-				}
-			}
-		}
-	}
-};
-
-// row could be either a *zuckdb.Row or a *zuckdb.OwningRow
-fn dataSetFromRow(allocator: Allocator, row: anytype, conn: *zuckdb.Conn) !*DataSet {
-	const arena = try allocator.create(ArenaAllocator);
-	errdefer allocator.destroy(arena);
-
-	arena.* = ArenaAllocator.init(allocator);
-	errdefer arena.deinit();
-
-	const aa = arena.allocator();
-
-	const name = try aa.dupe(u8, row.get([]const u8, 0));
-
-	const columns = try std.json.parseFromSliceLeaky([]Column, aa, row.get([]const u8, 1), .{});
-	const insert_one = try generateInsertOnePrepared(allocator, conn, name, columns);
-
-	var columnLookup = std.StringHashMapUnmanaged(void){};
-	try columnLookup.ensureTotalCapacity(aa, @intCast(columns.len));
-	for (columns) |c| {
-		columnLookup.putAssumeCapacity(c.name, {});
-	}
-
-	const dataset = try allocator.create(DataSet);
-	dataset.* = .{
-		.name = name,
-		.conn = conn,
-		.arena = arena,
-		.insert_one = insert_one,
-		.columnLookup = columnLookup,
-		.columns = std.ArrayList(Column).fromOwnedSlice(aa, columns),
-		.buffer = zul.StringBuilder.fromOwnedSlice(aa, try aa.alloc(u8, logdk.MAX_IDENTIFIER_LEN * 2 + 512)), // more than enough for an alter table T alter column C ...
-	};
-	return dataset;
-}
-
 fn generateInsertOnePrepared(allocator: Allocator, conn: *zuckdb.Conn, name: []const u8, columns: []Column) !zuckdb.Stmt {
 	var sb = zul.StringBuilder.init(allocator);
 	defer sb.deinit();
@@ -702,98 +597,6 @@ fn generateInsertOnePrepared(allocator: Allocator, conn: *zuckdb.Conn, name: []c
 		return logdk.dbErr("dataSetFromRow", err, conn, logz.err().string("sql", sb.string()));
 	};
 }
-
-const Message = struct {
-	task: Task,
-	dataset: ?*DataSet,
-
-	const Task = union(enum) {
-		stop: void,
-		event: *Event,
-	};
-};
-
-const Queue = struct {
-	// Where pending messages are stored. Acts as a circular buffer.
-	messages: []Message,
-
-	// Index in `messages` where we'll enqueue a new messages (see enqueue function)
-	push: usize,
-
-	// Index in `messages` where we'll read to ge the next pendin messages (see next function)
-	pull: usize,
-
-	// The number of pending messages we have
-	pending: usize,
-
-	// messages.len - 1. When `push` or `pull` hit this, they need to go back to 0
-	queue_end: usize,
-
-	// protects messages
-	mutex: Thread.Mutex,
-
-	// signals the consumer that there are messages waiting
-	cond: Thread.Condition,
-
-	// limits the producers. This sem permits (messages.len - pending) messages from being
-	// queued. When `messages` is full, producers block.
-	sem: Thread.Semaphore,
-
-	fn init(allocator: Allocator, len: usize) !Queue {
-		// we expect allcator to be an arena!
-		const messages = try allocator.alloc(Message, len);
-		errdefer allocator.free(messages);
-
-		return .{
-			.pull = 0,
-			.push = 0,
-			.pending = 0,
-			.cond = .{},
-			.mutex = .{},
-			.messages = messages,
-			.queue_end = len - 1,
-			.sem = .{.permits = len}
-		};
-	}
-	// This is only ever called by a single thread (the same thread each time)
-	// Essentially the "consumer"
-	fn next(self: *Queue) []Message {
-		// pull is only ever written to from this thread
-		const pull = self.pull;
-
-		while (true) {
-			self.mutex.lock();
-			while (self.pending == 0) {
-				self.cond.wait(&self.mutex);
-			}
-			const push = self.push;
-			const end = if (push > pull) push else self.messages.len;
-			const messages = self.messages[pull..end];
-
-			self.pull = if (end == self.messages.len) 0 else push;
-			self.pending -= messages.len;
-			self.mutex.unlock();
-			var sem = &self.sem;
-			sem.mutex.lock();
-			defer sem.mutex.unlock();
-			sem.permits += messages.len;
-			sem.cond.signal();
-			return messages;
-		}
-	}
-
-	// This can be called by multiple threads, the "producers"
-	fn enqueue(self: *Queue, message: Message) void {
-		self.sem.wait();
-		self.mutex.lock();
-		const push = self.push;
-		self.messages[push] = message;
-		self.push = if (push == self.queue_end) 0 else push + 1;
-		self.pending += 1;
-		self.mutex.unlock();
-		self.cond.signal();
-	}
-};
 
 const t = logdk.testing;
 test "Column: writeDDL" {
@@ -948,7 +751,7 @@ test "columnTypeForEventList" {
 	}
 }
 
-fn testColumnTypeEventList(comptime event_value: []const u8) Column.DataType {
+fn testColumnTypeEventList(comptime event_value: []const u8) DataType {
 	const event = Event.parse(t.allocator, "{\"list\": [" ++ event_value ++ "]}") catch unreachable;
 	defer event.deinit();
 	return columnTypeForEventList(event.map.get("list").?.list);
@@ -1122,7 +925,6 @@ test "DataSet: record add column" {
 		try t.expectEqual(.smallint, ds.columns.items[7].data_type);
 		try t.expectEqual(true, ds.columnLookup.contains("tag2"));
 	}
-
 }
 
 // This is one of those things. It's hard to create a DataSet since it requires
@@ -1140,7 +942,6 @@ fn testDataSet(tc: *t.Context) !*DataSet {
 		\\ }
 	);
 	defer event.deinit();
-
 	const actor_id = try tc.app.createDataSet(tc.env(), "dataset_test", event);
-	return @as(*Dispatcher.Actor, @ptrFromInt(actor_id)).dataset;
+	return tc.app.dispatcher.unsafeInstance(DataSet, actor_id);
 }
