@@ -9,7 +9,7 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 	const app = env.app;
 	const name = req.params.get("name").?;
 
-	var dataset = app._datasets.get(name) orelse blk: {
+	var dataset_id = app.getDataSet(name) orelse blk: {
 		if (app.settings.dynamicDataSetCreation() == false) {
 			return web.notFound(res, "dataset not found and dynamic creation is disabled");
 		}
@@ -19,11 +19,11 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 	const event = Event.parse(res.arena, req.body() orelse "") catch return error.InvalidJson;
 	defer event.deinit();
 
-	if (dataset == null) {
-		dataset = try app.createDataSet(env, name, event);
+	if (dataset_id == null) {
+		dataset_id = try app.createDataSet(env, name, event);
 	}
 
-	// dataset.?.record(event);
+	app.dispatcher.send(logdk.DataSet, dataset_id.?, .{.record = event});
 	res.status = 204;
 }
 

@@ -9,6 +9,7 @@ const logdk = @import("../logdk.zig");
 const App = logdk.App;
 const Env = logdk.Env;
 
+const info = @import("info/_info.zig");
 const datasets = @import("datasets/_datasets.zig");
 
 // every request gets a request_id, any log message created from a request-specific
@@ -45,10 +46,11 @@ pub fn start(app: *App, config: *const logdk.Config) !void {
 	{
 		var routes = router.group("/api/1", .{});
 		datasets.routes(&routes);
+		routes.get("/describe", info.describe);
 	}
-	router.getC("/metrics", metrics, .{.dispatcher = server.dispatchUndefined()});
+	router.getC("/metrics", info.metrics, .{.dispatcher = server.dispatchUndefined()});
 
-	logz.info().ctx("http.listen").fmt("listen", "http://{s}:{d}", .{server.config.address.?, server.config.port.?}).boolean("log_http", config.log_http).log();
+	logz.info().ctx("http.listen").fmt("address", "http://{s}:{d}", .{server.config.address.?, server.config.port.?}).boolean("log_http", config.log_http).log();
 	// blocks
 	try server.listen();
 }

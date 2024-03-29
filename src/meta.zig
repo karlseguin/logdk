@@ -59,10 +59,10 @@ pub const Meta = struct {
 	// multiple-threads which aren't all under lock.
 	// I think.
 	pub fn payload(self: *Meta) *Payload {
-		self._lock.sharedlock();
+		self._lock.lockShared();
 		const p = self._payload;
 		_ = @atomicRmw(u16, &p._rc, .Add, 1, .monotonic);
-		self._lock.sharedUnlock();
+		self._lock.unlockShared();
 		return p;
 	}
 
@@ -130,36 +130,37 @@ pub const Meta = struct {
 		self._payload.release();
 		self._payload = pl;
 	}
-};
 
-const Payload = struct {
-	_rc: u16,
-	_json: []const u8,
-	_allocator: Allocator,
+	pub const Payload = struct {
+		_rc: u16,
+		json: []const u8,
+		_allocator: Allocator,
 
-	fn init(allocator: Allocator, describe: anytype) !*Payload {
-		const json = try std.json.stringifyAlloc(allocator, describe, .{});
-		errdefer allocator.free(json);
+		fn init(allocator: Allocator, describe: anytype) !*Payload {
+			const json = try std.json.stringifyAlloc(allocator, describe, .{});
+			errdefer allocator.free(json);
 
-		const payload = try allocator.create(Payload);
-		errdefer allocator.destroy(payload);
+			const pl = try allocator.create(Payload);
+			errdefer allocator.destroy(pl);
 
-		payload.* = .{
-			._rc = 1,  // Meta's reference always counts as 1
-			._json = json,
-			._allocator = allocator,
-		};
+			pl.* = .{
+				.json = json,
+				._rc = 1,  // Meta's reference always counts as 1
+				._allocator = allocator,
+			};
 
-		return payload;
-	}
-
-	pub fn release(self: *Payload) void {
-		if (@atomicRmw(u16, &self._rc, .Sub, 1, .monotonic) != 1) {
-			return;
+			return pl;
 		}
-		self._allocator.free(self._json);
-		self._allocator.destroy(self);
-	}
+
+		pub fn release(self: *Payload) void {
+			// returns the value before the sub, so if the value before the sub was 1,
+			// then we have no more references to this payload
+			if (@atomicRmw(u16, &self._rc, .Sub, 1, .monotonic) == 1) {
+				self._allocator.free(self.json);
+				self._allocator.destroy(self);
+			}
+		}
+	};
 };
 
 // a "meta" representation of a DataSet. This owns all its fields, since

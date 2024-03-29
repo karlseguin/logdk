@@ -4,9 +4,9 @@ const zuckdb = @import("zuckdb");
 const logdk = @import("logdk.zig");
 
 const Env = logdk.Env;
+const Meta = logdk.Meta;
 const Event = logdk.Event;
 const DataSet = logdk.DataSet;
-const Meta = @import("meta.zig").Meta;
 const d = logdk.dispatcher;
 
 const Thread = std.Thread;
@@ -131,6 +131,12 @@ pub const App = struct {
 		self._datasets.deinit();
 	}
 
+	pub fn getDataSet(self: *App, name: []const u8) ?usize {
+		self._dataset_lock.lockShared();
+		defer self._dataset_lock.unlockShared();
+		return self._datasets.get(name);
+	}
+
 	pub fn createDataSet(self: *App, env: *Env, name: []const u8, event: *const Event) !usize {
 		const validator = try env.validator();
 		try logdk.Validate.TableName("dataset", name, validator);
@@ -199,6 +205,8 @@ pub const App = struct {
 				conn.commit() catch |err| return env.dbErr("App.createDataSet.commit", err, conn);
 			}
 		}
+
+		logdk.metrics.addDataSet();
 
 		// This has to happen under our create_lock, else another thread can come in
 		// and create the same dataset.

@@ -106,7 +106,7 @@ pub fn Dispatcher(comptime Q: type) type {
 
 		pub fn send(_: *const Self, comptime T: type, actor_id: usize, message: T.Message) void {
 			const actor: *Actor(T) = @ptrFromInt(actor_id);
-			actor.queue.enqueue(.{.dispatch = .{.message = message, .recipient = actor.value}});
+			actor.queue.enqueue(.{.dispatch = .{.message = message, .recipient = &actor.value}});
 		}
 	};
 }

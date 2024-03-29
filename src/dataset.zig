@@ -111,7 +111,10 @@ pub const DataSet = struct {
 
 	pub fn handle(self: *DataSet, message: Message) !void {
 		switch (message) {
-			.record => |event| return self.record(event),
+			.record => |event| return self.record(event) catch |err| {
+				logdk.metrics.recordError();
+				return err;
+			},
 		}
 	}
 
@@ -215,6 +218,8 @@ pub const DataSet = struct {
 
 		const inserted = try insert.exec();
 		std.debug.assert(inserted == 1);
+
+		logdk.metrics.alterDataSet();
 		try self.app.meta.datasetChanged(self);
 	}
 
