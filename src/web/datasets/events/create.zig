@@ -16,8 +16,9 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 		break :blk null;
 	};
 
-	const event = Event.parse(res.arena, req.body() orelse "") catch return error.InvalidJson;
-	defer event.deinit();
+	// once passed to the dispatcher, it because the datasets job to release this
+	const event = Event.parse(app.allocator, req.body() orelse "") catch return error.InvalidJson;
+	errdefer event.deinit();
 
 	if (dataset_id == null) {
 		dataset_id = try app.createDataSet(env, name, event);

@@ -20,7 +20,7 @@
 			.hash = "1220db7dd7c530053aa63191d727bc4c4be31cdd41308272143eb4fd0b969263231f"
 		},
 		.validate = .{
-			.url = "https://github.com/karlseguin/validate.zig/archive/d375e342bc70afee8d5f695d9bbbe9a5668b3708.tar.gz",
+			.url = "https://github.com/karlseguin/validate.zig/archive/52cfade5ba259aa5fccc0860702f3c624f0dea3f.tar.gz",
 			.hash = "1220066c4ec980ae3b5734b12121a3ff037a1ec4848019a3e1905bb92a0596f0eefe"
 		},
 		.zuckdb = .{

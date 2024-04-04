@@ -1,10 +1,13 @@
 {
 	"log_http": false,
+	"logger": {
+		"level": "Info"
+	},
 	"http": {
 		"port": 7714,
 		"address": "127.0.0.1",
 		"request": {
-			"max_body_size": 0,
+			"max_body_size": 16384,
 			"buffer_size": 4096,
 			"max_param_count": 2,
 			"max_query_count": 32

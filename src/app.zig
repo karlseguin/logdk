@@ -103,7 +103,7 @@ pub const App = struct {
 			.meta = &meta_actor.value,
 			.validators = validator_pool,
 			.settings = .{
-				._dynamic_dataset_creation = false,
+				._dynamic_dataset_creation = true,
 			},
 			.db = db_pool,
 			.buffers = buffers,
@@ -231,9 +231,17 @@ pub const App = struct {
 		errdefer dataset.deinit();
 		const actor_id = try self.dispatcher.add(dataset);
 
-		self._dataset_lock.lock();
-		defer self._dataset_lock.unlock();
-		try self._datasets.put(dataset.name, actor_id);
+		{
+			self._dataset_lock.lock();
+			defer self._dataset_lock.unlock();
+			try self._datasets.put(dataset.name, actor_id);
+		}
+
+		// this dataset is going to move (and be owned by our actor), but this
+		// is safe because meta.datasetChanged clones all the data it needs for its
+		// own meta copy
+		try self.meta.datasetChanged(&dataset);
+
 		return actor_id;
 	}
 
@@ -257,6 +265,11 @@ pub const App = struct {
 
 			const actor_id = try self.dispatcher.add(dataset);
 			try self._datasets.put(dataset.name, actor_id);
+
+			// this dataset is going to move (and be owned by our actor), but this
+			// is safe because meta.datasetChanged clones all the data it needs for its
+			// own meta copy
+			try self.meta.datasetChanged(&dataset);
 		}
 
 		logz.info().ctx("App.loadDataSets").int("count", self._datasets.count()).log();

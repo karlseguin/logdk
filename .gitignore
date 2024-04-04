@@ -5,3 +5,4 @@ zig-cache/
 *.dylib
 lib/zul
 lib/zuckdb.zig
+db.duckdb*
