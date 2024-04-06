@@ -42,7 +42,6 @@ pub const Meta = struct {
 
 	pub fn deinit(self: *Meta) void {
 		self._payload.release();
-
 		for (self._datasets.items) |ds| {
 			ds.deinit();
 		}
@@ -124,6 +123,7 @@ pub const Meta = struct {
 
 		const pl = try Payload.init(allocator, .{.datasets = self._datasets.items});
 		errdefer pl.release();
+
 
 		self._lock.lock();
 		defer self._lock.unlock();

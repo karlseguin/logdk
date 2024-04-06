@@ -32,21 +32,21 @@ const t = logdk.testing;
 test "events.create: unknown dataset, dynamic creation disabled" {
 	var tc = t.context(.{});
 	defer tc.deinit();
+	tc.app.settings._dynamic_dataset_creation = false;
 
 	tc.web.param("name", "nope");
 	try handler(tc.env(), tc.web.req, tc.web.res);
 	try tc.expectNotFound("dataset not found and dynamic creation is disabled");
 }
 
-test "events.create: unknown dataset, dynamic create invalid name" {
-	var tc = t.context(.{});
-	defer tc.deinit();
+// test "events.create: unknown dataset, dynamic create invalid name" {
+// 	var tc = t.context(.{});
+// 	defer tc.deinit();
 
-	tc.web.param("name", "nope");
-	try handler(tc.env(), tc.web.req, tc.web.res);
-	try tc.expectNotFound("dataset not found and dynamic creation is disabled");
-}
-
+// 	tc.web.param("name", "nope");
+// 	try handler(tc.env(), tc.web.req, tc.web.res);
+// 	try tc.expectNotFound("dataset not found and dynamic creation is disabled");
+// }
 
 // test "events.create: empty body" {
 // 	var tc = t.context(.{});

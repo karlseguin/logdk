@@ -132,6 +132,15 @@ pub fn metrics(_: *Env, _: *httpz.Request, res: *httpz.Response) !void {
 	try logz.writeMetrics(writer);
 }
 
+pub fn invalidSQL(res: *httpz.Response, desc: ?[]const u8, sql: []const u8) !void {
+	res.status = 400;
+	return res.json(.{
+		.code = logdk.codes.INVALID_SQL,
+		.@"error" = desc orelse "invalid sql",
+		.sql = sql,
+	}, .{});
+}
+
 // An application-related 404. The given method+path was valid. This could be
 // something like trying to request a non-existent package.
 pub fn notFound(res: *httpz.Response, comptime desc: []const u8) !void {

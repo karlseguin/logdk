@@ -16,6 +16,7 @@ pub fn build(b: *std.Build) !void {
 	const dep_opts = .{.target = target,.optimize = optimize};
 
 	try modules.put("httpz", b.dependency("httpz", dep_opts).module("httpz"));
+	try modules.put("typed", b.dependency("typed", dep_opts).module("typed"));
 	try modules.put("metrics", b.dependency("metrics", dep_opts).module("metrics"));
 	try modules.put("logz", b.dependency("logz", dep_opts).module("logz"));
 	try modules.put("validate", b.dependency("validate", dep_opts).module("validate"));

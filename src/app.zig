@@ -47,8 +47,7 @@ pub const App = struct {
 	// same dataset (same name) from 2 concurrent requests.
 	create_lock: std.Thread.Mutex,
 
-	// Thread-safe pool of pre-generated []u8 for whatever we need. Currently only
-	// used when creating a dataset (for the create table DDL).
+	// Thread-safe pool of pre-generated []u8 for whatever we need.
 	buffers: *BufferPool,
 
 	validators: ValidatorPool(void),
@@ -114,21 +113,19 @@ pub const App = struct {
 	}
 
 	pub fn deinit(self: *App) void {
-		self.deinitDataSets();
+		self.dispatcher.stop();
+
+		var it = self._datasets.valueIterator();
+		while (it.next()) |value| {
+			self.dispatcher.unsafeInstance(DataSet, value.*).deinit();
+		}
+		self._datasets.deinit();
 		self.meta.deinit();
 		self.dispatcher.deinit();
 
 		self.db.deinit();
 		self.buffers.deinit();
 		self.validators.deinit();
-	}
-
-	fn deinitDataSets(self: *App) void {
-		var it = self._datasets.valueIterator();
-		while (it.next()) |value| {
-			self.dispatcher.unsafeInstance(DataSet, value.*).deinit();
-		}
-		self._datasets.deinit();
 	}
 
 	pub fn getDataSet(self: *App, name: []const u8) ?usize {
@@ -254,8 +251,6 @@ pub const App = struct {
 		};
 		defer rows.deinit();
 
-		errdefer self.deinitDataSets();
-
 		self._dataset_lock.lock();
 		defer self._dataset_lock.unlock();
 
@@ -293,9 +288,9 @@ test "App: loadDataSets" {
 
 	const columns = \\ [
 		\\{"name": "id", "nullable": false, "is_list": false, "data_type": "integer"},
+		\\{"name": "tags", "nullable": false, "is_list": true, "data_type": "text"},
 		\\{"name": "type", "nullable": false, "is_list": false, "data_type": "text"},
-		\\{"name": "value", "nullable": true, "is_list": false, "data_type": "double"},
-		\\{"name": "tags", "nullable": false, "is_list": true, "data_type": "text"}
+		\\{"name": "value", "nullable": true, "is_list": false, "data_type": "double"}
 	\\]
 	;
 	try tc.exec("insert into logdk.datasets (name, columns) values ($1, $2)", .{"system", columns});
@@ -308,9 +303,9 @@ test "App: loadDataSets" {
 	try t.expectEqual("system", ds.name);
 	try t.expectEqual(4, ds.columns.items.len);
 	try t.expectEqual(.{.name = "id", .nullable = false, .is_list = false, .data_type = .integer}, ds.columns.items[0]);
-	try t.expectEqual(.{.name = "type", .nullable = false, .is_list = false, .data_type = .text}, ds.columns.items[1]);
-	try t.expectEqual(.{.name = "value", .nullable = true, .is_list = false, .data_type = .double}, ds.columns.items[2]);
-	try t.expectEqual(.{.name = "tags", .nullable = false, .is_list = true, .data_type = .text}, ds.columns.items[3]);
+	try t.expectEqual(.{.name = "tags", .nullable = false, .is_list = true, .data_type = .text}, ds.columns.items[1]);
+	try t.expectEqual(.{.name = "type", .nullable = false, .is_list = false, .data_type = .text}, ds.columns.items[2]);
+	try t.expectEqual(.{.name = "value", .nullable = true, .is_list = false, .data_type = .double}, ds.columns.items[3]);
 }
 
 test "App: createDataSet invalid dataset name" {
@@ -388,14 +383,10 @@ test "App: createDataSet success" {
 
 		try t.expectEqual(4, ds.columns.items.len);
 
-		// The order is only semi-reliable. As long as the order here matches the order of the describe (tested
-		// a few lines down), we're happy. But, since our json parser parses the input in order and puts it
-		// into the map in that same order, the order _is_ predictable so long as the std.HashMap implementation
-		// doesn't change.
-		try t.expectEqual(.{.name = "tags", .nullable = true, .is_list = false, .data_type = .unknown}, ds.columns.items[0]);
+		try t.expectEqual(.{.name = "flags", .nullable = false, .is_list = true, .data_type = .integer}, ds.columns.items[0]);
 		try t.expectEqual(.{.name = "id", .nullable = false, .is_list = false, .data_type = .text}, ds.columns.items[1]);
 		try t.expectEqual(.{.name = "monitor", .nullable = false, .is_list = false, .data_type = .bool}, ds.columns.items[2]);
-		try t.expectEqual(.{.name = "flags", .nullable = false, .is_list = true, .data_type = .integer}, ds.columns.items[3]);
+		try t.expectEqual(.{.name = "tags", .nullable = true, .is_list = false, .data_type = .unknown}, ds.columns.items[3]);
 	}
 
 	try t.expectEqual(1, tc.scalar(i64, "select nextval('metrics_1_id_seq')", .{}));
@@ -425,9 +416,9 @@ test "App: createDataSet success" {
 
 	{
 		const row = (try rows.next()).?;
-		try t.expectEqual("tags", row.get([]u8, 0));  // name
-		try t.expectEqual("VARCHAR", row.get([]u8, 1));  // type
-		try t.expectEqual("YES", row.get([]u8, 2));  // nullable
+		try t.expectEqual("flags", row.get([]u8, 0));  // name
+		try t.expectEqual("INTEGER[]", row.get([]u8, 1));  // type
+		try t.expectEqual("NO", row.get([]u8, 2));  // nullable
 		try t.expectEqual(null, row.get(?[]u8, 3));  // key
 		try t.expectEqual(null, row.get(?[]u8, 4));  // default
 		try t.expectEqual(null, row.get(?[]u8, 5));  // extra
@@ -455,9 +446,9 @@ test "App: createDataSet success" {
 
 	{
 		const row = (try rows.next()).?;
-		try t.expectEqual("flags", row.get([]u8, 0));  // name
-		try t.expectEqual("INTEGER[]", row.get([]u8, 1));  // type
-		try t.expectEqual("NO", row.get([]u8, 2));  // nullable
+		try t.expectEqual("tags", row.get([]u8, 0));  // name
+		try t.expectEqual("VARCHAR", row.get([]u8, 1));  // type
+		try t.expectEqual("YES", row.get([]u8, 2));  // nullable
 		try t.expectEqual(null, row.get(?[]u8, 3));  // key
 		try t.expectEqual(null, row.get(?[]u8, 4));  // default
 		try t.expectEqual(null, row.get(?[]u8, 5));  // extra

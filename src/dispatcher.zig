@@ -1,4 +1,5 @@
 const std = @import("std");
+const logz = @import("logz");
 
 const Thread = std.Thread;
 const Allocator = std.mem.Allocator;
@@ -51,13 +52,13 @@ pub fn Dispatcher(comptime Q: type) type {
 			var started: usize = 0;
 			var threads = try allocator.alloc(Thread, queue_count);
 			errdefer blk: {
-				var shutdown: usize = 0;
+				var j: usize = 0;
 				inline for (@typeInfo(Q).Struct.fields) |field| {
 					for (@field(queues, field.name)) |*tq| {
 						tq.enqueue(.{.stop = {}});
-						threads[shutdown].join();
-						shutdown += 1;
-						if (shutdown == started) break :blk;
+						threads[j].join();
+						j += 1;
+						if (j == started) break :blk;
 					}
 				}
 			}
@@ -70,6 +71,24 @@ pub fn Dispatcher(comptime Q: type) type {
 			}
 
 			return threads;
+		}
+
+		// The caller (the App) wants to call stop and deinit separately. First
+		// it wants to call dispatcher.stop, which will drain the queues.
+		// Then it wants to do other cleanup and then call dispatcher.deinit().
+		// The reason for this is that dispatcher.deinit() clears the dispatcher
+		// arena, which owns all the actors. That's fine for cleaning the actual
+		// *Actor, but the values might need to be de-inited, which we leave up
+		// to the app.
+		pub fn stop(self: *const Self) void {
+			var i: usize = 0;
+			inline for (@typeInfo(Q).Struct.fields) |field| {
+				for (@field(self.queues, field.name)) |*tq| {
+					tq.enqueue(.{.stop = {}});
+					self.threads[i].join();
+					i += 1;
+				}
+			}
 		}
 
 		pub fn deinit(self: *Self) void {
@@ -218,7 +237,7 @@ pub fn Queue(comptime T: type) type {
 						.dispatch => |d| {
 							var recipient = d.recipient;
 							recipient.handle(d.message) catch |err| {
-								std.debug.print("Q R E: {any}\n", .{err});
+								logz.err().ctx("Dispatcher.handle").stringSafe("recipient", @typeName(@TypeOf(recipient))).stringSafe("message", @tagName(d.message)).err(err).log();
 							};
 						}
 					}

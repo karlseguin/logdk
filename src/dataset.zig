@@ -102,6 +102,8 @@ pub const DataSet = struct {
 			i += 1;
 		}
 
+		std.mem.sort(Column, columns, {}, sortColumns);
+
 		return columns;
 	}
 
@@ -603,6 +605,10 @@ fn generateInsertOnePrepared(allocator: Allocator, conn: *zuckdb.Conn, name: []c
 	};
 }
 
+fn sortColumns(_: void, a: Column, b: Column) bool {
+	return std.ascii.lessThanIgnoreCase(a.name, b.name);
+}
+
 const t = logdk.testing;
 test "Column: writeDDL" {
 	var buf = zul.StringBuilder.init(t.allocator);
@@ -775,11 +781,11 @@ test "DataSet: columnsFromEvent" {
 	defer t.allocator.free(columns);
 
 	try t.expectEqual(5, columns.len);
-	try t.expectEqual(.{.name = "l2", .is_list = false, .nullable = false, .data_type = .json}, columns[0]);
+	try t.expectEqual(.{.name = "details.handle", .is_list = false, .nullable = false, .data_type = .usmallint}, columns[0]);
 	try t.expectEqual(.{.name = "id", .is_list = false, .nullable = false, .data_type = .uinteger}, columns[1]);
-	try t.expectEqual(.{.name = "name", .is_list = false, .nullable = false, .data_type = .text}, columns[2]);
-	try t.expectEqual(.{.name = "l1", .is_list = true, .nullable = false, .data_type = .integer}, columns[3]);
-	try t.expectEqual(.{.name = "details.handle", .is_list = false, .nullable = false, .data_type = .usmallint}, columns[4]);
+	try t.expectEqual(.{.name = "l1", .is_list = true, .nullable = false, .data_type = .integer}, columns[2]);
+	try t.expectEqual(.{.name = "l2", .is_list = false, .nullable = false, .data_type = .json}, columns[3]);
+	try t.expectEqual(.{.name = "name", .is_list = false, .nullable = false, .data_type = .text}, columns[4]);
 }
 
 test "DataSet: record simple" {

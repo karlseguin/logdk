@@ -22,6 +22,7 @@ pub const codes = struct {
 	pub const NOT_FOUND = 4;
 	pub const VALIDATION_ERROR = 5;
 	pub const INVALID_JSON = 6;
+	pub const INVALID_SQL = 7;
 };
 
 const logz = @import("logz");
