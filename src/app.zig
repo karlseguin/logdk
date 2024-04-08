@@ -141,7 +141,7 @@ pub const App = struct {
 		var arena = ArenaAllocator.init(self.allocator);
 		defer arena.deinit();
 
-		const allocator = arena.allocator();
+		const aa = arena.allocator();
 
 		// We could prepare everything we need before taking this lock, like
 		// building our columns, turning them into json, and writing our SQL strings.
@@ -157,15 +157,15 @@ pub const App = struct {
 				return q;
 			}
 
-			const columns = try DataSet.columnsFromEvent(allocator, event);
+			const columns = try DataSet.columnsFromEvent(aa, event);
 			for (columns) |c| {
-				logdk.Validate.ColumnName(c.name, validator) catch {};
+				logdk.Validate.ColumnName(try env.arena.dupe(u8, c.name), validator) catch {};
 			}
 			if (validator.isValid() == false) {
 				return error.Validation;
 			}
 
-			const serialized_columns = try std.json.stringifyAlloc(allocator, columns, .{});
+			const serialized_columns = try std.json.stringifyAlloc(aa, columns, .{});
 
 			var sequence = try self.buffers.acquire();
 			defer sequence.release();

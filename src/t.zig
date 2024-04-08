@@ -86,6 +86,7 @@ pub const Context = struct {
 		const e = self.arena.create(Env) catch unreachable;
 		e.* = Env{
 			.app = app,
+			.arena = self.arena,
 			.logger = logz.logger().multiuse(),
 		};
 		self._env = e;
@@ -101,16 +102,25 @@ pub const Context = struct {
 		};
 	}
 
+	pub fn row(self: *Context, sql: []const u8, args: anytype) !?zuckdb.OwningRow {
+		var c = self.conn();
+		defer c.release();
+		return c.row(sql, args) catch |err| {
+			if (c.err) |e| std.debug.print("err: {s}\n", .{e});
+			return err;
+		};
+	}
+
 	pub fn scalar(self: *Context, comptime T: type, sql: []const u8, args: anytype) !T {
 		var c = self.conn();
 		defer c.release();
-		const row = c.row(sql, args) catch |err| {
+		const r = c.row(sql, args) catch |err| {
 			if (c.err) |e| std.debug.print("err: {s}\n", .{e});
 			return err;
 		} orelse unreachable;
 
-		defer row.deinit();
-		return row.get(T, 0);
+		defer r.deinit();
+		return r.get(T, 0);
 	}
 
 	pub fn query(self: *Context, sql: []const u8, args: anytype) !zuckdb.Rows {

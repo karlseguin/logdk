@@ -12,11 +12,15 @@ const Allocator = std.mem.Allocator;
 pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void {
 	const app = env.app;
 	const name = req.params.get("name").?;
-
 	_ = app.getDataSet(name) orelse return web.notFound(res, "dataset not found");
+
+	const query = try req.query();
+	const include_total = if (query.get("total")) |t| std.mem.eql(u8, t, "true") else false;
+	_ = include_total;
 
 	const buf = try app.buffers.acquire();
 	defer buf.release();
+
 
 	// This is relatively safe because the name was validated when the dataset was
 	// created. If `name` was invalid/unsafe, then the dataset never wouldn't exist

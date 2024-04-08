@@ -5,27 +5,11 @@ const json = std.json;
 const Allocator = std.mem.Allocator;
 const ParseOptions = json.ParseOptions;
 
-const MAX_FLATTEN_DEPTH = 3;
+const MAX_FLATTEN_DEPTH = 1;
 
 pub const Event = struct {
-	// // This is part of detecting whether our Event has new fields that need to
-	// // be added as columns to our DataSet. Essentially, DataSet.record "consumes"
-	// // fields based on its []Columns. If at the end of that,
-	// //   event.consumed < event.map.count()
-	// // then we know we have new fields in Event. We don't know _which_ field is
-	// // new, we just know there's `event.map.count() - event.consumed` new fields.
-	// // I know, you're thinking, why not just delete the fields from map when we
-	// // consume them? Then we'd know which are the new fields! The issue is with how
-	// // DataSet.record is implemented, and how it's optimized for the common case
-	// // where the event can be inserted as-is, without altering the dataset.
-	// // DataSet.record might need to re-bind the prepared statement twice. The first
-	// // time is the optimized case where it assumes there's no modification to make
-	// // But if we do have to make a modification, then we need to re-create and
-	// // re-bind the prepared statement. Which means, we can't start deleting fields.
-	// consumed: usize,
-
 	map: std.StringHashMapUnmanaged(Value),
-	_arena: *std.heap.ArenaAllocator,
+	arena: *std.heap.ArenaAllocator,
 
 	pub fn get(self: *const Event, field: []const u8) ?Value {
 		return self.map.get(field);
@@ -66,11 +50,16 @@ pub const Event = struct {
 		null: void,
 		text: []const u8,
 		json: []const u8,
-		list: []const Value,
+		list: List,
+
+		const List = struct {
+			values: []const Value,
+			json: []const u8,
+		};
 	};
 
 	pub fn deinit(self: *const Event) void {
-		const arena = self._arena;
+		const arena = self.arena;
 		const allocator = arena.child_allocator;
 		arena.deinit();
 		allocator.destroy(arena);
@@ -85,7 +74,8 @@ pub const Event = struct {
 
 		const aa = arena.allocator();
 
-		var scanner = json.Scanner.initCompleteInput(aa, input);
+		const owned = try aa.dupe(u8, input);
+		var scanner = json.Scanner.initCompleteInput(aa, owned);
 		defer scanner.deinit();
 
 		if (try scanner.next() != .object_begin) {
@@ -100,7 +90,7 @@ pub const Event = struct {
 		try parser.parseObject(aa, &scanner);
 		const event = try aa.create(Event);
 		event.* = .{
-			._arena = arena,
+			.arena = arena,
 			.map = parser.map,
 		};
 
@@ -225,7 +215,7 @@ const Parser = struct {
 						}
 					}
 				}
-				return .{.value = .{.list = arr.items}};
+				return .{.value = .{.list = .{.json = scanner.input[array_start..scanner.cursor], .values = arr.items}}};
 			},
 			.object_begin => {
 				if (break_on_object) {
@@ -324,35 +314,61 @@ test "Event: parse simple" {
 	}, event);
 }
 
+// test "Event: parse nesting flatten" {
+// 	if (MAX_FLATTEN_DEPTH != 3) return error.SkipZigTest;
+
+// 	const event = try Event.parse(t.allocator, \\{
+// 		\\ "key_1": {},
+// 		\\ "key_2": {
+// 		\\   "sub_1": true,
+// 		\\   "sub_2": "hello",
+// 		\\   "sub_3": {
+// 		\\      "other": 12345,
+// 		\\      "too_deep":  {  "handle ":  1, "x": {"even": "more", "ok": true}}
+// 		\\   }
+// 		\\ }
+// 	\\}
+// 	);
+// 	defer event.deinit();
+
+// 	try assertEvent(.{
+// 		.@"key_2.sub_1" = Event.Value{.bool = true},
+// 		.@"key_2.sub_2" = Event.Value{.text = "hello"},
+// 		.@"key_2.sub_3.other" = Event.Value{.usmallint = 12345},
+// 		.@"key_2.sub_3.too_deep" = Event.Value{.json =  "{  \"handle \":  1, \"x\": {\"even\": \"more\", \"ok\": true}}"},
+// 	}, event);
+// }
+
 test "Event: parse nesting" {
+	if (MAX_FLATTEN_DEPTH != 1) return error.SkipZigTest;
 	const event = try Event.parse(t.allocator, \\{
 		\\ "key_1": {},
 		\\ "key_2": {
 		\\   "sub_1": true,
-		\\   "sub_2": "hello",
-		\\   "sub_3": {
-		\\      "other": 12345,
-		\\      "too_deep":  {  "handle ":  1, "x": {"even": "more", "ok": true}}
-		\\   }
-		\\ }
+		\\   "sub_2": {  "handle ":  1, "x": {"even": "more", "ok": true}}
+		\\}
 	\\}
 	);
 	defer event.deinit();
 
 	try assertEvent(.{
-		.@"key_2.sub_1" = Event.Value{.bool = true},
-		.@"key_2.sub_2" = Event.Value{.text = "hello"},
-		.@"key_2.sub_3.other" = Event.Value{.usmallint = 12345},
-		.@"key_2.sub_3.too_deep" = Event.Value{.json =  "{  \"handle \":  1, \"x\": {\"even\": \"more\", \"ok\": true}}"},
+		.@"key_1" = Event.Value{.json =  "{}"},
+		.@"key_2" = Event.Value{.json =  "{\n   \"sub_1\": true,\n   \"sub_2\": {  \"handle \":  1, \"x\": {\"even\": \"more\", \"ok\": true}}\n}"},
 	}, event);
 }
 
 test "Event: parse list" {
-	const event = try Event.parse(t.allocator, "{\"a\": [1, -9000], \"b\": {\"values\": [true, 56.78912, null, {\"abc\": \"123\"}]}}");
+	const event = try Event.parse(t.allocator, "{\"a\": [1, -9000], \"b\": [true, 56.78912, null, {\"abc\": \"123\"}]}");
 	defer event.deinit();
 	try assertEvent(.{
-		.a = Event.Value{.list = &[_]Event.Value{.{.utinyint = 1}, .{.smallint = -9000}}},
-		.@"b.values" = Event.Value{.list = &[_]Event.Value{.{.bool = true}, .{.double = 56.78912}, .{.null = {}}, .{.json = "{\"abc\": \"123\"}"}}},
+		.a = Event.Value{.list = .{
+			.json = "[1, -9000]",
+			.values = &[_]Event.Value{.{.utinyint = 1}, .{.smallint = -9000}}}
+		},
+		.b = Event.Value{.list = .{
+			.json = "[true, 56.78912, null, {\"abc\": \"123\"}]",
+			.values = &[_]Event.Value{.{.bool = true}, .{.double = 56.78912}, .{.null = {}}, .{.json = "{\"abc\": \"123\"}"}}}
+		},
 	}, event);
 }
 
@@ -365,18 +381,24 @@ test "Event: parse nested list" {
 test "Event: parse list simple" {
 	const event = try Event.parse(t.allocator, "{\"a\": [9999, -128]}");
 	defer event.deinit();
-	try assertEvent(.{.a = Event.Value{.list = &[_]Event.Value{.{.usmallint = 9999}, .{.tinyint = -128}}}}, event);
+	try assertEvent(.{.a = Event.Value{.list = .{
+		.json = "[9999, -128]",
+		.values = &[_]Event.Value{.{.usmallint = 9999}, .{.tinyint = -128}}
+	}}}, event);
 }
 
 test "Event: parse positive integer" {
 	const event = try Event.parse(t.allocator, "{\"pos\": [0, 1, 255, 256, 65535, 65536, 4294967295, 4294967296, 18446744073709551615]}");
 	defer event.deinit();
 	try assertEvent(.{
-		.pos = Event.Value{.list = &[_]Event.Value{
-			.{.utinyint = 0}, .{.utinyint = 1}, .{.utinyint = 255},
-			.{.usmallint = 256}, .{.usmallint = 65535},
-			.{.uinteger = 65536}, .{.uinteger = 4294967295},
-			.{.ubigint = 4294967296}, .{.ubigint = 18446744073709551615}
+		.pos = Event.Value{.list = .{
+			.json = "[0, 1, 255, 256, 65535, 65536, 4294967295, 4294967296, 18446744073709551615]",
+			.values = &[_]Event.Value{
+				.{.utinyint = 0}, .{.utinyint = 1}, .{.utinyint = 255},
+				.{.usmallint = 256}, .{.usmallint = 65535},
+				.{.uinteger = 65536}, .{.uinteger = 4294967295},
+				.{.ubigint = 4294967296}, .{.ubigint = 18446744073709551615}
+			}
 		}}
 	}, event);
 }
@@ -385,12 +407,15 @@ test "Event: parse negative integer" {
 	const event = try Event.parse(t.allocator, "{\"neg\": [-0, -1, -128, -129, -32768 , -32769, -2147483648, -2147483649, -9223372036854775807, -9223372036854775808]}");
 	defer event.deinit();
 	try assertEvent(.{
-		.neg = Event.Value{.list = &[_]Event.Value{
-			.{.double = -0.0}, .{.tinyint = -1}, .{.tinyint = -128},
-			.{.smallint = -129}, .{.smallint = -32768},
-			.{.integer = -32769}, .{.integer = -2147483648},
-			.{.bigint = -2147483649}, .{.bigint = -9223372036854775807}, .{.bigint = -9223372036854775808}
-		}},
+		.neg = Event.Value{.list = .{
+			.json = "[-0, -1, -128, -129, -32768 , -32769, -2147483648, -2147483649, -9223372036854775807, -9223372036854775808]",
+			.values = &[_]Event.Value{
+				.{.double = -0.0}, .{.tinyint = -1}, .{.tinyint = -128},
+				.{.smallint = -129}, .{.smallint = -32768},
+				.{.integer = -32769}, .{.integer = -2147483648},
+				.{.bigint = -2147483649}, .{.bigint = -9223372036854775807}, .{.bigint = -9223372036854775808}
+			}
+		}}
 	}, event);
 }
 
@@ -406,9 +431,11 @@ fn assertEvent(expected: anytype, actual: *Event) !void {
 		const field_name = f.name;
 		switch (@field(expected, field_name)) {
 			.list => |expected_list| {
-				for (expected_list, actual.map.get(field_name).?.list) |expect_list_value, actual_list_value| {
+				const actual_list = actual.map.get(field_name).?.list;
+				for (expected_list.values, actual_list.values) |expect_list_value, actual_list_value| {
 					try t.expectEqual(expect_list_value, actual_list_value);
 				}
+				try t.expectEqual(expected_list.json, actual_list.json);
 			},
 			else => |expected_value| try t.expectEqual(expected_value, actual.map.get(field_name).?),
 		}

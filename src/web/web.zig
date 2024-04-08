@@ -73,6 +73,7 @@ const Dispatcher = struct {
 		var env = Env{
 			.app = app,
 			.logger = logger,
+			.arena = res.arena,
 		};
 		defer env.deinit();
 

@@ -91,6 +91,7 @@ pub const DataSet = struct {
 		allocator.destroy(arena);
 	}
 
+	// allocator is the ArenaAllocator that'll be owned by the DataSet
 	pub fn columnsFromEvent(allocator: Allocator, event: *const Event) ![]Column {
 		var columns = try allocator.alloc(Column, event.fieldCount());
 		errdefer allocator.free(columns);
@@ -98,7 +99,7 @@ pub const DataSet = struct {
 		var i: usize = 0;
 		var it = event.map.iterator();
 		while (it.next()) |kv| {
-			columns[i] = Column.fromEventValue(kv.key_ptr.*, kv.value_ptr.*);
+			columns[i] = Column.fromEventValue(try allocator.dupe(u8, kv.key_ptr.*), kv.value_ptr.*);
 			i += 1;
 		}
 
@@ -130,12 +131,10 @@ pub const DataSet = struct {
 	// But, because this is the hot path and because we expect most events not
 	// to require any alterations, it's written in a way that assumes that the
 	// event can be inserted as-is. We don't loop through the event first to
-	// detect if there's a alteration. Instead, we start to bind our prepare
+	// detect if there's a alteration. Instead, we start to bind our prepared
 	// statement, and if, in doing so, we need to alter, things get a bit messy.
 	// One issue with altering is that we need to re-prepare our insert statement
-	// so it pretty much resets everything. Also, detecting new columns (fields in
-	// event that aren't a known column) is particularly inefficient, but again
-	// something we don't expect to have to do often.
+	// so it pretty much resets everything.
 	fn record(self: *DataSet, event: *Event) !void {
 		defer event.deinit();
 
@@ -165,7 +164,6 @@ pub const DataSet = struct {
 				};
 
 				switch (value) {
-					.list => unreachable, // TODO
 					.null => {
 						if (column.nullable == false) {
 							try self.alter(param_index, value, event, used_fields);
@@ -173,13 +171,31 @@ pub const DataSet = struct {
 						}
 						try insert.bindValue(param_index, null);
 					},
+					.list => |list| {
+						if (column.is_list == false) {
+							try self.alter(param_index, value, event, used_fields);
+							break :first_pass;
+						}
+						const target_type = compatibleListDataType(column.data_type, columnTypeForEventList(list.values));
+						if (target_type != column.data_type) {
+							try self.alter(param_index, value, event, used_fields);
+							break :first_pass;
+						}
+						try insert.bindValue(param_index, list.json);
+					},
 					inline else => |scalar| {
 						const target_type = compatibleDataType(column.data_type, value);
 						if (target_type != column.data_type) {
 							try self.alter(param_index, value, event, used_fields);
 							break :first_pass;
 						}
-						try insert.bindValue(param_index, scalar);
+						if (column.is_list) {
+							// the column is a list, but we were given a single value. This is
+							// a problem given DuckDB's lack of list binding support
+							try insert.bindValue(param_index, try scalarToList(event.arena.allocator(), scalar));
+						} else {
+							try insert.bindValue(param_index, scalar);
+						}
 					},
 				}
 			}
@@ -206,14 +222,23 @@ pub const DataSet = struct {
 		for (self.columns.items, 0..) |*column, param_index| {
 			const value = event.get(column.name) orelse Event.Value{.null = {}};
 			switch (value) {
-				.list => unreachable, // TODO
+				.list => |list| {
+					std.debug.assert(column.is_list);
+					try insert.bindValue(param_index, list.json);
+				},
 				.null => {
 					std.debug.assert(column.nullable);
 					try insert.bindValue(param_index, null);
 				},
 				inline else => |scalar| {
 					std.debug.assert(compatibleDataType(column.data_type, value) == column.data_type);
-					try insert.bindValue(param_index, scalar);
+					if (column.is_list) {
+						// the column is a list, but we were given a single value. This is
+						// a problem given DuckDB's lack of list binding support
+						try insert.bindValue(param_index, try scalarToList(event.arena.allocator(), scalar));
+					} else {
+						try insert.bindValue(param_index, scalar);
+					}
 				},
 			}
 		}
@@ -284,7 +309,7 @@ pub const DataSet = struct {
 					continue;
 				}
 
-				var column = Column.fromEventValue(kv.key_ptr.*, kv.value_ptr.*);
+				var column = Column.fromEventValue(try aa.dupe(u8, kv.key_ptr.*), kv.value_ptr.*);
 
 				// a column added after initial creation is always nullable, since
 				// existing events won't have a value.
@@ -325,15 +350,27 @@ pub const DataSet = struct {
 
 	fn alterColumn(self: *DataSet, column: *Column, value: Event.Value) !void {
 		switch (value) {
-			.list => unreachable, // TODO
 			.null => if (column.nullable == false) {
 				_ = try self.execFmt("alter table \"{s}\" alter column \"{s}\" drop not null", .{self.name, column.name}, .{});
 				column.nullable = true;
 			},
+			.list => |list| {
+				const target_type = compatibleListDataType(column.data_type, columnTypeForEventList(list.values));
+				if (column.is_list == false) {
+					_ = try self.execFmt("alter table \"{s}\" alter column \"{s}\" set type {s}[] using array[\"{s}\"]", .{self.name, column.name, @tagName(target_type), column.name}, .{});
+					column.is_list = true;
+					column.data_type = target_type;
+				} else if (target_type != column.data_type) {
+					_ = try self.execFmt("alter table \"{s}\" alter column \"{s}\" set type {s}[]", .{self.name, column.name, @tagName(target_type)}, .{});
+					column.is_list = true;
+					column.data_type = target_type;
+				}
+			},
 			else => {
 				const target_type = compatibleDataType(column.data_type, value);
 				if (target_type != column.data_type) {
-					_ = try self.execFmt("alter table \"{s}\" alter column \"{s}\" set type {s}", .{self.name, column.name, @tagName(target_type)}, .{});
+					const extra = if (column.is_list) "[]" else "";
+					_ = try self.execFmt("alter table \"{s}\" alter column \"{s}\" set type {s}{s}", .{self.name, column.name, @tagName(target_type), extra}, .{});
 					column.data_type = target_type;
 				}
 			},
@@ -388,7 +425,7 @@ const Column = struct {
 	pub fn fromEventValue(name: []const u8, value: Event.Value) Column {
 		const event_type = std.meta.activeTag(value);
 		const column_type = switch (value) {
-			.list => |list| columnTypeForEventList(list),
+			.list => |list| columnTypeForEventList(list.values),
 			else => columnTypeFromEventScalar(event_type),
 		};
 
@@ -556,7 +593,10 @@ fn compatibleDataType(column_type: DataType, value: Event.Value) DataType {
 			.json => return .json,
 			.null, .list => unreachable,
 		},
-		.text => return .text,
+		.text => switch (value) {
+			.json => return .json,
+			else => return .text,
+		},
 		.json => return .json,
 		.unknown => switch (value) {
 			.tinyint => return .tinyint,
@@ -576,6 +616,103 @@ fn compatibleDataType(column_type: DataType, value: Event.Value) DataType {
 	}
 }
 
+fn compatibleListDataType(column_type: DataType, list_type: DataType) DataType {
+	switch (column_type) {
+		.bool => switch (list_type) {
+			.bool => return .bool,
+			.json => return .json,
+			else => return .text,
+		},
+		.tinyint => switch (list_type) {
+			.tinyint, .unknown => return .tinyint,
+			.smallint => return .smallint,
+			.integer => return .integer,
+			.bigint => return .bigint,
+			.double => return .double,
+			.utinyint => return .smallint,
+			.usmallint => return .integer,
+			.uinteger => return .bigint,
+			.ubigint => return .text,
+			.text, .bool => return .text,
+			.json => return .json,
+		},
+		.utinyint => switch (list_type) {
+			.utinyint, .unknown => return .utinyint,
+			.usmallint => return .usmallint,
+			.uinteger => return .uinteger,
+			.ubigint => return .ubigint,
+			.double => return .double,
+			.tinyint, .smallint => return .smallint,
+			.integer => return .integer,
+			.bigint => return .bigint,
+			.text, .bool => return .text,
+			.json => return .json,
+		},
+		.smallint => switch (list_type) {
+			.utinyint, .tinyint, .smallint, .unknown => return .smallint,
+			.integer => return .integer,
+			.bigint => return .bigint,
+			.double => return .double,
+			.usmallint => return .integer,
+			.uinteger => return .bigint,
+			.ubigint => return .text,
+			.text, .bool => return .text,
+			.json => return .json,
+		},
+		.usmallint => switch (list_type) {
+			.utinyint, .usmallint, .unknown => return .usmallint,
+			.uinteger => return .uinteger,
+			.ubigint => return .ubigint,
+			.double => return .double,
+			.tinyint, .smallint, .integer => return .integer,
+			.bigint => return .bigint,
+			.text, .bool => return .text,
+			.json => return .json,
+		},
+		.integer => switch (list_type) {
+			.utinyint, .tinyint, .smallint, .usmallint, .integer, .unknown => return .integer,
+			.bigint => return .bigint,
+			.double => return .double,
+			.uinteger => return .bigint,
+			.ubigint => return .text,
+			.text, .bool => return .text,
+			.json => return .json,
+		},
+		.uinteger => switch (list_type) {
+			.utinyint, .usmallint, .uinteger, .unknown => return .uinteger,
+			.ubigint => return .ubigint,
+			.double => return .double,
+			.tinyint, .smallint, .integer, .bigint => return .bigint,
+			.text, .bool => return .text,
+			.json => return .json,
+		},
+		.bigint => switch (list_type) {
+			.utinyint, .tinyint, .smallint, .usmallint, .integer, .uinteger, .bigint, .unknown => return .bigint,
+			.double => return .double,
+			.ubigint => return .text,
+			.text, .bool => return .text,
+			.json => return .json,
+		},
+		.ubigint => switch (list_type) {
+			.utinyint, .usmallint, .uinteger, .ubigint, .unknown => return .ubigint,
+			.double => return .double,
+			.tinyint, .smallint, .integer, .bigint => return .bigint,
+			.text, .bool => return .text,
+			.json => return .json,
+		},
+		.double => switch (list_type) {
+			.tinyint, .utinyint, .smallint, .usmallint, .integer, .uinteger, .bigint, .ubigint, .double, .unknown => return .double,
+			.text, .bool => return .text,
+			.json => return .json,
+		},
+		.text => switch (list_type) {
+			.json => return .json,
+			else => return .text,
+		},
+		.json => return .json,
+		.unknown => return list_type,
+	}}
+
 fn generateInsertOnePrepared(allocator: Allocator, conn: *zuckdb.Conn, name: []const u8, columns: []Column) !zuckdb.Stmt {
 	var sb = zul.StringBuilder.init(allocator);
 	defer sb.deinit();
@@ -593,8 +730,15 @@ fn generateInsertOnePrepared(allocator: Allocator, conn: *zuckdb.Conn, name: []c
 
 	try sb.write(")\nvalues (");
 	const writer = sb.writer();
-	for (0..columns.len) |i| {
-		try std.fmt.format(writer, "${d}, ", .{i+1});
+	for (columns, 1..) |c, i| {
+		if (c.is_list) {
+			// This is a [temp??] hack. There's no great way to insert lists in
+			// DuckDB's C API (seriously), but if we pass it a JSON string and tell it
+			// it's json, it'll convert it for us
+			try std.fmt.format(writer, "${d}::json, ", .{i});
+		} else {
+			try std.fmt.format(writer, "${d}, ", .{i});
+		}
 	}
 	// strip out the trailing comma + space
 	sb.truncate(2);
@@ -607,6 +751,16 @@ fn generateInsertOnePrepared(allocator: Allocator, conn: *zuckdb.Conn, name: []c
 
 fn sortColumns(_: void, a: Column, b: Column) bool {
 	return std.ascii.lessThanIgnoreCase(a.name, b.name);
+}
+
+// The column is a list, but we only have a single value. Because DuckDB doesn't
+// have binding support for lists, dealing with lists is already weird, and is
+// weirder in this case. We "bind" a list by binding the JSON string and relying
+// on DuckDB's auto conversion.
+fn scalarToList(allocator: Allocator, value: anytype) ![]const u8 {
+	const T = @TypeOf(value);
+	const arr = [1]T{value};
+	return std.json.stringifyAlloc(allocator, &arr, .{});
 }
 
 const t = logdk.testing;
@@ -765,7 +919,7 @@ test "columnTypeForEventList" {
 fn testColumnTypeEventList(comptime event_value: []const u8) DataType {
 	const event = Event.parse(t.allocator, "{\"list\": [" ++ event_value ++ "]}") catch unreachable;
 	defer event.deinit();
-	return columnTypeForEventList(event.map.get("list").?.list);
+	return columnTypeForEventList(event.map.get("list").?.list.values);
 }
 
 test "DataSet: columnsFromEvent" {
@@ -778,10 +932,16 @@ test "DataSet: columnsFromEvent" {
 	defer event.deinit();
 
 	const columns = try DataSet.columnsFromEvent(t.allocator, event);
-	defer t.allocator.free(columns);
+	defer {
+		// this is normally managed by an arena
+		for (columns) |c| {
+			t.allocator.free(c.name);
+		}
+		t.allocator.free(columns);
+	}
 
 	try t.expectEqual(5, columns.len);
-	try t.expectEqual(.{.name = "details.handle", .is_list = false, .nullable = false, .data_type = .usmallint}, columns[0]);
+	try t.expectEqual(.{.name = "details", .is_list = false, .nullable = false, .data_type = .json}, columns[0]);
 	try t.expectEqual(.{.name = "id", .is_list = false, .nullable = false, .data_type = .uinteger}, columns[1]);
 	try t.expectEqual(.{.name = "l1", .is_list = true, .nullable = false, .data_type = .integer}, columns[2]);
 	try t.expectEqual(.{.name = "l2", .is_list = false, .nullable = false, .data_type = .json}, columns[3]);
@@ -863,6 +1023,116 @@ test "DataSet: record simple" {
 		try t.expectEqual("maybe", row.get([]const u8, 4));
 		try t.expectEqual(229, row.get(f64, 5));
 		try t.expectEqual(-2, row.get(i8, 6));
+	}
+}
+
+test "DataSet: record with list" {
+	var tc = t.context(.{});
+	defer tc.deinit();
+
+	const ds = try testDataSetWithList(tc);
+
+	{
+		// history is added for another part of this test later
+		const event = try Event.parse(t.allocator, "{\"id\": 1, \"tags\": [1, 9], \"history\": 9991}");
+		try ds.record(event);
+
+		var row = (try ds.conn.row("select \"$id\", \"$inserted\", id, tags from dataset_list_test where id =  1", .{})).?;
+		defer row.deinit();
+
+		try t.expectEqual(1, row.get(i32, 0));
+		try t.expectDelta(std.time.microTimestamp(), row.get(i64, 1), 5000);
+		try t.expectEqual(1, row.get(u16, 2));
+
+		const list = row.list(u8, 3).?;
+		try t.expectEqual(2, list.len);
+		try t.expectEqual(1, list.get(0));
+		try t.expectEqual(9, list.get(1));
+	}
+
+	{
+		// alter list type
+		const event = try Event.parse(t.allocator, "{\"id\": 2, \"tags\": [\"hello\"]}");
+		try ds.record(event);
+
+		{
+			var row = (try ds.conn.row("select tags from dataset_list_test where id =  2", .{})).?;
+			defer row.deinit();
+			const list = row.list([]const u8, 0).?;
+			try t.expectEqual(1, list.len);
+			try t.expectEqual("hello", list.get(0));
+		}
+
+		{
+			// check the original row too
+			var row = (try ds.conn.row("select tags from dataset_list_test where id =  1", .{})).?;
+			defer row.deinit();
+			const list = row.list([]const u8, 0).?;
+			try t.expectEqual(2, list.len);
+			try t.expectEqual("1", list.get(0));
+			try t.expectEqual("9", list.get(1));
+		}
+	}
+
+	{
+		// add a new list
+		const event = try Event.parse(t.allocator, "{\"id\": 3, \"state\": [true, false]}");
+		try ds.record(event);
+
+		var row = (try ds.conn.row("select state from dataset_list_test where id =  3", .{})).?;
+		defer row.deinit();
+		const list = row.list(bool, 0).?;
+		try t.expectEqual(2, list.len);
+		try t.expectEqual(true, list.get(0));
+		try t.expectEqual(false, list.get(1));
+	}
+
+	{
+		// convert scalar to list
+		const event = try Event.parse(t.allocator, "{\"id\": 4, \"history\": [1.1, 0.9]}");
+		try ds.record(event);
+
+		{
+			var row = (try ds.conn.row("select history from dataset_list_test where id =  4", .{})).?;
+			defer row.deinit();
+			const list = row.list(f64, 0).?;
+			try t.expectEqual(2, list.len);
+			try t.expectEqual(1.1, list.get(0));
+			try t.expectEqual(0.9, list.get(1));
+		}
+
+		{
+			// check the original row too
+			var row = (try ds.conn.row("select history from dataset_list_test where id =  1", .{})).?;
+			defer row.deinit();
+			const list = row.list(f64, 0).?;
+			try t.expectEqual(1, list.len);
+			try t.expectEqual(9991, list.get(0));
+		}
+	}
+
+	{
+		// insert scalar in list
+		const event = try Event.parse(t.allocator, "{\"id\": 5, \"tags\": \"ouch\"}");
+		try ds.record(event);
+
+		{
+			var row = (try ds.conn.row("select tags from dataset_list_test where id =  5", .{})).?;
+			defer row.deinit();
+			const list = row.list([]const u8, 0).?;
+			try t.expectEqual(1, list.len);
+			try t.expectEqual("ouch", list.get(0));
+		}
+
+		{
+			// check the original row too
+			var row = (try ds.conn.row("select tags from dataset_list_test where id =  1", .{})).?;
+			defer row.deinit();
+			const list = row.list([]const u8, 0).?;
+			try t.expectEqual(2, list.len);
+			try t.expectEqual("1", list.get(0));
+			try t.expectEqual("9", list.get(1));
+		}
 	}
 }
 
@@ -954,5 +1224,18 @@ fn testDataSet(tc: *t.Context) !*DataSet {
 	);
 	defer event.deinit();
 	const actor_id = try tc.app.createDataSet(tc.env(), "dataset_test", event);
+	return tc.app.dispatcher.unsafeInstance(DataSet, actor_id);
+}
+
+fn testDataSetWithList(tc: *t.Context) !*DataSet {
+	const event = try Event.parse(t.allocator,
+		\\ {
+		\\    "id": 393,
+		\\    "tags": [1, 9],
+		\\    "history": 7.2
+		\\ }
+	);
+	defer event.deinit();
+	const actor_id = try tc.app.createDataSet(tc.env(), "dataset_list_test", event);
 	return tc.app.dispatcher.unsafeInstance(DataSet, actor_id);
 }
