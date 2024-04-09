@@ -153,6 +153,13 @@ pub const Context = struct {
 		}
 	}
 
+	pub fn recordEvent(self: *Context, dataset_name: []const u8, event_json: []const u8) !void {
+		const event = try logdk.Event.parse(allocator, event_json);
+		const actor_id = self.app.getDataSet(dataset_name).?;
+		const dataset = self.app.dispatcher.unsafeInstance(logdk.DataSet, actor_id);
+		try dataset.handle(.{.record = event});
+	}
+
 	// pub fn event(self: *const Context, s: anytype) typed.Map {
 	// 	const str = std.json.stringifyAlloc(self.arena, s, .{}) catch unreachable;
 	// 	return std.json.parseFromSliceLeaky(typed.Map, self.arena, str, .{}) catch unreachable;

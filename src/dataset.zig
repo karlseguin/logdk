@@ -172,6 +172,11 @@ pub const DataSet = struct {
 						try insert.bindValue(param_index, null);
 					},
 					.list => |list| {
+						if (column.data_type == .json) {
+							try insert.bindValue(param_index, list.json);
+							continue;
+						}
+
 						if (column.is_list == false) {
 							try self.alter(param_index, value, event, used_fields);
 							break :first_pass;
@@ -223,7 +228,7 @@ pub const DataSet = struct {
 			const value = event.get(column.name) orelse Event.Value{.null = {}};
 			switch (value) {
 				.list => |list| {
-					std.debug.assert(column.is_list);
+					std.debug.assert(column.is_list or column.data_type == .json);
 					try insert.bindValue(param_index, list.json);
 				},
 				.null => {
@@ -423,11 +428,18 @@ const Column = struct {
 	}
 
 	pub fn fromEventValue(name: []const u8, value: Event.Value) Column {
-		const event_type = std.meta.activeTag(value);
+		var event_type = std.meta.activeTag(value);
 		const column_type = switch (value) {
 			.list => |list| columnTypeForEventList(list.values),
 			else => columnTypeFromEventScalar(event_type),
 		};
+
+		// instead of having a json[] column, we're going to have a json column
+		// which holds an array. I *think* this is more usable.
+		if (event_type == .list and column_type == .json) {
+			event_type = .json;
+		}
+
 
 		return .{
 			.name = name,
@@ -478,7 +490,8 @@ fn columnTypeForEventList(list: []const Event.Value) DataType {
 	const first = list[0];
 	var candidate = columnTypeFromEventScalar(std.meta.activeTag(first));
 	for (list[1..]) |value| {
-		candidate = compatibleDataType(candidate, value);
+		const maybe = compatibleDataType(candidate, value);
+		candidate = if ((maybe == .text and candidate != .text) or (maybe == .text and std.meta.activeTag(value) != .text)) .json else maybe;
 	}
 	return candidate;
 }
@@ -620,8 +633,7 @@ fn compatibleListDataType(column_type: DataType, list_type: DataType) DataType {
 	switch (column_type) {
 		.bool => switch (list_type) {
 			.bool => return .bool,
-			.json => return .json,
-			else => return .text,
+			else => return .json,
 		},
 		.tinyint => switch (list_type) {
 			.tinyint, .unknown => return .tinyint,
@@ -633,8 +645,7 @@ fn compatibleListDataType(column_type: DataType, list_type: DataType) DataType {
 			.usmallint => return .integer,
 			.uinteger => return .bigint,
 			.ubigint => return .text,
-			.text, .bool => return .text,
-			.json => return .json,
+			.text, .bool, .json => return .json,
 		},
 		.utinyint => switch (list_type) {
 			.utinyint, .unknown => return .utinyint,
@@ -645,8 +656,7 @@ fn compatibleListDataType(column_type: DataType, list_type: DataType) DataType {
 			.tinyint, .smallint => return .smallint,
 			.integer => return .integer,
 			.bigint => return .bigint,
-			.text, .bool => return .text,
-			.json => return .json,
+			.text, .bool, .json => return .json,
 		},
 		.smallint => switch (list_type) {
 			.utinyint, .tinyint, .smallint, .unknown => return .smallint,
@@ -656,8 +666,7 @@ fn compatibleListDataType(column_type: DataType, list_type: DataType) DataType {
 			.usmallint => return .integer,
 			.uinteger => return .bigint,
 			.ubigint => return .text,
-			.text, .bool => return .text,
-			.json => return .json,
+			.text, .bool, .json => return .json,
 		},
 		.usmallint => switch (list_type) {
 			.utinyint, .usmallint, .unknown => return .usmallint,
@@ -666,8 +675,7 @@ fn compatibleListDataType(column_type: DataType, list_type: DataType) DataType {
 			.double => return .double,
 			.tinyint, .smallint, .integer => return .integer,
 			.bigint => return .bigint,
-			.text, .bool => return .text,
-			.json => return .json,
+			.text, .bool, .json => return .json,
 		},
 		.integer => switch (list_type) {
 			.utinyint, .tinyint, .smallint, .usmallint, .integer, .unknown => return .integer,
@@ -675,39 +683,34 @@ fn compatibleListDataType(column_type: DataType, list_type: DataType) DataType {
 			.double => return .double,
 			.uinteger => return .bigint,
 			.ubigint => return .text,
-			.text, .bool => return .text,
-			.json => return .json,
+			.text, .bool, .json => return .json,
 		},
 		.uinteger => switch (list_type) {
 			.utinyint, .usmallint, .uinteger, .unknown => return .uinteger,
 			.ubigint => return .ubigint,
 			.double => return .double,
 			.tinyint, .smallint, .integer, .bigint => return .bigint,
-			.text, .bool => return .text,
-			.json => return .json,
+			.text, .json, .bool => return .json,
 		},
 		.bigint => switch (list_type) {
 			.utinyint, .tinyint, .smallint, .usmallint, .integer, .uinteger, .bigint, .unknown => return .bigint,
 			.double => return .double,
 			.ubigint => return .text,
-			.text, .bool => return .text,
-			.json => return .json,
+			.text, .json, .bool => return .json,
 		},
 		.ubigint => switch (list_type) {
 			.utinyint, .usmallint, .uinteger, .ubigint, .unknown => return .ubigint,
 			.double => return .double,
 			.tinyint, .smallint, .integer, .bigint => return .bigint,
-			.text, .bool => return .text,
-			.json => return .json,
+			.text, .json, .bool => return .json,
 		},
 		.double => switch (list_type) {
 			.tinyint, .utinyint, .smallint, .usmallint, .integer, .uinteger, .bigint, .ubigint, .double, .unknown => return .double,
-			.text, .bool => return .text,
-			.json => return .json,
+			.text, .bool, .json => return .json,
 		},
 		.text => switch (list_type) {
-			.json => return .json,
-			else => return .text,
+			.text => return .text,
+			else => return .json,
 		},
 		.json => return .json,
 		.unknown => return list_type,
@@ -793,19 +796,19 @@ test "Column: writeDDL" {
 test "columnTypeForEventList" {
 	try t.expectEqual(.text, columnTypeForEventList(&.{}));
 	{
-		// tinyint transation
+		// tinyint
 		try t.expectEqual(.tinyint, testColumnTypeEventList("-1, -20, -128"));
 		try t.expectEqual(.tinyint, testColumnTypeEventList("-1, -20, 127"));
 		try t.expectEqual(.smallint, testColumnTypeEventList("-1, -20, 128"));
 		try t.expectEqual(.integer, testColumnTypeEventList("-1, -20, 32768"));
 		try t.expectEqual(.bigint, testColumnTypeEventList("-1, -20, 2147483648"));
-		try t.expectEqual(.text, testColumnTypeEventList("-1, -20, 9223372036854775808"));
+		try t.expectEqual(.json, testColumnTypeEventList("-1, -20, 9223372036854775808"));
 		try t.expectEqual(.double, testColumnTypeEventList("-1, 1.2"));
-		try t.expectEqual(.text, testColumnTypeEventList("-1, true"));
+		try t.expectEqual(.json, testColumnTypeEventList("-1, true"));
 	}
 
 	{
-		// utinyint transation
+		// utinyint
 		try t.expectEqual(.utinyint, testColumnTypeEventList("1, 128, 255"));
 		try t.expectEqual(.usmallint, testColumnTypeEventList("1, 65535"));
 		try t.expectEqual(.uinteger, testColumnTypeEventList("1, 65536"));
@@ -817,22 +820,22 @@ test "columnTypeForEventList" {
 		try t.expectEqual(.bigint, testColumnTypeEventList("1, -2147483649"));
 		try t.expectEqual(.bigint, testColumnTypeEventList("1, -9223372036854775808"));
 		try t.expectEqual(.double, testColumnTypeEventList("1, 1.2"));
-		try t.expectEqual(.text, testColumnTypeEventList("1, false"));
+		try t.expectEqual(.json, testColumnTypeEventList("1, false"));
 	}
 
 	{
-		// smallint transition
+		// smallint
 		try t.expectEqual(.smallint, testColumnTypeEventList("-129, -20, -32768"));
 		try t.expectEqual(.smallint, testColumnTypeEventList("-129, -4832, 32767"));
 		try t.expectEqual(.integer, testColumnTypeEventList("-129, -4832, 32768"));
 		try t.expectEqual(.bigint, testColumnTypeEventList("-129, -4832, 2147483648"));
-		try t.expectEqual(.text, testColumnTypeEventList("-129, 4, 9223372036854775808"));
+		try t.expectEqual(.json, testColumnTypeEventList("-129, 4, 9223372036854775808"));
 		try t.expectEqual(.double, testColumnTypeEventList("-129, 1.2"));
-		try t.expectEqual(.text, testColumnTypeEventList("-129, true"));
+		try t.expectEqual(.json, testColumnTypeEventList("-129, true"));
 	}
 
 	{
-		// usmallint transation
+		// usmallint
 		try t.expectEqual(.usmallint, testColumnTypeEventList("256, 128, 255"));
 		try t.expectEqual(.usmallint, testColumnTypeEventList("256, 65535"));
 		try t.expectEqual(.uinteger, testColumnTypeEventList("256, 65536"));
@@ -844,20 +847,20 @@ test "columnTypeForEventList" {
 		try t.expectEqual(.bigint, testColumnTypeEventList("256, -2147483649"));
 		try t.expectEqual(.bigint, testColumnTypeEventList("256, -9223372036854775808"));
 		try t.expectEqual(.double, testColumnTypeEventList("256, 1.2"));
-		try t.expectEqual(.text, testColumnTypeEventList("256, false"));
+		try t.expectEqual(.json, testColumnTypeEventList("256, false"));
 	}
 
 	{
-		// integer transition
+		// integer
 		try t.expectEqual(.integer, testColumnTypeEventList("-32769, -20, -2147483647"));
 		try t.expectEqual(.bigint, testColumnTypeEventList("-32769, -4832, 2147483648"));
-		try t.expectEqual(.text, testColumnTypeEventList("-32769, 4, 9223372036854775808"));
+		try t.expectEqual(.json, testColumnTypeEventList("-32769, 4, 9223372036854775808"));
 		try t.expectEqual(.double, testColumnTypeEventList("-32769, 1.2"));
-		try t.expectEqual(.text, testColumnTypeEventList("-32769, true"));
+		try t.expectEqual(.json, testColumnTypeEventList("-32769, true"));
 	}
 
 	{
-		// uinteger transation
+		// uinteger
 		try t.expectEqual(.uinteger, testColumnTypeEventList("65536, 128, 255"));
 		try t.expectEqual(.uinteger, testColumnTypeEventList("65536, 4294967295"));
 		try t.expectEqual(.ubigint, testColumnTypeEventList("65536, 4294967296"));
@@ -868,20 +871,20 @@ test "columnTypeForEventList" {
 		try t.expectEqual(.bigint, testColumnTypeEventList("65536, -2147483649"));
 		try t.expectEqual(.bigint, testColumnTypeEventList("65536, -9223372036854775808"));
 		try t.expectEqual(.double, testColumnTypeEventList("65536, 1.2"));
-		try t.expectEqual(.text, testColumnTypeEventList("65536, false"));
+		try t.expectEqual(.json, testColumnTypeEventList("65536, false"));
 	}
 
 	{
-		// bigint transition
+		// bigint
 		try t.expectEqual(.bigint, testColumnTypeEventList("-2147483649, -20, -9223372036854775808"));
 		try t.expectEqual(.bigint, testColumnTypeEventList("-2147483649, -4832, 9223372036854775807"));
-		try t.expectEqual(.text, testColumnTypeEventList("-2147483649, 4, 9223372036854775808"));
+		try t.expectEqual(.json, testColumnTypeEventList("-2147483649, 4, 9223372036854775808"));
 		try t.expectEqual(.double, testColumnTypeEventList("-2147483649, 1.2"));
-		try t.expectEqual(.text, testColumnTypeEventList("-2147483649, true"));
+		try t.expectEqual(.json, testColumnTypeEventList("-2147483649, true"));
 	}
 
 	{
-		// ubigint transation
+		// ubigint
 		try t.expectEqual(.ubigint, testColumnTypeEventList("4294967296, 128, 255"));
 		try t.expectEqual(.ubigint, testColumnTypeEventList("4294967296, 4294967295"));
 		try t.expectEqual(.ubigint, testColumnTypeEventList("4294967296, 18446744073709551615"));
@@ -891,28 +894,28 @@ test "columnTypeForEventList" {
 		try t.expectEqual(.bigint, testColumnTypeEventList("4294967296, -2147483649"));
 		try t.expectEqual(.bigint, testColumnTypeEventList("4294967296, -9223372036854775808"));
 		try t.expectEqual(.double, testColumnTypeEventList("4294967296, 1.2"));
-		try t.expectEqual(.text, testColumnTypeEventList("4294967296, false"));
+		try t.expectEqual(.json, testColumnTypeEventList("4294967296, false"));
 	}
 
 	{
-		// double transition
+		// double
 		try t.expectEqual(.double, testColumnTypeEventList("1.02, -20, 43384848"));
-		try t.expectEqual(.text, testColumnTypeEventList("-2147483649, 4, 9223372036854775808"));
-		try t.expectEqual(.text, testColumnTypeEventList("-2147483649, true"));
+		try t.expectEqual(.json, testColumnTypeEventList("-2147483649, 4, 9223372036854775808"));
+		try t.expectEqual(.json, testColumnTypeEventList("-2147483649, true"));
 	}
 
 	{
-		// bool transition
+		// bool
 		try t.expectEqual(.bool, testColumnTypeEventList("true, false, true"));
-		try t.expectEqual(.text, testColumnTypeEventList("false, 0"));
-		try t.expectEqual(.text, testColumnTypeEventList("true, \"hello\""));
+		try t.expectEqual(.json, testColumnTypeEventList("false, 0"));
+		try t.expectEqual(.json, testColumnTypeEventList("true, \"hello\""));
 	}
 
 	{
-		// text transition
+		// text
 		try t.expectEqual(.text, testColumnTypeEventList("\"a\", \"abc\", \"213\""));
-		try t.expectEqual(.text, testColumnTypeEventList("\"a\", 0"));
-		try t.expectEqual(.text, testColumnTypeEventList("\"a\", 123.4, true"));
+		try t.expectEqual(.json, testColumnTypeEventList("\"a\", 0"));
+		try t.expectEqual(.json, testColumnTypeEventList("\"a\", 123.4, true"));
 	}
 }
 
@@ -1060,7 +1063,7 @@ test "DataSet: record with list" {
 			defer row.deinit();
 			const list = row.list([]const u8, 0).?;
 			try t.expectEqual(1, list.len);
-			try t.expectEqual("hello", list.get(0));
+			try t.expectEqual("\"hello\"", list.get(0));
 		}
 
 		{
@@ -1121,7 +1124,7 @@ test "DataSet: record with list" {
 			defer row.deinit();
 			const list = row.list([]const u8, 0).?;
 			try t.expectEqual(1, list.len);
-			try t.expectEqual("ouch", list.get(0));
+			try t.expectEqual("\"ouch\"", list.get(0));
 		}
 
 		{

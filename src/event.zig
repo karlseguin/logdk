@@ -215,6 +215,7 @@ const Parser = struct {
 						}
 					}
 				}
+
 				return .{.value = .{.list = .{.json = scanner.input[array_start..scanner.cursor], .values = arr.items}}};
 			},
 			.object_begin => {

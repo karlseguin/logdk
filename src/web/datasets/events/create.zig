@@ -94,6 +94,7 @@ test "events.create: creates dataset and event" {
 		.active = true,
 		.category = "system",
 		.tags = &[_]std.json.Value{.{.string = "teg"}, .{.float = 1.32}},
+		.zrecord = &[_]std.json.Value{.{.integer = 394}, .{.float = 590.1}},
 		.details = .{
 			.over = 9000.1,
 		}
@@ -111,9 +112,10 @@ test "events.create: creates dataset and event" {
 	try t.expectEqual("system", row.get([]const u8, 3));                 // category
 	try t.expectEqual("{\"over\":9.0001e3}", row.get([]const u8, 4));    // details
 	try t.expectEqual(552, row.get(u16, 5));                             // id
+	try t.expectEqual("[\"teg\",1.32e0]", row.get([]const u8, 6));       // details
 
-	const list = row.list([]const u8, 6).?;                             // tags
+	const list = row.list(f64, 7).?;                                    // zrecord
 	try t.expectEqual(2, list.len);
-	try t.expectEqual("teg", list.get(0));
-	try t.expectEqual("1.32", list.get(1));
+	try t.expectEqual(394, list.get(0));
+	try t.expectEqual(590.1, list.get(1));
 }

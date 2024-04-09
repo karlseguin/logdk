@@ -15,12 +15,11 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 	_ = app.getDataSet(name) orelse return web.notFound(res, "dataset not found");
 
 	const query = try req.query();
-	const include_total = if (query.get("total")) |total| std.mem.eql(u8, total, "true") else false;
+	const include_total = if (query.get("total")) |value| std.mem.eql(u8, value, "true") else false;
 	_ = include_total;
 
 	const buf = try app.buffers.acquire();
 	defer buf.release();
-
 
 	// This is relatively safe because the name was validated when the dataset was
 	// created. If `name` was invalid/unsafe, then the dataset never wouldn't exist
@@ -46,11 +45,6 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 
 	res.content_type = .JSON;
 
-	const first_row = (try rows.next()) orelse {
-		res.body = "{\"cols\":[],\"rows\":[]}";
-		return;
-	};
-
 	buf.clearRetainingCapacity();
 	const writer = buf.writer();
 
@@ -67,21 +61,40 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 	}
 	// strip out the last comma
 	buf.truncate(1);
-	try buf.write("],\n \"rows\": [\n  [");
-	try res.chunk(buf.string());
 
-	buf.clearRetainingCapacity();
-	try serializeRow(&first_row, column_types, buf);
-	try res.chunk(buf.string());
+	if (try rows.next()) |first_row| {
+		try buf.write("],\n \"types\": [");
 
-	while (try rows.next()) |row| {
-		buf.clearRetainingCapacity();
-		buf.writeAssumeCapacity("],\n  [");
-		try serializeRow(&row, column_types, buf);
+		for (column_types, 0..) |column_type, i| {
+			try buf.writeByte('"');
+			switch (column_type) {
+				.list => try writeListType(rows.result, i, buf),
+				.varchar => try writeVarcharType(rows.result, i, buf),
+				else => try buf.write(@tagName(column_type)),
+			}
+			try buf.write("\",");
+		}
+		buf.truncate(1);
+		try buf.write("],\n \"rows\": [");
+
+		try buf.write("\n  [");
+		try serializeRow(&first_row, column_types, buf);
 		try res.chunk(buf.string());
+		buf.clearRetainingCapacity();
+
+		while (try rows.next()) |row| {
+			buf.writeAssumeCapacity("],\n  [");
+			try serializeRow(&row, column_types, buf);
+			try res.chunk(buf.string());
+			buf.clearRetainingCapacity();
+		}
+		try buf.writeByte(']');
+	} else {
+		try buf.write("],\"rows\":[");
 	}
 
-	try res.chunk("]\n ]\n}");
+	try buf.write("\n]\n}");
+	try res.chunk(buf.string());
 }
 
 fn serializeRow(row: *const zuckdb.Row, column_types: []zuckdb.ParameterType, buf: *zul.StringBuilder) !void {
@@ -116,7 +129,6 @@ fn serializeRow(row: *const zuckdb.Row, column_types: []zuckdb.ParameterType, bu
 	// overwrite the last trailing comma
 	buf.truncate(1);
 }
-
 
 // src can either be a zuckdb.Row or a zuckdb.LazyList
 fn translateScalar(src: anytype, column_type: zuckdb.ParameterType, i: usize, writer: anytype) !void {
@@ -161,6 +173,30 @@ fn translateScalar(src: anytype, column_type: zuckdb.ParameterType, i: usize, wr
 	}
 }
 
+fn writeListType(result: *zuckdb.c.duckdb_result, column_index: usize, buf: *zul.StringBuilder) !void {
+	var logical_type = zuckdb.c.duckdb_column_logical_type(result, column_index);
+	defer zuckdb.c.duckdb_destroy_logical_type(&logical_type);
+
+	var child_type = zuckdb.c.duckdb_list_type_child_type(logical_type);
+	defer zuckdb.c.duckdb_destroy_logical_type(&child_type);
+
+	const duckdb_type = zuckdb.c.duckdb_get_type_id(child_type);
+	const named_type = zuckdb.ParameterType.fromDuckDBType(duckdb_type);
+	try buf.write(@tagName(named_type));
+	try buf.write("[]");
+}
+
+fn writeVarcharType(result: *zuckdb.c.duckdb_result, column_index: usize, buf: *zul.StringBuilder) !void {
+	var logical_type = zuckdb.c.duckdb_column_logical_type(result, column_index);
+	defer zuckdb.c.duckdb_destroy_logical_type(&logical_type);
+	const alias = zuckdb.c.duckdb_logical_type_get_alias(logical_type);
+	if (alias == null) {
+		return buf.write("varchar");
+	}
+ 	defer zuckdb.c.duckdb_free(alias);
+ 	return buf.write(std.mem.span(alias));
+}
+
 const t = logdk.testing;
 test "events.index: unknown dataset" {
 	var tc = t.context(.{});
@@ -175,15 +211,12 @@ test "events.index: empty result" {
 	var tc = t.context(.{});
 	defer tc.deinit();
 
-	try tc.createDataSet(
-		"ds1",
-		\\{"id": 1}
-	, false);
+	try tc.createDataSet("ds1", "{\"id\": 1}", false);
 
 	tc.web.param("name", "ds1");
 	try handler(tc.env(), tc.web.req, tc.web.res);
 	try tc.web.expectJson(.{
-		.cols = &[_][]const u8{},
+		.cols = &[_][]const u8{"$id", "$inserted", "id"},
 		.rows = &[_][]const u8{},
 	});
 }
@@ -204,7 +237,7 @@ test "events.index: single row" {
 		\\  "text": "over 9000",
 		\\  "null": null,
 		\\  "details": {"message": "1", "tags": [1, 2, 3]},
-		\\  "mixed_list": [1, "2", true],
+		\\  "mixed_list": [1, "two", true],
 		\\  "list": [0.1, 2.2, -33.33]
 		\\ }
 	, true);
@@ -212,21 +245,8 @@ test "events.index: single row" {
 	tc.web.param("name", "ds1");
 	try handler(tc.env(), tc.web.req, tc.web.res);
 	try tc.web.expectJson(.{
-		.cols = &[_][]const u8{
-			"$id",
-			"$inserted",
-			"details",
-			"false",
-			"float_neg",
-			"float_pos",
-			"int",
-			"list",
-			"mixed_list",
-			"null",
-			"text",
-			"true",
-			"uint",
-		},
+		.cols = &[_][]const u8{"$id", "$inserted", "details", "false", "float_neg", "float_pos", "int", "list", "mixed_list", "null", "text", "true", "uint"},
+		.types = &[_][]const u8{"u32", "timestamptz", "JSON", "bool", "f64", "f64", "i16", "f64[]", "JSON", "varchar", "varchar", "bool", "u32"},
 		.rows = &[_][]const std.json.Value{
 			&[_]std.json.Value{
 				.{.integer = 1},
@@ -239,13 +259,38 @@ test "events.index: single row" {
 				.{.array = std.json.Array.fromOwnedSlice(undefined, @constCast(&[_]std.json.Value{
 					.{.float = 0.1}, .{.float = 2.2}, .{.float = -33.33},
 				}))},
-				.{.array = std.json.Array.fromOwnedSlice(undefined, @constCast(&[_]std.json.Value{
-					.{.string = "1"}, .{.string = "2"}, .{.string = "true"},
-				}))},
+				.{.string = "[1, \"two\", true]"},
 				.{.null = {}},
 				.{.string = "over 9000"},
 				.{.bool = true},
 				.{.integer = 98823},
+			}
+		},
+	});
+}
+
+test "events.index: multiple rows" {
+	var tc = t.context(.{});
+	defer tc.deinit();
+
+	try tc.createDataSet("ds1", "{\"int\": 99}", true);
+	try tc.recordEvent("ds1", "{\"int\": 4913}");
+
+	tc.web.param("name", "ds1");
+	try handler(tc.env(), tc.web.req, tc.web.res);
+	try tc.web.expectJson(.{
+		.cols = &[_][]const u8{"$id", "$inserted", "int"},
+		.types = &[_][]const u8{"u32", "timestamptz", "u16"},
+		.rows = &[_][]const std.json.Value{
+			&[_]std.json.Value{
+				.{.integer = 1},
+				.{.integer = try tc.scalar(i64, "select \"$inserted\" from ds1 where \"$id\" = 1", .{})},
+				.{.integer = 99},
+			},
+			&[_]std.json.Value{
+				.{.integer = 2},
+				.{.integer = try tc.scalar(i64, "select \"$inserted\" from ds1 where \"$id\" = 2", .{})},
+				.{.integer = 4913},
 			}
 		},
 	});
