@@ -4,5 +4,9 @@ zig-cache/
 *.so
 *.dylib
 lib/zul
+lib/http.zig
+lib/metrics.zig
+lib/websocket.zig
 lib/zuckdb.zig
 db.duckdb*
+

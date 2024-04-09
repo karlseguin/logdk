@@ -15,7 +15,7 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 	_ = app.getDataSet(name) orelse return web.notFound(res, "dataset not found");
 
 	const query = try req.query();
-	const include_total = if (query.get("total")) |t| std.mem.eql(u8, t, "true") else false;
+	const include_total = if (query.get("total")) |total| std.mem.eql(u8, total, "true") else false;
 	_ = include_total;
 
 	const buf = try app.buffers.acquire();
@@ -27,7 +27,7 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 	// and app.getDataSet above would have returned null;
 	try buf.write("select * from \"");
 	try buf.write(name);
-	try buf.write("\" where \"$id\" >= 56071478 order by \"$id\" desc limit 100");
+	try buf.write("\"");
 
 	var conn = try app.db.acquire();
 	defer conn.release();
@@ -43,6 +43,8 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 		else => return err,
 	};
 	defer rows.deinit();
+
+	res.content_type = .JSON;
 
 	const first_row = (try rows.next()) orelse {
 		res.body = "{\"cols\":[],\"rows\":[]}";
@@ -86,26 +88,24 @@ fn serializeRow(row: *const zuckdb.Row, column_types: []zuckdb.ParameterType, bu
 	const writer = buf.writer();
 
 	for (column_types, 0..) |column_type, i| {
-		if (row.isNull(i)) {
-			try buf.write("null,");
-		}
-
 		switch (column_type) {
 			.list => {
 				const list = row.lazyList(i) orelse {
 					try buf.write("null,");
 					continue;
 				};
-				_ = list;
-				// var typed_list = typed.Array.init(aa);
-				// try typed_list.ensureTotalCapacity(list.len);
-				// for (0..list.len) |list_index| {
-				// 	if (list.isNull(list_index)) {
-				// 		typed_list.appendAssumeCapacity(.{.null = {}});
-				// 	} else {
-				// 		typed_list.appendAssumeCapacity(try translateScalar(aa, &list, list.type, list_index));
-				// 	}
-				// }
+				if (list.len == 0) {
+					try buf.write("[],");
+					continue;
+				}
+				try buf.writeByte('[');
+				for (0..list.len) |list_index| {
+					try translateScalar(&list, list.type, list_index, writer);
+					try buf.writeByte(',');
+				}
+				// overwrite the last trailing comma
+				buf.truncate(1);
+				try buf.write("],");
 			},
 			else => {
 				try translateScalar(row, column_type, i, writer);
@@ -120,6 +120,10 @@ fn serializeRow(row: *const zuckdb.Row, column_types: []zuckdb.ParameterType, bu
 
 // src can either be a zuckdb.Row or a zuckdb.LazyList
 fn translateScalar(src: anytype, column_type: zuckdb.ParameterType, i: usize, writer: anytype) !void {
+	if (src.isNull(i)) {
+		return writer.writeAll("null");
+	}
+
 	switch (column_type) {
 		.varchar => try std.json.encodeJsonString(src.get([]const u8, i), .{}, writer),
 		.bool => try writer.writeAll(if (src.get(bool, i)) "true" else "false"),
@@ -157,14 +161,92 @@ fn translateScalar(src: anytype, column_type: zuckdb.ParameterType, i: usize, wr
 	}
 }
 
-// fn serializeRow(row: []typed.Value, prefix: []const u8, sb: *zul.StringBuilder, writer: anytype) ![]const u8 {
-// 	sb.clearRetainingCapacity();
-// 	try sb.write(prefix);
-// 	try std.json.stringify(row, .{}, writer);
-// 	return sb.string();
-// }
+const t = logdk.testing;
+test "events.index: unknown dataset" {
+	var tc = t.context(.{});
+	defer tc.deinit();
 
-// fn releaseBuf(state: *anyopaque) void {
-// 	const buf: *zul.StringBuilder = @alignCast(@ptrCast(state));
-// 	buf.release();
-// }
+	tc.web.param("name", "nope");
+	try handler(tc.env(), tc.web.req, tc.web.res);
+	try tc.expectNotFound("dataset not found");
+}
+
+test "events.index: empty result" {
+	var tc = t.context(.{});
+	defer tc.deinit();
+
+	try tc.createDataSet(
+		"ds1",
+		\\{"id": 1}
+	, false);
+
+	tc.web.param("name", "ds1");
+	try handler(tc.env(), tc.web.req, tc.web.res);
+	try tc.web.expectJson(.{
+		.cols = &[_][]const u8{},
+		.rows = &[_][]const u8{},
+	});
+}
+
+test "events.index: single row" {
+	var tc = t.context(.{});
+	defer tc.deinit();
+
+	try tc.createDataSet(
+		"ds1",
+		\\ {
+		\\  "int": -30029,
+		\\  "uint": 98823,
+		\\  "float_pos": 0.392,
+		\\  "float_neg": -9949283.44221,
+		\\  "true": true,
+		\\  "false": false,
+		\\  "text": "over 9000",
+		\\  "null": null,
+		\\  "details": {"message": "1", "tags": [1, 2, 3]},
+		\\  "mixed_list": [1, "2", true],
+		\\  "list": [0.1, 2.2, -33.33]
+		\\ }
+	, true);
+
+	tc.web.param("name", "ds1");
+	try handler(tc.env(), tc.web.req, tc.web.res);
+	try tc.web.expectJson(.{
+		.cols = &[_][]const u8{
+			"$id",
+			"$inserted",
+			"details",
+			"false",
+			"float_neg",
+			"float_pos",
+			"int",
+			"list",
+			"mixed_list",
+			"null",
+			"text",
+			"true",
+			"uint",
+		},
+		.rows = &[_][]const std.json.Value{
+			&[_]std.json.Value{
+				.{.integer = 1},
+				.{.integer = try tc.scalar(i64, "select \"$inserted\" from ds1 where \"$id\" = 1", .{})},
+				.{.string = "{\"message\": \"1\", \"tags\": [1, 2, 3]}"},
+				.{.bool = false},
+				.{.float = -9949283.44221},
+				.{.float = 0.392},
+				.{.integer = -30029},
+				.{.array = std.json.Array.fromOwnedSlice(undefined, @constCast(&[_]std.json.Value{
+					.{.float = 0.1}, .{.float = 2.2}, .{.float = -33.33},
+				}))},
+				.{.array = std.json.Array.fromOwnedSlice(undefined, @constCast(&[_]std.json.Value{
+					.{.string = "1"}, .{.string = "2"}, .{.string = "true"},
+				}))},
+				.{.null = {}},
+				.{.string = "over 9000"},
+				.{.bool = true},
+				.{.integer = 98823},
+			}
+		},
+	});
+}

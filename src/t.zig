@@ -77,6 +77,12 @@ pub const Context = struct {
 		}
 	}
 
+	pub fn flushMessages(self: *Context) void {
+		// brute force, since we can't process any more messages after this
+		// but should be good enough for most cases.
+		self.app.dispatcher.stop();
+	}
+
 	pub fn env(self: *Context) *Env {
 		if (self._env) |e| {
 			return e;
@@ -134,6 +140,17 @@ pub const Context = struct {
 
 	pub fn conn(self: *Context) *zuckdb.Conn  {
 		return self.app.db.acquire() catch unreachable;
+	}
+
+	pub fn createDataSet(self: *Context, name: []const u8, event_json: []const u8, insert_event: bool) !void {
+		const event = try logdk.Event.parse(allocator, event_json);
+		const actor_id = try self.app.createDataSet(self.env(), name, event);
+		if (insert_event) {
+			const dataset = self.app.dispatcher.unsafeInstance(logdk.DataSet, actor_id);
+			try dataset.handle(.{.record = event});
+		} else {
+			event.deinit();
+		}
 	}
 
 	// pub fn event(self: *const Context, s: anytype) typed.Map {

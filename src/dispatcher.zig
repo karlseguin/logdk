@@ -80,7 +80,12 @@ pub fn Dispatcher(comptime Q: type) type {
 		// arena, which owns all the actors. That's fine for cleaning the actual
 		// *Actor, but the values might need to be de-inited, which we leave up
 		// to the app.
-		pub fn stop(self: *const Self) void {
+		pub fn stop(self: *Self) void {
+			// we don't usually expect stop to be called twice, but it is in some tests
+			// as a brute force way to ensure all messages are flushed. So we guard against
+			// it being called twice
+			if (self.threads.len == 0) return;
+
 			var i: usize = 0;
 			inline for (@typeInfo(Q).Struct.fields) |field| {
 				for (@field(self.queues, field.name)) |*tq| {
@@ -89,6 +94,7 @@ pub fn Dispatcher(comptime Q: type) type {
 					i += 1;
 				}
 			}
+			self.threads = &[_]Thread{};
 		}
 
 		pub fn deinit(self: *Self) void {

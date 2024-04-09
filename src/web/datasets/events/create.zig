@@ -45,7 +45,6 @@ test "events.create: unknown dataset, dynamic creation disabled" {
 	try tc.expectNotFound("dataset not found and dynamic creation is disabled");
 }
 
-
 test "events.create: empty body" {
 	var tc = t.context(.{});
 	defer tc.deinit();
@@ -91,13 +90,30 @@ test "events.create: creates dataset and event" {
 
 	tc.web.param("name", "logx_x");
 	tc.web.json(.{
-		.id = 1,
+		.id = 552,
 		.active = true,
 		.category = "system",
-		.tags = &[_][]const u8{"teg", "leto"},
+		.tags = &[_]std.json.Value{.{.string = "teg"}, .{.float = 1.32}},
 		.details = .{
 			.over = 9000.1,
 		}
 	});
 	try handler(tc.env(), tc.web.req, tc.web.res);
+
+	tc.flushMessages();
+
+	const row = (try tc.row("select * from logx_x", .{})).?;
+	defer row.deinit();
+
+	try t.expectEqual(1, row.get(u32, 0));                               // $id
+	try t.expectDelta(std.time.microTimestamp(), row.get(i64, 1), 5000); // $inserted
+	try t.expectEqual(true, row.get(bool, 2));                           // active
+	try t.expectEqual("system", row.get([]const u8, 3));                 // category
+	try t.expectEqual("{\"over\":9.0001e3}", row.get([]const u8, 4));    // details
+	try t.expectEqual(552, row.get(u16, 5));                             // id
+
+	const list = row.list([]const u8, 6).?;                             // tags
+	try t.expectEqual(2, list.len);
+	try t.expectEqual("teg", list.get(0));
+	try t.expectEqual("1.32", list.get(1));
 }

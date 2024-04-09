@@ -177,7 +177,7 @@ pub const App = struct {
 			{
 				try std.fmt.format(create.writer(),
 					\\ create table {s} (
-					\\  "$id" integer not null default(nextval('{s}_id_seq')),
+					\\  "$id" uinteger not null default(nextval('{s}_id_seq')),
 					\\  "$inserted" timestamptz not null default(now())
 				, .{name, name});
 
@@ -397,7 +397,7 @@ test "App: createDataSet success" {
 	{
 		const row = (try rows.next()).?;
 		try t.expectEqual("$id", row.get([]u8, 0));  // name
-		try t.expectEqual("INTEGER", row.get([]u8, 1));  // type
+		try t.expectEqual("UINTEGER", row.get([]u8, 1));  // type
 		try t.expectEqual("NO", row.get([]u8, 2));  // nullable
 		try t.expectEqual(null, row.get(?[]u8, 3));  // key
 		try t.expectEqual("nextval('metrics_1_id_seq')", row.get([]u8, 4));  // default

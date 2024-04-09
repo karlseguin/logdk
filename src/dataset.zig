@@ -961,7 +961,7 @@ test "DataSet: record simple" {
 		var row = (try ds.conn.row("select \"$id\", \"$inserted\", id, system, active, record, category from dataset_test where id =  1", .{})).?;
 		defer row.deinit();
 
-		try t.expectEqual(1, row.get(i32, 0));
+		try t.expectEqual(1, row.get(u32, 0));
 		try t.expectDelta(std.time.microTimestamp(), row.get(i64, 1), 5000);
 		try t.expectEqual(1, row.get(u16, 2));
 		try t.expectEqual("catalog", row.get([]const u8, 3));
@@ -978,7 +978,7 @@ test "DataSet: record simple" {
 		var row = (try ds.conn.row("select \"$id\", \"$inserted\", id, system, active, record, category from dataset_test where id =  2", .{})).?;
 		defer row.deinit();
 
-		try t.expectEqual(2, row.get(i32, 0));
+		try t.expectEqual(2, row.get(u32, 0));
 		try t.expectDelta(std.time.microTimestamp(), row.get(i64, 1), 5000);
 		try t.expectEqual(2, row.get(u16, 2));
 		try t.expectEqual("other", row.get([]const u8, 3));
@@ -995,7 +995,7 @@ test "DataSet: record simple" {
 		var row = (try ds.conn.row("select \"$id\", \"$inserted\", id, system, active, record, category from dataset_test where id is null", .{})).?;
 		defer row.deinit();
 
-		try t.expectEqual(3, row.get(i32, 0));
+		try t.expectEqual(3, row.get(u32, 0));
 		try t.expectDelta(std.time.microTimestamp(), row.get(i64, 1), 5000);
 		try t.expectEqual(null, row.get(?u16, 2));
 		try t.expectEqual(null, row.get(?[]const u8, 3));
@@ -1016,7 +1016,7 @@ test "DataSet: record simple" {
 		var row = (try ds.conn.row("select \"$id\", \"$inserted\", id, system, active, record, category from dataset_test where id = -1003843293448", .{})).?;
 		defer row.deinit();
 
-		try t.expectEqual(4, row.get(i32, 0));
+		try t.expectEqual(4, row.get(u32, 0));
 		try t.expectDelta(std.time.microTimestamp(), row.get(i64, 1), 5000);
 		try t.expectEqual(-1003843293448, row.get(i64, 2));
 		try t.expectEqual("43", row.get([]const u8, 3));
@@ -1040,7 +1040,7 @@ test "DataSet: record with list" {
 		var row = (try ds.conn.row("select \"$id\", \"$inserted\", id, tags from dataset_list_test where id =  1", .{})).?;
 		defer row.deinit();
 
-		try t.expectEqual(1, row.get(i32, 0));
+		try t.expectEqual(1, row.get(u32, 0));
 		try t.expectDelta(std.time.microTimestamp(), row.get(i64, 1), 5000);
 		try t.expectEqual(1, row.get(u16, 2));
 
@@ -1149,7 +1149,7 @@ test "DataSet: record add column" {
 		var row = (try ds.conn.row("select \"$id\", \"$inserted\", id, system, active, record, category, new from dataset_test where id =  5", .{})).?;
 		defer row.deinit();
 
-		try t.expectEqual(1, row.get(i32, 0));
+		try t.expectEqual(1, row.get(u32, 0));
 		try t.expectDelta(std.time.microTimestamp(), row.get(i64, 1), 5000);
 		try t.expectEqual(5, row.get(u16, 2));
 		try t.expectEqual(null, row.get(?[]const u8, 3));
@@ -1183,7 +1183,7 @@ test "DataSet: record add column" {
 		var row = (try ds.conn.row("select \"$id\", \"$inserted\", id, system, active, record, category, new, tag1, tag2 from dataset_test where id =  6", .{})).?;
 		defer row.deinit();
 
-		try t.expectEqual(2, row.get(i32, 0));
+		try t.expectEqual(2, row.get(u32, 0));
 		try t.expectDelta(std.time.microTimestamp(), row.get(i64, 1), 5000);
 		try t.expectEqual(6, row.get(u16, 2));
 		try t.expectEqual("catalog", row.get([]const u8, 3));
