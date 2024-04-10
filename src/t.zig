@@ -143,13 +143,13 @@ pub const Context = struct {
 	}
 
 	pub fn createDataSet(self: *Context, name: []const u8, event_json: []const u8, insert_event: bool) !void {
-		const event = try logdk.Event.parse(allocator, event_json);
-		const actor_id = try self.app.createDataSet(self.env(), name, event);
+		const event_list = try logdk.Event.parse(allocator, event_json);
+		const actor_id = try self.app.createDataSet(self.env(), name, event_list.events[0]);
 		if (insert_event) {
 			const dataset = self.app.dispatcher.unsafeInstance(logdk.DataSet, actor_id);
-			try dataset.handle(.{.record = event});
+			try dataset.handle(.{.record = event_list});
 		} else {
-			event.deinit();
+			event_list.deinit();
 		}
 	}
 

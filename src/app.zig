@@ -17,8 +17,10 @@ const ValidatorPool = @import("validate").Pool;
 const BufferPool = @import("zul").StringBuilder.Pool;
 
 pub const Queues = struct {
-	meta: []d.Queue(Meta),
+	// order sadly matters, we want to shutdown the dataset workers before the
+	// meta workers, since dataset workers send messages to meta workers. Ouch.
 	dataset: []d.Queue(DataSet),
+	meta: []d.Queue(Meta),
 
 	pub fn init(allocator: Allocator) !Queues {
 		return .{
@@ -134,7 +136,7 @@ pub const App = struct {
 		return self._datasets.get(name);
 	}
 
-	pub fn createDataSet(self: *App, env: *Env, name: []const u8, event: *const Event) !usize {
+	pub fn createDataSet(self: *App, env: *Env, name: []const u8, event: Event) !usize {
 		const validator = try env.validator();
 		try logdk.Validate.TableName("dataset", name, validator);
 
@@ -353,10 +355,10 @@ test "App: createDataSet invalid column names" {
 	defer tc.deinit();
 
 	const long = "a" ** 251;
-	var event = try Event.parse(t.allocator, "{\"\": 1, \"1a\": 2, \"_a\": 3, \".a\": 4, \"a$\": 5, \"a b\": 6, \"a[b]\": 7, \"" ++ long ++ "\": 8}");
-	defer event.deinit();
+	var event_list = try Event.parse(t.allocator, "{\"\": 1, \"1a\": 2, \"_a\": 3, \".a\": 4, \"a$\": 5, \"a b\": 6, \"a[b]\": 7, \"" ++ long ++ "\": 8}");
+	defer event_list.deinit();
 
-	try t.expectError(error.Validation, tc.app.createDataSet(tc.env(), "ds", event));
+	try t.expectError(error.Validation, tc.app.createDataSet(tc.env(), "ds", event_list.events[0]));
 	try tc.expectInvalid(.{.code = 1, .field = ""});
 	try tc.expectInvalid(.{.code = 5000, .field = "1a"});
 	try tc.expectInvalid(.{.code = 5000, .field = "_a"});
@@ -371,11 +373,11 @@ test "App: createDataSet success" {
 	var tc = t.context(.{});
 	defer tc.deinit();
 
-	var event = try Event.parse(t.allocator, "{\"id\": \"cx_312\", \"tags\": null, \"monitor\": false, \"flags\": [2, 2394, -3]}");
-	defer event.deinit();
+	var event_list = try Event.parse(t.allocator, "{\"id\": \"cx_312\", \"tags\": null, \"monitor\": false, \"flags\": [2, 2394, -3]}");
+	defer event_list.deinit();
 
 	{
-		const actor_id = try tc.app.createDataSet(tc.env(), "metrics_1", event);
+		const actor_id = try tc.app.createDataSet(tc.env(), "metrics_1", event_list.events[0]);
 		try t.expectEqual(actor_id, tc.app._datasets.get("metrics_1").?);
 
 		const ds = tc.app.dispatcher.unsafeInstance(DataSet, actor_id);

@@ -16,21 +16,21 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 		break :blk null;
 	};
 
-	const event = Event.parse(app.allocator, req.body() orelse "") catch return error.InvalidJson;
-	if (event.fieldCount() == 0) {
-		event.deinit();
+	const event_list = Event.parse(app.allocator, req.body() orelse "") catch return error.InvalidJson;
+	if (event_list.events.len == 0) {
+		event_list.deinit();
 		res.status = 204;
 		return;
 	}
 
 	// once passed to the dispatcher, it because the datasets job to release this
-	errdefer event.deinit();
+	errdefer event_list.deinit();
 
 	if (dataset_id == null) {
-		dataset_id = try app.createDataSet(env, name, event);
+		dataset_id = try app.createDataSet(env, name, event_list.events[0]);
 	}
 
-	app.dispatcher.send(logdk.DataSet, dataset_id.?, .{.record = event});
+	app.dispatcher.send(logdk.DataSet, dataset_id.?, .{.record = event_list});
 	res.status = 204;
 }
 

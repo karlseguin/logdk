@@ -9,7 +9,18 @@ const MAX_FLATTEN_DEPTH = 1;
 
 pub const Event = struct {
 	map: std.StringHashMapUnmanaged(Value),
-	arena: *std.heap.ArenaAllocator,
+
+	pub const List = struct {
+		events: []Event,
+		arena: *std.heap.ArenaAllocator,
+
+		pub fn deinit(self: *const List) void {
+			const arena = self.arena;
+			const allocator = arena.child_allocator;
+			arena.deinit();
+			allocator.destroy(arena);
+		}
+	};
 
 	pub fn get(self: *const Event, field: []const u8) ?Value {
 		return self.map.get(field);
@@ -50,7 +61,7 @@ pub const Event = struct {
 		null: void,
 		text: []const u8,
 		json: []const u8,
-		list: List,
+		list: Value.List,
 
 		const List = struct {
 			values: []const Value,
@@ -58,14 +69,7 @@ pub const Event = struct {
 		};
 	};
 
-	pub fn deinit(self: *const Event) void {
-		const arena = self.arena;
-		const allocator = arena.child_allocator;
-		arena.deinit();
-		allocator.destroy(arena);
-	}
-
-	pub fn parse(allocator: Allocator, input: []const u8) !*Event {
+	pub fn parse(allocator: Allocator, input: []const u8) !Event.List {
 		const arena = try allocator.create(std.heap.ArenaAllocator);
 		errdefer allocator.destroy(arena);
 
@@ -78,23 +82,16 @@ pub const Event = struct {
 		var scanner = json.Scanner.initCompleteInput(aa, owned);
 		defer scanner.deinit();
 
-		if (try scanner.next() != .object_begin) {
-			return error.UnexpectedToken;
-		}
-
-		var parser = Parser{
-			.allocator = aa,
-			.map = std.StringHashMapUnmanaged(Value){},
+		const events = switch (try scanner.next()) {
+			.array_begin => try Parser.bulk(aa, &scanner),
+			.object_begin => try Parser.singleAsList(aa, &scanner),
+			else => return error.UnexpectedToken,
 		};
 
-		try parser.parseObject(aa, &scanner);
-		const event = try aa.create(Event);
-		event.* = .{
+		return .{
 			.arena = arena,
-			.map = parser.map,
+			.events = events,
 		};
-
-		return event;
 	}
 };
 
@@ -105,6 +102,48 @@ const Parser = struct {
 	map: std.StringHashMapUnmanaged(Event.Value),
 
 	const Error = json.ParseError(json.Scanner);
+
+	fn bulk(aa: Allocator, scanner: *json.Scanner) ![]Event {
+		var count: usize = 0;
+		var events = try aa.alloc(Event, 10);
+
+		while (true) {
+			switch (try scanner.next()) {
+				.object_begin => {},
+				.array_end => break,
+				else => return error.UnexpectedToken,
+			}
+
+			if (try single(aa, scanner)) |event| {
+				if (count == events.len) {
+					events = try aa.realloc(events, events.len + 10);
+				}
+				events[count] = event;
+				count += 1;
+			}
+		}
+
+		switch (try scanner.next()) {
+			.end_of_document => return events[0..count],
+			else => return error.UnexpectedToken,
+		}
+	}
+
+	fn singleAsList(aa: Allocator, scanner: *json.Scanner) ![]Event {
+		const event = try single(aa, scanner) orelse return &[_]Event{};
+		var events = try aa.alloc(Event, 1);
+		events[0] = event;
+		return events;
+	}
+
+	fn single(aa: Allocator, scanner: *json.Scanner) !?Event {
+		var parser = Parser{
+			.allocator = aa,
+			.map = std.StringHashMapUnmanaged(Event.Value){},
+		};
+		try parser.parseObject(aa, scanner);
+		return if (parser.map.count() == 0) null else .{.map = parser.map};
+	}
 
 	fn add(self: *Parser, value: Event.Value) !void {
 		const depth = self.depth;
@@ -286,18 +325,30 @@ const Parser = struct {
 };
 
 const t = logdk.testing;
-test "Event: parse empty array" {
-	try t.expectError(error.UnexpectedToken, Event.parse(t.allocator, "[]"));
+test "Event: parse non-array or non-object" {
+	try t.expectError(error.UnexpectedToken, Event.parse(t.allocator, "123"));
 }
 
 test "Event: parse empty" {
-	const event = try Event.parse(t.allocator, "{}");
-	defer event.deinit();
-	try t.expectEqual(0, event.fieldCount());
+	const event_list = try Event.parse(t.allocator, "{}");
+	defer event_list.deinit();
+	try t.expectEqual(0, event_list.events.len);
+}
+
+test "Event: parse empty list" {
+	const event_list = try Event.parse(t.allocator, "[]");
+	defer event_list.deinit();
+	try t.expectEqual(0, event_list.events.len);
+}
+
+test "Event: parse list of empty events" {
+	const event_list = try Event.parse(t.allocator, "[{}, {}, {}]");
+	defer event_list.deinit();
+	try t.expectEqual(0, event_list.events.len);
 }
 
 test "Event: parse simple" {
-	const event = try Event.parse(t.allocator, \\{
+	const event_list = try Event.parse(t.allocator, \\{
 		\\ "key_1": true, "another_key": false,
 		\\ "key_3": null,
 		\\ "key_4": "over 9000!!",
@@ -305,14 +356,41 @@ test "Event: parse simple" {
 		\\ "f1": 0.0, "f2": -0, "f3": 99.33929191, "f4": -1.49E10
 	\\}
 	);
-	defer event.deinit();
+	defer event_list.deinit();
 
 	try assertEvent(.{
 		.key_1 = Event.Value{.bool = true}, .another_key = Event.Value{.bool = false},
 		.key_3 = Event.Value{.null = {}}, .key_4 = Event.Value{.text = "over 9000!!"},
 		.a = Event.Value{.utinyint = 0}, .b = Event.Value{.utinyint = 1}, .c = Event.Value{.ubigint = 6999384751}, .d = Event.Value{.tinyint = -1}, .e = Event.Value{.integer = -867211}, // ints
 		.f1 = Event.Value{.double = 0.0}, .f2 = Event.Value{.double = -0.0}, .f3 = Event.Value{.double = 99.33929191}, .f4 = Event.Value{.double = -1.49E10}
-	}, event);
+	}, event_list.events[0]);
+}
+
+test "Event: parse array" {
+	const event_list = try Event.parse(t.allocator, "[{\"id\":1},{\"id\":2},{\"id\":3}]");
+	defer event_list.deinit();
+
+	try t.expectEqual(3, event_list.events.len);
+	try assertEvent(.{.id = Event.Value{.utinyint = 1}}, event_list.events[0]);
+	try assertEvent(.{.id = Event.Value{.utinyint = 2}}, event_list.events[1]);
+	try assertEvent(.{.id = Event.Value{.utinyint = 3}}, event_list.events[2]);
+}
+
+test "Event: parse array past initial size" {
+	const event_list = try Event.parse(t.allocator,
+		\\ [
+		\\   {"id":1}, {"id":2}, {"id":3}, {"id":4}, {"id":5}, {"id":6}, {"id":7}, {"id":8}, {"id":9}, {"id":10},
+		\\   {"id":11}, {"id":12}, {"id":13}, {"id":14}, {"id":15}, {"id":16}, {"id":17}, {"id":18}, {"id":19}, {"id":20},
+		\\   {"id":21}, {"id":22}, {"id":23}, {"id":24}, {"id":25}, {"id":26}, {"id":27}, {"id":28}, {"id":29}, {"id":30},
+		\\   {"id":31}, {"id":32}, {"id":33}, {"id":34}
+		\\ ]
+	);
+	defer event_list.deinit();
+
+	try t.expectEqual(34, event_list.events.len);
+	for (0..34) |i| {
+		try assertEvent(.{.id = Event.Value{.utinyint = @intCast(i + 1)}}, event_list.events[i]);
+	}
 }
 
 // test "Event: parse nesting flatten" {
@@ -342,7 +420,7 @@ test "Event: parse simple" {
 
 test "Event: parse nesting" {
 	if (MAX_FLATTEN_DEPTH != 1) return error.SkipZigTest;
-	const event = try Event.parse(t.allocator, \\{
+	const event_list = try Event.parse(t.allocator, \\{
 		\\ "key_1": {},
 		\\ "key_2": {
 		\\   "sub_1": true,
@@ -350,17 +428,17 @@ test "Event: parse nesting" {
 		\\}
 	\\}
 	);
-	defer event.deinit();
+	defer event_list.deinit();
 
 	try assertEvent(.{
 		.@"key_1" = Event.Value{.json =  "{}"},
 		.@"key_2" = Event.Value{.json =  "{\n   \"sub_1\": true,\n   \"sub_2\": {  \"handle \":  1, \"x\": {\"even\": \"more\", \"ok\": true}}\n}"},
-	}, event);
+	}, event_list.events[0]);
 }
 
 test "Event: parse list" {
-	const event = try Event.parse(t.allocator, "{\"a\": [1, -9000], \"b\": [true, 56.78912, null, {\"abc\": \"123\"}]}");
-	defer event.deinit();
+	const event_list = try Event.parse(t.allocator, "{\"a\": [1, -9000], \"b\": [true, 56.78912, null, {\"abc\": \"123\"}]}");
+	defer event_list.deinit();
 	try assertEvent(.{
 		.a = Event.Value{.list = .{
 			.json = "[1, -9000]",
@@ -370,27 +448,27 @@ test "Event: parse list" {
 			.json = "[true, 56.78912, null, {\"abc\": \"123\"}]",
 			.values = &[_]Event.Value{.{.bool = true}, .{.double = 56.78912}, .{.null = {}}, .{.json = "{\"abc\": \"123\"}"}}}
 		},
-	}, event);
+	}, event_list.events[0]);
 }
 
 test "Event: parse nested list" {
-	const event = try Event.parse(t.allocator, "{\"a\": [1, [true, null, \"hi\"]]}");
-	defer event.deinit();
-	try assertEvent(.{.a = Event.Value{.json = "[1, [true, null, \"hi\"]]"}}, event);
+	const event_list = try Event.parse(t.allocator, "{\"a\": [1, [true, null, \"hi\"]]}");
+	defer event_list.deinit();
+	try assertEvent(.{.a = Event.Value{.json = "[1, [true, null, \"hi\"]]"}}, event_list.events[0]);
 }
 
 test "Event: parse list simple" {
-	const event = try Event.parse(t.allocator, "{\"a\": [9999, -128]}");
-	defer event.deinit();
+	const event_list = try Event.parse(t.allocator, "{\"a\": [9999, -128]}");
+	defer event_list.deinit();
 	try assertEvent(.{.a = Event.Value{.list = .{
 		.json = "[9999, -128]",
 		.values = &[_]Event.Value{.{.usmallint = 9999}, .{.tinyint = -128}}
-	}}}, event);
+	}}}, event_list.events[0]);
 }
 
 test "Event: parse positive integer" {
-	const event = try Event.parse(t.allocator, "{\"pos\": [0, 1, 255, 256, 65535, 65536, 4294967295, 4294967296, 18446744073709551615]}");
-	defer event.deinit();
+	const event_list = try Event.parse(t.allocator, "{\"pos\": [0, 1, 255, 256, 65535, 65536, 4294967295, 4294967296, 18446744073709551615]}");
+	defer event_list.deinit();
 	try assertEvent(.{
 		.pos = Event.Value{.list = .{
 			.json = "[0, 1, 255, 256, 65535, 65536, 4294967295, 4294967296, 18446744073709551615]",
@@ -401,12 +479,12 @@ test "Event: parse positive integer" {
 				.{.ubigint = 4294967296}, .{.ubigint = 18446744073709551615}
 			}
 		}}
-	}, event);
+	}, event_list.events[0]);
 }
 
 test "Event: parse negative integer" {
-	const event = try Event.parse(t.allocator, "{\"neg\": [-0, -1, -128, -129, -32768 , -32769, -2147483648, -2147483649, -9223372036854775807, -9223372036854775808]}");
-	defer event.deinit();
+	const event_list = try Event.parse(t.allocator, "{\"neg\": [-0, -1, -128, -129, -32768 , -32769, -2147483648, -2147483649, -9223372036854775807, -9223372036854775808]}");
+	defer event_list.deinit();
 	try assertEvent(.{
 		.neg = Event.Value{.list = .{
 			.json = "[-0, -1, -128, -129, -32768 , -32769, -2147483648, -2147483649, -9223372036854775807, -9223372036854775808]",
@@ -417,14 +495,14 @@ test "Event: parse negative integer" {
 				.{.bigint = -2147483649}, .{.bigint = -9223372036854775807}, .{.bigint = -9223372036854775808}
 			}
 		}}
-	}, event);
+	}, event_list.events[0]);
 }
 
 test "Event: parse integer overflow" {
 	try t.expectError(error.InvalidNumber, Event.parse(t.allocator, "{\"overflow\": 18446744073709551616}"));
 }
 
-fn assertEvent(expected: anytype, actual: *Event) !void {
+fn assertEvent(expected: anytype, actual: Event) !void {
 	const fields = @typeInfo(@TypeOf(expected)).Struct.fields;
 	try t.expectEqual(fields.len, actual.fieldCount());
 

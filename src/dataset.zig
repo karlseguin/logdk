@@ -92,7 +92,7 @@ pub const DataSet = struct {
 	}
 
 	// allocator is the ArenaAllocator that'll be owned by the DataSet
-	pub fn columnsFromEvent(allocator: Allocator, event: *const Event) ![]Column {
+	pub fn columnsFromEvent(allocator: Allocator, event: Event) ![]Column {
 		var columns = try allocator.alloc(Column, event.fieldCount());
 		errdefer allocator.free(columns);
 
@@ -109,12 +109,12 @@ pub const DataSet = struct {
 	}
 
 	pub const Message = union(enum) {
-		record: *Event,
+		record: Event.List,
 	};
 
 	pub fn handle(self: *DataSet, message: Message) !void {
 		switch (message) {
-			.record => |event| return self.record(event) catch |err| {
+			.record => |event_list| return self.record(event_list) catch |err| {
 				logdk.metrics.recordError();
 				return err;
 			},
@@ -135,69 +135,112 @@ pub const DataSet = struct {
 	// statement, and if, in doing so, we need to alter, things get a bit messy.
 	// One issue with altering is that we need to re-prepare our insert statement
 	// so it pretty much resets everything.
-	fn record(self: *DataSet, event: *Event) !void {
-		defer event.deinit();
+	fn record(self: *DataSet, event_list: Event.List) !void {
+		defer event_list.deinit();
 
 		var insert = &self.insert_one;
-		try insert.clearBindings();
+		for (event_list.events) |event| {
+			try insert.clearBindings();
 
+			// first_pass is an attempt to bind the event values to our prepared
+			// statement as-is. This is the optimized case where we don't need to
+			// alter the dataset and underlying table. If we succeed, we'll return
+			// at the end of first_pass and are done.
+			// If we do detect the need for an alteration, we switch to a slow-path.
+			// Specifically, we'll apply any alternation needed, then break out of
+			// first_pass, and execute our second pass (which should be guaranteed to
+			// work since all necessary alterations should have been applied)
+			first_pass: {
+				// Used to track if we've used up all of the events fields. If we haven't
+				// then we had new columns to add.
+				var used_fields: usize = 0;
 
-		// first_pass is an attempt to bind the event values to our prepared
-		// statement as-is. This is the optimized case where we don't need to
-		// alter the dataset and underlying table. If we succeed, we'll return
-		// at the end of first_pass and are done.
-		// If we do detect the need for an alteration, we switch to a slow-path.
-		// Specifically, we'll apply any alternation needed, then break out of
-		// first_pass, and execute our second pass (which should be guaranteed to
-		// work since all necessary alterations should have been applied)
-		first_pass: {
-			// Used to track if we've used up all of the events fields. If we haven't
-			// then we had new columns to add.
-			var used_fields: usize = 0;
+				for (self.columns.items, 0..) |*column, param_index| {
+					const value = if (event.get(column.name)) |value| blk: {
+						used_fields += 1;
+						break :blk value;
+					} else blk: {
+						break :blk Event.Value{.null = {}};
+					};
 
-			for (self.columns.items, 0..) |*column, param_index| {
-				const value = if (event.get(column.name)) |value| blk: {
-					used_fields += 1;
-					break :blk value;
-				} else blk: {
-					break :blk Event.Value{.null = {}};
-				};
+					switch (value) {
+						.null => {
+							if (column.nullable == false) {
+								try self.alter(param_index, value, event, used_fields);
+								break :first_pass;
+							}
+							try insert.bindValue(param_index, null);
+						},
+						.list => |list| {
+							if (column.data_type == .json) {
+								try insert.bindValue(param_index, list.json);
+								continue;
+							}
 
-				switch (value) {
-					.null => {
-						if (column.nullable == false) {
-							try self.alter(param_index, value, event, used_fields);
-							break :first_pass;
-						}
-						try insert.bindValue(param_index, null);
-					},
-					.list => |list| {
-						if (column.data_type == .json) {
+							if (column.is_list == false) {
+								try self.alter(param_index, value, event, used_fields);
+								break :first_pass;
+							}
+							const target_type = compatibleListDataType(column.data_type, columnTypeForEventList(list.values));
+							if (target_type != column.data_type) {
+								try self.alter(param_index, value, event, used_fields);
+								break :first_pass;
+							}
 							try insert.bindValue(param_index, list.json);
-							continue;
-						}
+						},
+						inline else => |scalar| {
+							const target_type = compatibleDataType(column.data_type, value);
+							if (target_type != column.data_type) {
+								try self.alter(param_index, value, event, used_fields);
+								break :first_pass;
+							}
+							if (column.is_list) {
+								// the column is a list, but we were given a single value. This is
+								// a problem given DuckDB's lack of list binding support
+								try insert.bindValue(param_index, try scalarToList(event_list.arena.allocator(), scalar));
+							} else {
+								try insert.bindValue(param_index, scalar);
+							}
+						},
+					}
+				}
 
-						if (column.is_list == false) {
-							try self.alter(param_index, value, event, used_fields);
-							break :first_pass;
-						}
-						const target_type = compatibleListDataType(column.data_type, columnTypeForEventList(list.values));
-						if (target_type != column.data_type) {
-							try self.alter(param_index, value, event, used_fields);
-							break :first_pass;
-						}
+				if (used_fields < event.fieldCount()) {
+					try self.alter(self.columns.items.len, null, event, used_fields);
+					break: first_pass;
+				}
+
+				// If we made it all the way here, then the event fit into our dataset
+				// as-is (without any alternation) and thus we can finish our insert)
+				const inserted = try insert.exec();
+				std.debug.assert(inserted == 1);
+				continue;
+			}
+
+			// We can only be here because first_pass made alterations to the dataset
+			// and underlying table. This also means our insert_one prepared statement
+			// was re-generated. At this point, it should be possible to insert our
+			// event as-is, using the new prepared statement.
+
+			insert = &self.insert_one;
+			try insert.clearBindings();
+			for (self.columns.items, 0..) |*column, param_index| {
+				const value = event.get(column.name) orelse Event.Value{.null = {}};
+				switch (value) {
+					.list => |list| {
+						std.debug.assert(column.is_list or column.data_type == .json);
 						try insert.bindValue(param_index, list.json);
 					},
+					.null => {
+						std.debug.assert(column.nullable);
+						try insert.bindValue(param_index, null);
+					},
 					inline else => |scalar| {
-						const target_type = compatibleDataType(column.data_type, value);
-						if (target_type != column.data_type) {
-							try self.alter(param_index, value, event, used_fields);
-							break :first_pass;
-						}
+						std.debug.assert(compatibleDataType(column.data_type, value) == column.data_type);
 						if (column.is_list) {
 							// the column is a list, but we were given a single value. This is
 							// a problem given DuckDB's lack of list binding support
-							try insert.bindValue(param_index, try scalarToList(event.arena.allocator(), scalar));
+							try insert.bindValue(param_index, try scalarToList(event_list.arena.allocator(), scalar));
 						} else {
 							try insert.bindValue(param_index, scalar);
 						}
@@ -205,57 +248,15 @@ pub const DataSet = struct {
 				}
 			}
 
-			if (used_fields < event.fieldCount()) {
-				try self.alter(self.columns.items.len, null, event, used_fields);
-				break: first_pass;
-			}
-
-			// If we made it all the way here, then the event fit into our dataset
-			// as-is (without any alternation) and thus we can finish our insert)
 			const inserted = try insert.exec();
 			std.debug.assert(inserted == 1);
-			return;
+			logdk.metrics.alterDataSet();
 		}
 
-		// We can only be here because first_pass made alterations to the dataset
-		// and underlying table. This also means our insert_one prepared statement
-		// was re-generated. At this point, it should be possible to insert our
-		// event as-is, using the new prepared statement.
-
-		insert = &self.insert_one;
-		try insert.clearBindings();
-		for (self.columns.items, 0..) |*column, param_index| {
-			const value = event.get(column.name) orelse Event.Value{.null = {}};
-			switch (value) {
-				.list => |list| {
-					std.debug.assert(column.is_list or column.data_type == .json);
-					try insert.bindValue(param_index, list.json);
-				},
-				.null => {
-					std.debug.assert(column.nullable);
-					try insert.bindValue(param_index, null);
-				},
-				inline else => |scalar| {
-					std.debug.assert(compatibleDataType(column.data_type, value) == column.data_type);
-					if (column.is_list) {
-						// the column is a list, but we were given a single value. This is
-						// a problem given DuckDB's lack of list binding support
-						try insert.bindValue(param_index, try scalarToList(event.arena.allocator(), scalar));
-					} else {
-						try insert.bindValue(param_index, scalar);
-					}
-				},
-			}
-		}
-
-		const inserted = try insert.exec();
-		std.debug.assert(inserted == 1);
-
-		logdk.metrics.alterDataSet();
 		try self.app.meta.datasetChanged(self);
 	}
 
-	fn alter(self: *DataSet, start_index: usize, value_: ?Event.Value, event: *const Event, used_fields_: usize) !void {
+	fn alter(self: *DataSet, start_index: usize, value_: ?Event.Value, event: Event, used_fields_: usize) !void {
 		_ = try self.exec("begin", .{});
 		errdefer _ = self.exec("rollback", .{}) catch {};
 
@@ -920,21 +921,21 @@ test "columnTypeForEventList" {
 }
 
 fn testColumnTypeEventList(comptime event_value: []const u8) DataType {
-	const event = Event.parse(t.allocator, "{\"list\": [" ++ event_value ++ "]}") catch unreachable;
-	defer event.deinit();
-	return columnTypeForEventList(event.map.get("list").?.list.values);
+	const event_list = Event.parse(t.allocator, "{\"list\": [" ++ event_value ++ "]}") catch unreachable;
+	defer event_list.deinit();
+	return columnTypeForEventList(event_list.events[0].map.get("list").?.list.values);
 }
 
 test "DataSet: columnsFromEvent" {
-	const event = try Event.parse(t.allocator,
+	const event_list = try Event.parse(t.allocator,
 	  \\ {
 	  \\   "id": 99999, "name": "teg", "details": {"handle": 9001},
 	  \\   "l1": [1, -9000, 293000], "l2": [true, [123]]
 	  \\ }
 	);
-	defer event.deinit();
+	defer event_list.deinit();
 
-	const columns = try DataSet.columnsFromEvent(t.allocator, event);
+	const columns = try DataSet.columnsFromEvent(t.allocator, event_list.events[0]);
 	defer {
 		// this is normally managed by an arena
 		for (columns) |c| {
@@ -958,8 +959,8 @@ test "DataSet: record simple" {
 	const ds = try testDataSet(tc);
 
 	{
-		const event = try Event.parse(t.allocator, "{\"id\": 1, \"system\": \"catalog\", \"active\": true, \"record\": 0.932, \"category\": null}");
-		try ds.record(event);
+		const event_list = try Event.parse(t.allocator, "{\"id\": 1, \"system\": \"catalog\", \"active\": true, \"record\": 0.932, \"category\": null}");
+		try ds.record(event_list);
 
 		var row = (try ds.conn.row("select \"$id\", \"$inserted\", id, system, active, record, category from dataset_test where id =  1", .{})).?;
 		defer row.deinit();
@@ -975,8 +976,8 @@ test "DataSet: record simple" {
 
 	{
 		// infer null from missing event field
-		const event = try Event.parse(t.allocator, "{\"id\": 2, \"system\": \"other\", \"active\": false, \"record\": 4}");
-		try ds.record(event);
+		const event_list = try Event.parse(t.allocator, "{\"id\": 2, \"system\": \"other\", \"active\": false, \"record\": 4}");
+		try ds.record(event_list);
 
 		var row = (try ds.conn.row("select \"$id\", \"$inserted\", id, system, active, record, category from dataset_test where id =  2", .{})).?;
 		defer row.deinit();
@@ -992,8 +993,8 @@ test "DataSet: record simple" {
 
 	{
 		// makes a column nullable
-		const event = try Event.parse(t.allocator, "{\"id\": null, \"system\": null, \"active\": null, \"record\": null}");
-		try ds.record(event);
+		const event_list = try Event.parse(t.allocator, "{\"id\": null, \"system\": null, \"active\": null, \"record\": null}");
+		try ds.record(event_list);
 
 		var row = (try ds.conn.row("select \"$id\", \"$inserted\", id, system, active, record, category from dataset_test where id is null", .{})).?;
 		defer row.deinit();
@@ -1013,8 +1014,8 @@ test "DataSet: record simple" {
 
 	{
 		// alter type
-		const event = try Event.parse(t.allocator, "{\"id\": -1003843293448, \"system\": 43, \"active\": \"maybe\", \"record\": 229, \"category\": -2}");
-		try ds.record(event);
+		const event_list = try Event.parse(t.allocator, "{\"id\": -1003843293448, \"system\": 43, \"active\": \"maybe\", \"record\": 229, \"category\": -2}");
+		try ds.record(event_list);
 
 		var row = (try ds.conn.row("select \"$id\", \"$inserted\", id, system, active, record, category from dataset_test where id = -1003843293448", .{})).?;
 		defer row.deinit();
@@ -1037,8 +1038,8 @@ test "DataSet: record with list" {
 
 	{
 		// history is added for another part of this test later
-		const event = try Event.parse(t.allocator, "{\"id\": 1, \"tags\": [1, 9], \"history\": 9991}");
-		try ds.record(event);
+		const event_list = try Event.parse(t.allocator, "{\"id\": 1, \"tags\": [1, 9], \"history\": 9991}");
+		try ds.record(event_list);
 
 		var row = (try ds.conn.row("select \"$id\", \"$inserted\", id, tags from dataset_list_test where id =  1", .{})).?;
 		defer row.deinit();
@@ -1055,8 +1056,8 @@ test "DataSet: record with list" {
 
 	{
 		// alter list type
-		const event = try Event.parse(t.allocator, "{\"id\": 2, \"tags\": [\"hello\"]}");
-		try ds.record(event);
+		const event_list = try Event.parse(t.allocator, "{\"id\": 2, \"tags\": [\"hello\"]}");
+		try ds.record(event_list);
 
 		{
 			var row = (try ds.conn.row("select tags from dataset_list_test where id =  2", .{})).?;
@@ -1079,8 +1080,8 @@ test "DataSet: record with list" {
 
 	{
 		// add a new list
-		const event = try Event.parse(t.allocator, "{\"id\": 3, \"state\": [true, false]}");
-		try ds.record(event);
+		const event_list = try Event.parse(t.allocator, "{\"id\": 3, \"state\": [true, false]}");
+		try ds.record(event_list);
 
 		var row = (try ds.conn.row("select state from dataset_list_test where id =  3", .{})).?;
 		defer row.deinit();
@@ -1092,8 +1093,8 @@ test "DataSet: record with list" {
 
 	{
 		// convert scalar to list
-		const event = try Event.parse(t.allocator, "{\"id\": 4, \"history\": [1.1, 0.9]}");
-		try ds.record(event);
+		const event_list = try Event.parse(t.allocator, "{\"id\": 4, \"history\": [1.1, 0.9]}");
+		try ds.record(event_list);
 
 		{
 			var row = (try ds.conn.row("select history from dataset_list_test where id =  4", .{})).?;
@@ -1116,8 +1117,8 @@ test "DataSet: record with list" {
 
 	{
 		// insert scalar in list
-		const event = try Event.parse(t.allocator, "{\"id\": 5, \"tags\": \"ouch\"}");
-		try ds.record(event);
+		const event_list = try Event.parse(t.allocator, "{\"id\": 5, \"tags\": \"ouch\"}");
+		try ds.record(event_list);
 
 		{
 			var row = (try ds.conn.row("select tags from dataset_list_test where id =  5", .{})).?;
@@ -1146,8 +1147,8 @@ test "DataSet: record add column" {
 	const ds = try testDataSet(tc);
 
 	{
-		const event = try Event.parse(t.allocator, "{\"id\": 5, \"new\": true}");
-		try ds.record(event);
+		const event_list = try Event.parse(t.allocator, "{\"id\": 5, \"new\": true}");
+		try ds.record(event_list);
 
 		var row = (try ds.conn.row("select \"$id\", \"$inserted\", id, system, active, record, category, new from dataset_test where id =  5", .{})).?;
 		defer row.deinit();
@@ -1170,7 +1171,7 @@ test "DataSet: record add column" {
 
 	{
 		// no other difference, except for 2 new columns
-		const event = try Event.parse(t.allocator, \\ {
+		const event_list = try Event.parse(t.allocator, \\ {
 		\\    "id": 6,
 		\\    "system": "catalog",
 		\\    "active": true,
@@ -1181,7 +1182,7 @@ test "DataSet: record add column" {
 		\\    "tag2": -9999
 		\\ }
 		);
-		try ds.record(event);
+		try ds.record(event_list);
 
 		var row = (try ds.conn.row("select \"$id\", \"$inserted\", id, system, active, record, category, new, tag1, tag2 from dataset_test where id =  6", .{})).?;
 		defer row.deinit();
@@ -1216,7 +1217,7 @@ test "DataSet: record add column" {
 // to think we can just fake create a dataset, ala, `return DataSet{....}`...but
 // it's simpler and has better fidelity if we use the real APIs
 fn testDataSet(tc: *t.Context) !*DataSet {
-	const event = try Event.parse(t.allocator,
+	const event_list = try Event.parse(t.allocator,
 		\\ {
 		\\    "id": 393,
 		\\    "system": "catalog",
@@ -1225,20 +1226,20 @@ fn testDataSet(tc: *t.Context) !*DataSet {
 		\\    "category": null
 		\\ }
 	);
-	defer event.deinit();
-	const actor_id = try tc.app.createDataSet(tc.env(), "dataset_test", event);
+	defer event_list.deinit();
+	const actor_id = try tc.app.createDataSet(tc.env(), "dataset_test", event_list.events[0]);
 	return tc.app.dispatcher.unsafeInstance(DataSet, actor_id);
 }
 
 fn testDataSetWithList(tc: *t.Context) !*DataSet {
-	const event = try Event.parse(t.allocator,
+	const event_list = try Event.parse(t.allocator,
 		\\ {
 		\\    "id": 393,
 		\\    "tags": [1, 9],
 		\\    "history": 7.2
 		\\ }
 	);
-	defer event.deinit();
-	const actor_id = try tc.app.createDataSet(tc.env(), "dataset_list_test", event);
+	defer event_list.deinit();
+	const actor_id = try tc.app.createDataSet(tc.env(), "dataset_list_test", event_list.events[0]);
 	return tc.app.dispatcher.unsafeInstance(DataSet, actor_id);
 }
