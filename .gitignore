@@ -3,6 +3,7 @@ zig-out/
 zig-cache/
 *.so
 *.dylib
+ui/
 lib/zul
 lib/http.zig
 lib/metrics.zig

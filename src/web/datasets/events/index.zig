@@ -26,7 +26,7 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 	// and app.getDataSet above would have returned null;
 	try buf.write("select * from \"");
 	try buf.write(name);
-	try buf.write("\"");
+	try buf.write("\" limit 100");
 
 	var conn = try app.db.acquire();
 	defer conn.release();

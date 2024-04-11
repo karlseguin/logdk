@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const LazyPath = std.Build.LazyPath;
+const Allocator = std.mem.Allocator;
 const ModuleMap = std.StringArrayHashMap(*std.Build.Module);
 
 pub fn build(b: *std.Build) !void {
@@ -51,6 +52,7 @@ pub fn build(b: *std.Build) !void {
 		.target = target,
 		.optimize = optimize,
 	});
+	try addUIFiles(allocator, b, exe);
 	try addLibs(exe, modules);
 	b.installArtifact(exe);
 
@@ -88,4 +90,30 @@ fn addLibs(step: *std.Build.Step.Compile, modules: ModuleMap) !void {
 	step.linkSystemLibrary("duckdb");
 	step.addRPath(LazyPath.relative("lib"));
 	step.addLibraryPath(LazyPath.relative("lib"));
+}
+
+fn addUIFiles(allocator: Allocator, b: *std.Build, step: *std.Build.Step.Compile) !void {
+	var files = std.ArrayList([]const u8).init(allocator);
+	try addUIFilesFrom(allocator, step, "ui", &files);
+
+	var files_option = b.addOptions();
+	files_option.addOption([]const []const u8, "names", files.items);
+	step.root_module.addOptions("ui_files", files_option);
+}
+
+fn addUIFilesFrom(allocator: Allocator, step: *std.Build.Step.Compile, root: []const u8, files: *std.ArrayList([]const u8)) !void {
+	var dir = try std.fs.cwd().openDir(root, .{.iterate = true});
+	var it = dir.iterate();
+
+	while (try it.next()) |file| {
+		const name = try std.fmt.allocPrint(allocator, "{s}/{s}", .{root, file.name});
+		switch (file.kind) {
+			.directory => try addUIFilesFrom(allocator, step, name, files),
+			.file => {
+				try files.append(name);
+				step.root_module.addAnonymousImport(name, .{.root_source_file = LazyPath.relative(name)});
+			},
+			else => unreachable,
+		}
+	}
 }

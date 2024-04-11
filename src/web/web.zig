@@ -9,6 +9,7 @@ const logdk = @import("../logdk.zig");
 const App = logdk.App;
 const Env = logdk.Env;
 
+const ui = @import("ui.zig");
 const info = @import("info/_info.zig");
 const datasets = @import("datasets/_datasets.zig");
 
@@ -48,8 +49,10 @@ pub fn start(app: *App, config: *const logdk.Config) !void {
 		datasets.routes(&routes);
 		routes.get("/describe", info.describe);
 	}
-	router.getC("/metrics", info.metrics, .{.dispatcher = server.dispatchUndefined()});
 
+
+	router.getC("/metrics", info.metrics, .{.dispatcher = server.dispatchUndefined()});
+	router.getC("/*", ui.handler, .{.dispatcher = server.dispatchUndefined()});
 	logz.info().ctx("http.listen").fmt("address", "http://{s}:{d}", .{server.config.address.?, server.config.port.?}).boolean("log_http", config.log_http).log();
 	// blocks
 	try server.listen();
