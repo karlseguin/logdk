@@ -14,36 +14,20 @@ pub fn build(b: *std.Build) !void {
 	var modules = ModuleMap.init(allocator);
 	defer modules.deinit();
 
-	const dep_opts = .{.target = target,.optimize = optimize};
+	const dep_opts = .{.target = target, .optimize = optimize};
+	const static_link = b.option(bool, "static", "static link duckdb") orelse false;
 
-	// try modules.put("httpz", b.dependency("httpz", dep_opts).module("httpz"));
-
-	const httpz = b.addModule("httpz", .{
-		.root_source_file = .{.path = "lib/http.zig/src/httpz.zig"},
-		.imports = &.{
-			.{.name = "metrics", .module = b.addModule("metrics", .{.root_source_file = .{.path = "lib/metrics.zig/src/metrics.zig"}})},
-			.{.name = "websocket", .module = b.addModule("websocket", .{.root_source_file = .{.path = "lib/websocket.zig/src/websocket.zig"}})},
-		},
-	});
-	try modules.put("httpz", httpz);
-
+	try modules.put("httpz", b.dependency("httpz", dep_opts).module("httpz"));
 	try modules.put("typed", b.dependency("typed", dep_opts).module("typed"));
 	try modules.put("metrics", b.dependency("metrics", dep_opts).module("metrics"));
 	try modules.put("logz", b.dependency("logz", dep_opts).module("logz"));
 	try modules.put("validate", b.dependency("validate", dep_opts).module("validate"));
-	// try modules.put("zul", b.dependency("zul", dep_opts).module("zul"));
+	try modules.put("zul", b.dependency("zul", dep_opts).module("zul"));
 
-	// const zuckdb = b.dependency("zuckdb", dep_opts).module("zuckdb");
-	const zuckdb = b.addModule("zuckdb", .{
-		.root_source_file = .{.path = "lib/zuckdb.zig/src/zuckdb.zig"},
-		.imports = &.{},
-	});
-	zuckdb.addIncludePath(LazyPath.relative("lib"));
+	const zuckdb = b.dependency("zuckdb", dep_opts).module("zuckdb");
 	try modules.put("zuckdb",  zuckdb);
 
-	try modules.put("zul", b.addModule("zul", .{
-		.root_source_file = .{.path = "lib/zul/src/zul.zig"},
-	}));
+	zuckdb.addIncludePath(LazyPath.relative("lib"));
 
 	// setup executable
 	const exe = b.addExecutable(.{
@@ -52,8 +36,8 @@ pub fn build(b: *std.Build) !void {
 		.target = target,
 		.optimize = optimize,
 	});
+	try addLibs(exe, modules, static_link);
 	try addUIFiles(allocator, b, exe);
-	try addLibs(exe, modules);
 	b.installArtifact(exe);
 
 	const run_cmd = b.addRunArtifact(exe);
@@ -73,7 +57,8 @@ pub fn build(b: *std.Build) !void {
 		.test_runner = "test_runner.zig",
 	});
 
-	try addLibs(tests, modules);
+	try addLibs(tests, modules, static_link);
+	try addUIFiles(allocator, b, tests);
 	const run_test = b.addRunArtifact(tests);
 	run_test.has_side_effects = true;
 
@@ -81,14 +66,19 @@ pub fn build(b: *std.Build) !void {
 	test_step.dependOn(&run_test.step);
 }
 
-fn addLibs(step: *std.Build.Step.Compile, modules: ModuleMap) !void {
+fn addLibs(step: *std.Build.Step.Compile, modules: ModuleMap, static_link: bool) !void {
 	var it = modules.iterator();
 	while (it.next()) |m| {
 		step.root_module.addImport(m.key_ptr.*, m.value_ptr.*);
 	}
+
 	step.linkLibC();
+	if (static_link) {
+		step.linkSystemLibrary("stdc++");
+	} else {
+		step.addRPath(LazyPath.relative("lib"));
+	}
 	step.linkSystemLibrary("duckdb");
-	step.addRPath(LazyPath.relative("lib"));
 	step.addLibraryPath(LazyPath.relative("lib"));
 }
 
@@ -117,3 +107,22 @@ fn addUIFilesFrom(allocator: Allocator, step: *std.Build.Step.Compile, root: []c
 		}
 	}
 }
+
+
+	// const httpz = b.addModule("httpz", .{
+	// 	.root_source_file = .{.path = "lib/http.zig/src/httpz.zig"},
+	// 	.imports = &.{
+	// 		.{.name = "metrics", .module = b.addModule("metrics", .{.root_source_file = .{.path = "lib/metrics.zig/src/metrics.zig"}})},
+	// 		.{.name = "websocket", .module = b.addModule("websocket", .{.root_source_file = .{.path = "lib/websocket.zig/src/websocket.zig"}})},
+	// 	},
+	// });
+	// try modules.put("httpz", httpz);
+
+	// const zuckdb = b.addModule("zuckdb", .{
+	// 	.root_source_file = .{.path = "lib/zuckdb.zig/src/zuckdb.zig"},
+	// 	.imports = &.{},
+	// });
+
+	// try modules.put("zul", b.addModule("zul", .{
+	// 	.root_source_file = .{.path = "lib/zul/src/zul.zig"},
+	// }));
