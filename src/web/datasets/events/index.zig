@@ -246,7 +246,7 @@ test "events.index: single row" {
 	try handler(tc.env(), tc.web.req, tc.web.res);
 	try tc.web.expectJson(.{
 		.cols = &[_][]const u8{"$id", "$inserted", "details", "false", "float_neg", "float_pos", "int", "list", "mixed_list", "null", "text", "true", "uint"},
-		.types = &[_][]const u8{"u32", "timestamptz", "JSON", "bool", "f64", "f64", "i16", "f64[]", "JSON", "varchar", "varchar", "bool", "u32"},
+		.types = &[_][]const u8{"u64", "timestamp", "JSON", "bool", "f64", "f64", "i16", "f64[]", "JSON", "varchar", "varchar", "bool", "u32"},
 		.rows = &[_][]const std.json.Value{
 			&[_]std.json.Value{
 				.{.integer = 1},
@@ -280,7 +280,7 @@ test "events.index: multiple rows" {
 	try handler(tc.env(), tc.web.req, tc.web.res);
 	try tc.web.expectJson(.{
 		.cols = &[_][]const u8{"$id", "$inserted", "int"},
-		.types = &[_][]const u8{"u32", "timestamptz", "u16"},
+		.types = &[_][]const u8{"u64", "timestamp", "u16"},
 		.rows = &[_][]const std.json.Value{
 			&[_]std.json.Value{
 				.{.integer = 1},

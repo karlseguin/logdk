@@ -169,19 +169,15 @@ pub const App = struct {
 
 			const serialized_columns = try std.json.stringifyAlloc(aa, columns, .{});
 
-			var sequence = try self.buffers.acquire();
-			defer sequence.release();
-			try std.fmt.format(sequence.writer(), "create sequence {s}_id_seq start 1;", .{name});
-
 			var create = try self.buffers.acquire();
 			defer create.release();
 
 			{
 				try std.fmt.format(create.writer(),
 					\\ create table {s} (
-					\\  "$id" uinteger not null default(nextval('{s}_id_seq')),
-					\\  "$inserted" timestamptz not null default(now())
-				, .{name, name});
+					\\  "$id" ubigint not null primary key,
+					\\  "$inserted" timestamp not null
+				, .{name});
 
 				const writer = create.writer();
 				for (columns) |c| {
@@ -198,7 +194,6 @@ pub const App = struct {
 				const insert_sql = "insert into logdk.datasets (name, columns, created) values ($1, $2, now())";
 				try conn.begin();
 				errdefer conn.rollback() catch {};
-				_ = conn.exec(sequence.string(), .{}) catch |err| return env.dbErr("App.createDataSet.sequence", err, conn);
 				_ = conn.exec(create.string(), .{}) catch |err| return env.dbErr("App.createDataSet.create", err, conn);
 				_ = conn.exec(insert_sql, .{name, serialized_columns}) catch |err| return env.dbErr("App.createDataSet.insert", err, conn);
 				conn.commit() catch |err| return env.dbErr("App.createDataSet.commit", err, conn);
@@ -296,7 +291,7 @@ test "App: loadDataSets" {
 	\\]
 	;
 	try tc.exec("insert into logdk.datasets (name, columns) values ($1, $2)", .{"system", columns});
-	try tc.exec("create table system (id integer, type text, value double null, tags text[])", .{});
+	try tc.exec("create table system (\"$id\" ubigint not null primary key, \"$inserted\" timestamp not null, id integer, type text, value double null, tags text[])", .{});
 
 	var app = tc.app;
 	try app.loadDataSets();
@@ -391,28 +386,25 @@ test "App: createDataSet success" {
 		try t.expectEqual(.{.name = "tags", .nullable = true, .is_list = false, .data_type = .unknown}, ds.columns.items[3]);
 	}
 
-	try t.expectEqual(1, tc.scalar(i64, "select nextval('metrics_1_id_seq')", .{}));
-	try t.expectEqual(2, tc.scalar(i64, "select nextval('metrics_1_id_seq')", .{}));
-
 	var rows = try tc.query("describe metrics_1", .{});
 	defer rows.deinit();
 	{
 		const row = (try rows.next()).?;
 		try t.expectEqual("$id", row.get([]u8, 0));  // name
-		try t.expectEqual("UINTEGER", row.get([]u8, 1));  // type
+		try t.expectEqual("UBIGINT", row.get([]u8, 1));  // type
 		try t.expectEqual("NO", row.get([]u8, 2));  // nullable
-		try t.expectEqual(null, row.get(?[]u8, 3));  // key
-		try t.expectEqual("nextval('metrics_1_id_seq')", row.get([]u8, 4));  // default
+		try t.expectEqual("PRI", row.get([]u8, 3));  // key
+		try t.expectEqual(null, row.get(?[]u8, 4));  // default
 		try t.expectEqual(null, row.get(?[]u8, 5));  // extra
 	}
 
 	{
 		const row = (try rows.next()).?;
 		try t.expectEqual("$inserted", row.get([]u8, 0));  // name
-		try t.expectEqual("TIMESTAMP WITH TIME ZONE", row.get([]u8, 1));  // type
+		try t.expectEqual("TIMESTAMP", row.get([]u8, 1));  // type
 		try t.expectEqual("NO", row.get([]u8, 2));  // nullable
 		try t.expectEqual(null, row.get(?[]u8, 3));  // key
-		try t.expectEqual("now()", row.get([]u8, 4));  // default
+		try t.expectEqual(null, row.get(?[]u8, 4));  // default
 		try t.expectEqual(null, row.get(?[]u8, 5));  // extra
 	}
 

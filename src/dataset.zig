@@ -12,6 +12,9 @@ const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 
 pub const DataSet = struct {
+	// the next $id value to insert
+	next_id: u64,
+
 	// DataSet doesn't usually need anything from the app, except when it modifies
 	// itself, it needs to inform app.meta of the change.
 	app: *App,
@@ -69,11 +72,20 @@ pub const DataSet = struct {
 			columnLookup.putAssumeCapacity(c.name, {});
 		}
 
+		const next_id = blk: {
+			var buf: [logdk.MAX_IDENTIFIER_LEN + 50]u8 = undefined;
+			const sql = try std.fmt.bufPrint(&buf, "select max(\"$id\") from \"{s}\"", .{name});
+			const max_id_row = try conn.row(sql, .{}) orelse break :blk 1;
+			defer max_id_row.deinit();
+			break :blk max_id_row.get(?u64, 0) orelse 1;
+		};
+
 		return .{
 			.app = app,
 			.name = name,
 			.conn = conn,
 			.arena = arena,
+			.next_id = next_id,
 			.insert_one = insert_one,
 			.columnLookup = columnLookup,
 			.columns = std.ArrayList(Column).fromOwnedSlice(aa, columns),
@@ -138,9 +150,18 @@ pub const DataSet = struct {
 	fn record(self: *DataSet, event_list: Event.List) !void {
 		defer event_list.deinit();
 
+		var next_id = self.next_id;
+		defer self.next_id = next_id;
+
+		const now = std.time.microTimestamp();
+
 		var insert = &self.insert_one;
 		for (event_list.events) |event| {
+			defer next_id += 1;
+
 			try insert.clearBindings();
+			try insert.bindValue(0, next_id);
+			try insert.bindValue(1, now);
 
 			// first_pass is an attempt to bind the event values to our prepared
 			// statement as-is. This is the optimized case where we don't need to
@@ -155,7 +176,7 @@ pub const DataSet = struct {
 				// then we had new columns to add.
 				var used_fields: usize = 0;
 
-				for (self.columns.items, 0..) |*column, param_index| {
+				for (self.columns.items, 2..) |*column, param_index| {
 					const value = if (event.get(column.name)) |value| blk: {
 						used_fields += 1;
 						break :blk value;
@@ -166,7 +187,7 @@ pub const DataSet = struct {
 					switch (value) {
 						.null => {
 							if (column.nullable == false) {
-								try self.alter(param_index, value, event, used_fields);
+								try self.alter(param_index - 2, value, event, used_fields);
 								break :first_pass;
 							}
 							try insert.bindValue(param_index, null);
@@ -178,12 +199,12 @@ pub const DataSet = struct {
 							}
 
 							if (column.is_list == false) {
-								try self.alter(param_index, value, event, used_fields);
+								try self.alter(param_index - 2, value, event, used_fields);
 								break :first_pass;
 							}
 							const target_type = compatibleListDataType(column.data_type, columnTypeForEventList(list.values));
 							if (target_type != column.data_type) {
-								try self.alter(param_index, value, event, used_fields);
+								try self.alter(param_index - 2, value, event, used_fields);
 								break :first_pass;
 							}
 							try insert.bindValue(param_index, list.json);
@@ -191,7 +212,7 @@ pub const DataSet = struct {
 						inline else => |scalar| {
 							const target_type = compatibleDataType(column.data_type, value);
 							if (target_type != column.data_type) {
-								try self.alter(param_index, value, event, used_fields);
+								try self.alter(param_index - 2, value, event, used_fields);
 								break :first_pass;
 							}
 							if (column.is_list) {
@@ -212,7 +233,10 @@ pub const DataSet = struct {
 
 				// If we made it all the way here, then the event fit into our dataset
 				// as-is (without any alternation) and thus we can finish our insert)
-				const inserted = try insert.exec();
+				const inserted = insert.exec() catch |err| {
+					logdk.dbErr("Dataset.record", err, self.conn, logz.err().string("dataset", self.name)) catch {};
+					continue;
+				};
 				std.debug.assert(inserted == 1);
 				continue;
 			}
@@ -224,7 +248,10 @@ pub const DataSet = struct {
 
 			insert = &self.insert_one;
 			try insert.clearBindings();
-			for (self.columns.items, 0..) |*column, param_index| {
+			try insert.bindValue(0, next_id);
+			try insert.bindValue(1, now);
+
+			for (self.columns.items, 2..) |*column, param_index| {
 				const value = event.get(column.name) orelse Event.Value{.null = {}};
 				switch (value) {
 					.list => |list| {
@@ -723,7 +750,7 @@ fn generateInsertOnePrepared(allocator: Allocator, conn: *zuckdb.Conn, name: []c
 
 	try sb.write("insert into ");
 	try sb.write(name);
-	try sb.write(" (");
+	try sb.write(" (\"$id\", \"$inserted\", ");
 	for (columns) |c| {
 		try sb.writeByte('"');
 		try sb.write(c.name);
@@ -732,9 +759,9 @@ fn generateInsertOnePrepared(allocator: Allocator, conn: *zuckdb.Conn, name: []c
 	// strip out the trailing comma + space
 	sb.truncate(2);
 
-	try sb.write(")\nvalues (");
+	try sb.write(")\nvalues ($1, $2, ");
 	const writer = sb.writer();
-	for (columns, 1..) |c, i| {
+	for (columns, 3..) |c, i| {
 		if (c.is_list) {
 			// This is a [temp??] hack. There's no great way to insert lists in
 			// DuckDB's C API (seriously), but if we pass it a JSON string and tell it
@@ -965,7 +992,7 @@ test "DataSet: record simple" {
 		var row = (try ds.conn.row("select \"$id\", \"$inserted\", id, system, active, record, category from dataset_test where id =  1", .{})).?;
 		defer row.deinit();
 
-		try t.expectEqual(1, row.get(u32, 0));
+		try t.expectEqual(1, row.get(u64, 0));
 		try t.expectDelta(std.time.microTimestamp(), row.get(i64, 1), 5000);
 		try t.expectEqual(1, row.get(u16, 2));
 		try t.expectEqual("catalog", row.get([]const u8, 3));
@@ -982,7 +1009,7 @@ test "DataSet: record simple" {
 		var row = (try ds.conn.row("select \"$id\", \"$inserted\", id, system, active, record, category from dataset_test where id =  2", .{})).?;
 		defer row.deinit();
 
-		try t.expectEqual(2, row.get(u32, 0));
+		try t.expectEqual(2, row.get(u64, 0));
 		try t.expectDelta(std.time.microTimestamp(), row.get(i64, 1), 5000);
 		try t.expectEqual(2, row.get(u16, 2));
 		try t.expectEqual("other", row.get([]const u8, 3));
@@ -999,7 +1026,7 @@ test "DataSet: record simple" {
 		var row = (try ds.conn.row("select \"$id\", \"$inserted\", id, system, active, record, category from dataset_test where id is null", .{})).?;
 		defer row.deinit();
 
-		try t.expectEqual(3, row.get(u32, 0));
+		try t.expectEqual(3, row.get(u64, 0));
 		try t.expectDelta(std.time.microTimestamp(), row.get(i64, 1), 5000);
 		try t.expectEqual(null, row.get(?u16, 2));
 		try t.expectEqual(null, row.get(?[]const u8, 3));
@@ -1020,7 +1047,7 @@ test "DataSet: record simple" {
 		var row = (try ds.conn.row("select \"$id\", \"$inserted\", id, system, active, record, category from dataset_test where id = -1003843293448", .{})).?;
 		defer row.deinit();
 
-		try t.expectEqual(4, row.get(u32, 0));
+		try t.expectEqual(4, row.get(u64, 0));
 		try t.expectDelta(std.time.microTimestamp(), row.get(i64, 1), 5000);
 		try t.expectEqual(-1003843293448, row.get(i64, 2));
 		try t.expectEqual("43", row.get([]const u8, 3));
@@ -1044,7 +1071,7 @@ test "DataSet: record with list" {
 		var row = (try ds.conn.row("select \"$id\", \"$inserted\", id, tags from dataset_list_test where id =  1", .{})).?;
 		defer row.deinit();
 
-		try t.expectEqual(1, row.get(u32, 0));
+		try t.expectEqual(1, row.get(u64, 0));
 		try t.expectDelta(std.time.microTimestamp(), row.get(i64, 1), 5000);
 		try t.expectEqual(1, row.get(u16, 2));
 
@@ -1153,7 +1180,7 @@ test "DataSet: record add column" {
 		var row = (try ds.conn.row("select \"$id\", \"$inserted\", id, system, active, record, category, new from dataset_test where id =  5", .{})).?;
 		defer row.deinit();
 
-		try t.expectEqual(1, row.get(u32, 0));
+		try t.expectEqual(1, row.get(u64, 0));
 		try t.expectDelta(std.time.microTimestamp(), row.get(i64, 1), 5000);
 		try t.expectEqual(5, row.get(u16, 2));
 		try t.expectEqual(null, row.get(?[]const u8, 3));
@@ -1187,7 +1214,7 @@ test "DataSet: record add column" {
 		var row = (try ds.conn.row("select \"$id\", \"$inserted\", id, system, active, record, category, new, tag1, tag2 from dataset_test where id =  6", .{})).?;
 		defer row.deinit();
 
-		try t.expectEqual(2, row.get(u32, 0));
+		try t.expectEqual(2, row.get(u64, 0));
 		try t.expectDelta(std.time.microTimestamp(), row.get(i64, 1), 5000);
 		try t.expectEqual(6, row.get(u16, 2));
 		try t.expectEqual("catalog", row.get([]const u8, 3));

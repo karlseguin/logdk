@@ -106,7 +106,7 @@ test "events.create: creates dataset and event" {
 	const row = (try tc.row("select * from logx_x", .{})).?;
 	defer row.deinit();
 
-	try t.expectEqual(1, row.get(u32, 0));                               // $id
+	try t.expectEqual(1, row.get(u64, 0));                               // $id
 	try t.expectDelta(std.time.microTimestamp(), row.get(i64, 1), 5000); // $inserted
 	try t.expectEqual(true, row.get(bool, 2));                           // active
 	try t.expectEqual("system", row.get([]const u8, 3));                 // category
