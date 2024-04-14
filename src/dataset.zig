@@ -12,6 +12,8 @@ const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 
 pub const DataSet = struct {
+	logger: logz.Logger,
+
 	// the next $id value to insert
 	next_id: u64,
 
@@ -80,11 +82,15 @@ pub const DataSet = struct {
 			break :blk max_id_row.get(?u64, 0) orelse 1;
 		};
 
+		var logger = (try logz.newLogger()).string("name", name).multiuse();
+		errdefer logger.deinit();
+
 		return .{
 			.app = app,
 			.name = name,
 			.conn = conn,
 			.arena = arena,
+			.logger = logger,
 			.next_id = next_id,
 			.insert_one = insert_one,
 			.columnLookup = columnLookup,
@@ -96,6 +102,7 @@ pub const DataSet = struct {
 	pub fn deinit(self: *DataSet) void {
 		self.insert_one.deinit();
 		self.conn.deinit();
+		self.logger.deinit();
 
 		const arena = self.arena;
 		const allocator = arena.child_allocator;
@@ -103,20 +110,25 @@ pub const DataSet = struct {
 		allocator.destroy(arena);
 	}
 
-	// allocator is the ArenaAllocator that'll be owned by the DataSet
-	pub fn columnsFromEvent(allocator: Allocator, event: Event) ![]Column {
+	// allocator is the ArenaAllocator, so we can be a little sloppy
+	pub fn columnsFromEvent(allocator: Allocator, event: Event, logger: logz.Logger) ![]Column {
 		var columns = try allocator.alloc(Column, event.fieldCount());
 		errdefer allocator.free(columns);
 
 		var i: usize = 0;
 		var it = event.map.iterator();
 		while (it.next()) |kv| {
-			columns[i] = Column.fromEventValue(try allocator.dupe(u8, kv.key_ptr.*), kv.value_ptr.*);
+			const name = kv.key_ptr.*;
+			if (Column.validName(name) == false) {
+				_ = logger.string("name", name);
+				continue;
+			}
+			columns[i] = Column.fromEventValue(try allocator.dupe(u8, name), kv.value_ptr.*);
 			i += 1;
 		}
 
+		columns = columns[0..i];
 		std.mem.sort(Column, columns, {}, sortColumns);
-
 		return columns;
 	}
 
@@ -234,7 +246,7 @@ pub const DataSet = struct {
 				// If we made it all the way here, then the event fit into our dataset
 				// as-is (without any alternation) and thus we can finish our insert)
 				const inserted = insert.exec() catch |err| {
-					logdk.dbErr("Dataset.record", err, self.conn, logz.err().string("dataset", self.name)) catch {};
+					logdk.dbErr("Dataset.record", err, self.conn, self.logger.level(.Error)) catch {};
 					continue;
 				};
 				std.debug.assert(inserted == 1);
@@ -341,8 +353,13 @@ pub const DataSet = struct {
 					// we already know this field/column
 					continue;
 				}
+				const name = kv.key_ptr.*;
+				if (Column.validName(name) == false) {
+					self.logger.level(.Warn).ctx("DataSet.alter.invalid_name").string("name", name).log();
+					continue;
+				}
 
-				var column = Column.fromEventValue(try aa.dupe(u8, kv.key_ptr.*), kv.value_ptr.*);
+				var column = Column.fromEventValue(try aa.dupe(u8, name), kv.value_ptr.*);
 
 				// a column added after initial creation is always nullable, since
 				// existing events won't have a value.
@@ -412,7 +429,7 @@ pub const DataSet = struct {
 
 	fn exec(self: *DataSet, sql: []const u8, args: anytype) !usize {
 		return self.conn.exec(sql, args) catch |err| {
-			return logdk.dbErr("DataSet.exec", err, self.conn, logz.err().string("sql", sql));
+			return logdk.dbErr("DataSet.exec", err, self.conn, self.logger.level(.Error).string("sql", sql));
 		};
 	}
 
@@ -420,7 +437,7 @@ pub const DataSet = struct {
 		var buffer = &self.buffer;
 		buffer.clearRetainingCapacity();
 		std.fmt.format(buffer.writer(), fmt, fmt_args) catch |err| {
-			logz.err().ctx("DataSet.execFmt").string("fmt", fmt).err(err).log();
+			self.logger.level(.Error).ctx("DataSet.execFmt").string("fmt", fmt).err(err).log();
 			return err;
 		};
 		return self.exec(buffer.string(), args);
@@ -432,6 +449,11 @@ const Column = struct {
 	nullable: bool,
 	is_list: bool,
 	data_type: DataType,
+
+	pub fn validName(name: []const u8) bool {
+		if (name.len == 0) return false;
+		return std.mem.indexOfScalarPos(u8, name, 0, '"') == null;
+	}
 
 	pub fn writeDDL(self: *const Column, writer: anytype) !void {
 		// name should always be a valid identifier without quoting
@@ -962,7 +984,7 @@ test "DataSet: columnsFromEvent" {
 	);
 	defer event_list.deinit();
 
-	const columns = try DataSet.columnsFromEvent(t.allocator, event_list.events[0]);
+	const columns = try DataSet.columnsFromEvent(t.allocator, event_list.events[0], logz.logger());
 	defer {
 		// this is normally managed by an arena
 		for (columns) |c| {
@@ -1206,7 +1228,8 @@ test "DataSet: record add column" {
 		\\    "category": null,
 		\\    "new": false,
 		\\    "tag1": "ok",
-		\\    "tag2": -9999
+		\\    "tag2": -9999,
+		\\    "\"invalid\"": "will not get added"
 		\\ }
 		);
 		try ds.record(event_list);
@@ -1236,6 +1259,8 @@ test "DataSet: record add column" {
 		try t.expectEqual(false, ds.columns.items[7].is_list);
 		try t.expectEqual(.smallint, ds.columns.items[7].data_type);
 		try t.expectEqual(true, ds.columnLookup.contains("tag2"));
+
+		try t.expectEqual(false, ds.columnLookup.contains("\"invalid\""));
 	}
 }
 

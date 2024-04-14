@@ -1,6 +1,5 @@
 const std = @import("std");
 
-const LazyPath = std.Build.LazyPath;
 const Allocator = std.mem.Allocator;
 const ModuleMap = std.StringArrayHashMap(*std.Build.Module);
 
@@ -20,14 +19,22 @@ pub fn build(b: *std.Build) !void {
 	try modules.put("httpz", b.dependency("httpz", dep_opts).module("httpz"));
 	try modules.put("typed", b.dependency("typed", dep_opts).module("typed"));
 	try modules.put("metrics", b.dependency("metrics", dep_opts).module("metrics"));
-	try modules.put("logz", b.dependency("logz", dep_opts).module("logz"));
+	// try modules.put("logz", b.dependency("logz", dep_opts).module("logz"));
 	try modules.put("validate", b.dependency("validate", dep_opts).module("validate"));
 	try modules.put("zul", b.dependency("zul", dep_opts).module("zul"));
 
 	const zuckdb = b.dependency("zuckdb", dep_opts).module("zuckdb");
 	try modules.put("zuckdb",  zuckdb);
 
-	zuckdb.addIncludePath(LazyPath.relative("lib"));
+
+	try modules.put("logz", b.addModule("logz", .{
+		.root_source_file = .{.path = "lib/log.zig/src/logz.zig"},
+		.imports = &.{
+			.{.name = "metrics", .module = b.addModule("metrics", .{.root_source_file = .{.path = "lib/metrics.zig/src/metrics.zig"}})},
+		},
+	}));
+
+	zuckdb.addIncludePath(b.path("lib"));
 
 	// setup executable
 	const exe = b.addExecutable(.{
@@ -54,7 +61,7 @@ pub fn build(b: *std.Build) !void {
 		.root_source_file = .{ .path = "src/main.zig" },
 		.target = target,
 		.optimize = optimize,
-		.test_runner = "test_runner.zig",
+		.test_runner = .{.path = "test_runner.zig"},
 	});
 
 	try addLibs(tests, modules, static_link);
@@ -66,42 +73,42 @@ pub fn build(b: *std.Build) !void {
 	test_step.dependOn(&run_test.step);
 }
 
-fn addLibs(step: *std.Build.Step.Compile, modules: ModuleMap, static_link: bool) !void {
+fn addLibs(c: *std.Build.Step.Compile, modules: ModuleMap, static_link: bool) !void {
 	var it = modules.iterator();
 	while (it.next()) |m| {
-		step.root_module.addImport(m.key_ptr.*, m.value_ptr.*);
+		c.root_module.addImport(m.key_ptr.*, m.value_ptr.*);
 	}
 
-	step.linkLibC();
+	c.linkLibC();
 	if (static_link) {
-		step.linkSystemLibrary("stdc++");
+		c.linkSystemLibrary("stdc++");
 	} else {
-		step.addRPath(LazyPath.relative("lib"));
+		c.addRPath(c.step.owner.path("lib"));
 	}
-	step.linkSystemLibrary("duckdb");
-	step.addLibraryPath(LazyPath.relative("lib"));
+	c.linkSystemLibrary("duckdb");
+	c.addLibraryPath(c.step.owner.path("lib"));
 }
 
-fn addUIFiles(allocator: Allocator, b: *std.Build, step: *std.Build.Step.Compile) !void {
+fn addUIFiles(allocator: Allocator, b: *std.Build, c: *std.Build.Step.Compile) !void {
 	var files = std.ArrayList([]const u8).init(allocator);
-	try addUIFilesFrom(allocator, step, "ui", &files);
+	try addUIFilesFrom(allocator, c, "ui", &files);
 
 	var files_option = b.addOptions();
 	files_option.addOption([]const []const u8, "names", files.items);
-	step.root_module.addOptions("ui_files", files_option);
+	c.root_module.addOptions("ui_files", files_option);
 }
 
-fn addUIFilesFrom(allocator: Allocator, step: *std.Build.Step.Compile, root: []const u8, files: *std.ArrayList([]const u8)) !void {
+fn addUIFilesFrom(allocator: Allocator, c: *std.Build.Step.Compile, root: []const u8, files: *std.ArrayList([]const u8)) !void {
 	var dir = try std.fs.cwd().openDir(root, .{.iterate = true});
 	var it = dir.iterate();
 
 	while (try it.next()) |file| {
 		const name = try std.fmt.allocPrint(allocator, "{s}/{s}", .{root, file.name});
 		switch (file.kind) {
-			.directory => try addUIFilesFrom(allocator, step, name, files),
+			.directory => try addUIFilesFrom(allocator, c, name, files),
 			.file => {
 				try files.append(name);
-				step.root_module.addAnonymousImport(name, .{.root_source_file = LazyPath.relative(name)});
+				c.root_module.addAnonymousImport(name, .{.root_source_file = c.step.owner.path(name)});
 			},
 			else => unreachable,
 		}

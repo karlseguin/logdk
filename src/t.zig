@@ -11,6 +11,13 @@ const App = logdk.App;
 const Env = logdk.Env;
 const allocator = std.testing.allocator;
 
+// We will _very_ rarely use this. Zig test doesn't have lifecycle hooks. We
+// can setup globals on startup, but we can't clean this up properly. If we use
+// std.testing.allocator for these, it'll report a leak. So, we create a gpa
+// without any leak reporting, and use that for the few globals that we have.
+var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+const leaking_allocator = gpa.allocator();
+
 pub fn setup() !void {
 	logz.setup(allocator, .{.pool_size = 2, .level = .Warn, .output = .stderr}) catch unreachable;
 }
@@ -53,6 +60,7 @@ pub const Context = struct {
 	app: *App,
 	web: web.Testing,
 	arena: std.mem.Allocator,
+	reset_log_level: bool = false,
 
 	const Config = struct {
 	};
@@ -65,6 +73,10 @@ pub const Context = struct {
 		self.app.deinit();
 		self._arena.deinit();
 
+		if (self.reset_log_level) {
+			logz.setLevel(.Warn);
+		}
+
 		allocator.destroy(self._arena);
 		allocator.destroy(self);
 	}
@@ -75,6 +87,11 @@ pub const Context = struct {
 				val.reset();
 			}
 		}
+	}
+
+	pub fn silenceLogs(self: *Context) void {
+		logz.setLevel(.None);
+		self.reset_log_level = true;
 	}
 
 	pub fn flushMessages(self: *Context) void {

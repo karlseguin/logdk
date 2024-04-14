@@ -137,9 +137,6 @@ pub const App = struct {
 	}
 
 	pub fn createDataSet(self: *App, env: *Env, name: []const u8, event: Event) !usize {
-		const validator = try env.validator();
-		try logdk.Validate.TableName("dataset", name, validator);
-
 		var arena = ArenaAllocator.init(self.allocator);
 		defer arena.deinit();
 
@@ -159,15 +156,14 @@ pub const App = struct {
 				return q;
 			}
 
-			const columns = try DataSet.columnsFromEvent(aa, event);
-			for (columns) |c| {
-				logdk.Validate.ColumnName(try env.arena.dupe(u8, c.name), validator) catch {};
-			}
-			if (validator.isValid() == false) {
-				return error.Validation;
-			}
-
+			const columns = try DataSet.columnsFromEvent(aa, event, env.logger);
 			const serialized_columns = try std.json.stringifyAlloc(aa, columns, .{});
+
+			if (columns.len < event.fieldCount()) {
+				// columnsFromEvent added the invalid column names to this logger already, without
+				// actually logging it
+				env.logger.level(.Warn).ctx("validation.column.name").string("dataset", name).log();
+			}
 
 			var create = try self.buffers.acquire();
 			defer create.release();
@@ -305,70 +301,13 @@ test "App: loadDataSets" {
 	try t.expectEqual(.{.name = "value", .nullable = true, .is_list = false, .data_type = .double}, ds.columns.items[3]);
 }
 
-test "App: createDataSet invalid dataset name" {
-	var tc = t.context(.{});
-	defer tc.deinit();
-
-	{
-		try t.expectError(error.Validation, tc.app.createDataSet(tc.env(), "", undefined));
-		try tc.expectInvalid(.{.code = 1, .field = "dataset"});
-	}
-
-	{
-		tc.reset();
-		try t.expectError(error.Validation, tc.app.createDataSet(tc.env(), "a" ** 251, undefined));
-		try tc.expectInvalid(.{.code = 5001, .field = "dataset"});
-	}
-
-	{
-		tc.reset();
-		try t.expectError(error.Validation, tc.app.createDataSet(tc.env(), "_hello", undefined));
-		try tc.expectInvalid(.{.code = 5000, .field = "dataset"});
-	}
-
-	{
-		tc.reset();
-		try t.expectError(error.Validation, tc.app.createDataSet(tc.env(), "1hello", undefined));
-		try tc.expectInvalid(.{.code = 5000, .field = "dataset"});
-	}
-
-	{
-		tc.reset();
-		try t.expectError(error.Validation, tc.app.createDataSet(tc.env(), "he-llo", undefined));
-		try tc.expectInvalid(.{.code = 5000, .field = "dataset"});
-	}
-
-	{
-		tc.reset();
-		try t.expectError(error.Validation, tc.app.createDataSet(tc.env(), "hello$", undefined));
-		try tc.expectInvalid(.{.code = 5000, .field = "dataset"});
-	}
-}
-
-test "App: createDataSet invalid column names" {
-	var tc = t.context(.{});
-	defer tc.deinit();
-
-	const long = "a" ** 251;
-	var event_list = try Event.parse(t.allocator, "{\"\": 1, \"1a\": 2, \"_a\": 3, \".a\": 4, \"a$\": 5, \"a b\": 6, \"a[b]\": 7, \"" ++ long ++ "\": 8}");
-	defer event_list.deinit();
-
-	try t.expectError(error.Validation, tc.app.createDataSet(tc.env(), "ds", event_list.events[0]));
-	try tc.expectInvalid(.{.code = 1, .field = ""});
-	try tc.expectInvalid(.{.code = 5000, .field = "1a"});
-	try tc.expectInvalid(.{.code = 5000, .field = "_a"});
-	try tc.expectInvalid(.{.code = 5000, .field = ".a"});
-	try tc.expectInvalid(.{.code = 5000, .field = "a$"});
-	try tc.expectInvalid(.{.code = 5000, .field = "a b"});
-	try tc.expectInvalid(.{.code = 5000, .field = "a[b]"});
-	try tc.expectInvalid(.{.code = 5001, .field = long});
-}
-
 test "App: createDataSet success" {
 	var tc = t.context(.{});
 	defer tc.deinit();
+	tc.silenceLogs();
 
-	var event_list = try Event.parse(t.allocator, "{\"id\": \"cx_312\", \"tags\": null, \"monitor\": false, \"flags\": [2, 2394, -3]}");
+	// the invalid field names are ignored
+	var event_list = try Event.parse(t.allocator, "{\"id\": \"cx_312\", \"tags\": null, \"monitor\": false, \"flags\": [2, 2394, -3], \"inv\\\"alid\": 8, \"\": 9}");
 	defer event_list.deinit();
 
 	{

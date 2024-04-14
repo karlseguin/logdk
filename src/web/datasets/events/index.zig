@@ -26,7 +26,7 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 	// and app.getDataSet above would have returned null;
 	try buf.write("select * from \"");
 	try buf.write(name);
-	try buf.write("\" limit 100");
+	try buf.write("\" order by \"$id\" desc limit 100");
 
 	var conn = try app.db.acquire();
 	defer conn.release();
@@ -283,15 +283,15 @@ test "events.index: multiple rows" {
 		.types = &[_][]const u8{"u64", "timestamp", "u16"},
 		.rows = &[_][]const std.json.Value{
 			&[_]std.json.Value{
+				.{.integer = 2},
+				.{.integer = try tc.scalar(i64, "select \"$inserted\" from ds1 where \"$id\" = 2", .{})},
+				.{.integer = 4913},
+			},
+			&[_]std.json.Value{
 				.{.integer = 1},
 				.{.integer = try tc.scalar(i64, "select \"$inserted\" from ds1 where \"$id\" = 1", .{})},
 				.{.integer = 99},
 			},
-			&[_]std.json.Value{
-				.{.integer = 2},
-				.{.integer = try tc.scalar(i64, "select \"$inserted\" from ds1 where \"$id\" = 2", .{})},
-				.{.integer = 4913},
-			}
 		},
 	});
 }

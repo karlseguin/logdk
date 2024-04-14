@@ -27,6 +27,11 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 	errdefer event_list.deinit();
 
 	if (dataset_id == null) {
+		const validator = try env.validator();
+		logdk.Validate.TableName("dataset", name, validator) catch |err| {
+			env.logger.level(.Warn).ctx("validation.dataset.name").string("name", name).log();
+			return err;
+		};
 		dataset_id = try app.createDataSet(env, name, event_list.events[0]);
 	}
 
@@ -67,21 +72,12 @@ test "events.create: invalid json body" {
 test "events.create: unknown dataset, dynamic create invalid dataset name" {
 	var tc = t.context(.{});
 	defer tc.deinit();
+	tc.silenceLogs();
 
-	tc.web.param("name", "n0p3!");
+	tc.web.param("name", "n\"0p3!");
 	tc.web.body("{\"id\": 1}");
 	try t.expectError(error.Validation, handler(tc.env(), tc.web.req, tc.web.res));
 	try tc.expectInvalid(.{.code = 5000, .field = "dataset"});
-}
-
-test "events.create: unknown dataset, invalid column name" {
-	var tc = t.context(.{});
-	defer tc.deinit();
-
-	tc.web.param("name", "table_x");
-	tc.web.body("{\"id$x\": 1}");
-	try t.expectError(error.Validation, handler(tc.env(), tc.web.req, tc.web.res));
-	try tc.expectInvalid(.{.code = 5000, .field = "id$x"});
 }
 
 test "events.create: creates dataset and event" {

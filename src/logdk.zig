@@ -12,7 +12,7 @@ pub const DataSet = @import("dataset.zig").DataSet;
 
 pub const testing = @import("t.zig");
 
-pub const MAX_IDENTIFIER_LEN = 250;
+pub const MAX_IDENTIFIER_LEN = 100;
 
 pub const codes = struct {
 	pub const CONNECTION_RESET = 0;
@@ -38,51 +38,10 @@ pub const Validate = struct {
 	const INVALID_IDENTIFIER = 5000;
 	const INVALID_IDENTIFIER_LEN = 5001;
 
-	pub fn TableName(field: []const u8, value: []const u8, context: *validate.Context(void)) !void {
-		if (value.len == 0) {
-			context.addInvalidField(.{
-				.field = field,
-				.err = "is required",
-				.code = validate.codes.REQUIRED,
-			});
-			return error.Validation;
-		}
-
-		if (value.len > MAX_IDENTIFIER_LEN) {
-			context.addInvalidField(.{
-				.field = field,
-				.code = INVALID_IDENTIFIER_LEN,
-				.err = std.fmt.comptimePrint("name cannot be longer than {d} characters", .{MAX_IDENTIFIER_LEN}),
-			});
-			return error.Validation;
-		}
-
-		var valid = std.ascii.isAlphabetic(value[0]);
-
-		if (valid) {
-			for (value[1..]) |c| {
-				if (std.ascii.isAlphanumeric(c) or c == '_') {
-					continue;
-				}
-				valid = false;
-				break;
-			}
-		}
-
-		if (valid == false) {
-			context.addInvalidField(.{
-				.field = field,
-				.code = INVALID_IDENTIFIER,
-				.err = "must begin with a letter, and only contain letters, numbers or underscores",
-			});
-			return error.Validation;
-		}
-	}
-
-	pub fn ColumnName(name: []const u8, context: *validate.Context(void)) !void {
+	pub fn TableName(field: []const u8, name: []const u8, context: *validate.Context(void)) !void {
 		if (name.len == 0) {
 			context.addInvalidField(.{
-				.field = name,
+				.field = field,
 				.err = "is required",
 				.code = validate.codes.REQUIRED,
 			});
@@ -91,30 +50,18 @@ pub const Validate = struct {
 
 		if (name.len > MAX_IDENTIFIER_LEN) {
 			context.addInvalidField(.{
-				.field = name,
+				.field = field,
 				.code = INVALID_IDENTIFIER_LEN,
-				.err = std.fmt.comptimePrint("column name cannot be longer than {d} characters", .{MAX_IDENTIFIER_LEN}),
+				.err = std.fmt.comptimePrint("name cannot be longer than {d} characters", .{MAX_IDENTIFIER_LEN}),
 			});
 			return error.Validation;
 		}
 
-		var valid = std.ascii.isAlphabetic(name[0]);
-
-		if (valid) {
-			for (name[1..]) |c| {
-				if (std.ascii.isAlphanumeric(c) or c == '_' or c == '.') {
-					continue;
-				}
-				valid = false;
-				break;
-			}
-		}
-
-		if (valid == false) {
+		if (std.mem.indexOfScalar(u8, name, '"') != null) {
 			context.addInvalidField(.{
-				.field = name,
+				.field = field,
 				.code = INVALID_IDENTIFIER,
-				.err = "must begin with a letter, and only contain letters, numbers, underscores and dots",
+				.err = "cannot contain double quote",
 			});
 			return error.Validation;
 		}

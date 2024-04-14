@@ -5,6 +5,7 @@ zig-cache/
 *.dylib
 ui/
 lib/zul
+lib/log.zig
 lib/http.zig
 lib/metrics.zig
 lib/websocket.zig
