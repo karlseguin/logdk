@@ -48,14 +48,16 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 	buf.clearRetainingCapacity();
 	const writer = buf.writer();
 
-	const aa = res.arena;
-	var column_types = try aa.alloc(zuckdb.ParameterType, rows.column_count);
-	for (0..column_types.len) |i| {
-		column_types[i] = rows.columnType(i);
-	}
+	// const aa = res.arena;
+	// var column_types = try aa.alloc(zuckdb.DataType, rows.column_count);
+	// for (0..column_types.len) |i| {
+	// 	column_types[i] = rows.columnType(i);
+	// }
+
+	const vectors = rows.vectors;
 
 	try buf.write("{\n \"cols\": [");
-	for (0..column_types.len) |i| {
+	for (0..vectors.len) |i| {
 		try std.json.encodeJsonString(std.mem.span(rows.columnName(i)), .{}, writer);
 		try buf.writeByte(',');
 	}
@@ -65,26 +67,22 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 	if (try rows.next()) |first_row| {
 		try buf.write("],\n \"types\": [");
 
-		for (column_types, 0..) |column_type, i| {
+		for (vectors) |*vector| {
 			try buf.writeByte('"');
-			switch (column_type) {
-				.list => try writeListType(rows.result, i, buf),
-				.varchar => try writeVarcharType(rows.result, i, buf),
-				else => try buf.write(@tagName(column_type)),
-			}
+			try vector.writeType(writer);
 			try buf.write("\",");
 		}
 		buf.truncate(1);
 		try buf.write("],\n \"rows\": [");
 
 		try buf.write("\n  [");
-		try serializeRow(&first_row, column_types, buf);
+		try serializeRow(env, &first_row, vectors, buf);
 		try res.chunk(buf.string());
 		buf.clearRetainingCapacity();
 
 		while (try rows.next()) |row| {
 			buf.writeAssumeCapacity("],\n  [");
-			try serializeRow(&row, column_types, buf);
+			try serializeRow(env, &row, vectors, buf);
 			try res.chunk(buf.string());
 			buf.clearRetainingCapacity();
 		}
@@ -97,12 +95,12 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 	try res.chunk(buf.string());
 }
 
-fn serializeRow(row: *const zuckdb.Row, column_types: []zuckdb.ParameterType, buf: *zul.StringBuilder) !void {
+fn serializeRow(env: *logdk.Env, row: *const zuckdb.Row, vectors: []zuckdb.Vector, buf: *zul.StringBuilder) !void {
 	const writer = buf.writer();
 
-	for (column_types, 0..) |column_type, i| {
-		switch (column_type) {
-			.list => {
+	for (vectors, 0..) |*vector, i| {
+		switch (vector.type) {
+			.list => |child_type| {
 				const list = row.lazyList(i) orelse {
 					try buf.write("null,");
 					continue;
@@ -113,15 +111,15 @@ fn serializeRow(row: *const zuckdb.Row, column_types: []zuckdb.ParameterType, bu
 				}
 				try buf.writeByte('[');
 				for (0..list.len) |list_index| {
-					try translateScalar(&list, list.type, list_index, writer);
+					try translateScalar(env, &list, child_type, list_index, writer);
 					try buf.writeByte(',');
 				}
 				// overwrite the last trailing comma
 				buf.truncate(1);
 				try buf.write("],");
 			},
-			else => {
-				try translateScalar(row, column_type, i, writer);
+			.scalar => |s| {
+				try translateScalar(env, row, s, i, writer);
 				try buf.writeByte(',');
 			}
 		}
@@ -131,45 +129,52 @@ fn serializeRow(row: *const zuckdb.Row, column_types: []zuckdb.ParameterType, bu
 }
 
 // src can either be a zuckdb.Row or a zuckdb.LazyList
-fn translateScalar(src: anytype, column_type: zuckdb.ParameterType, i: usize, writer: anytype) !void {
+fn translateScalar(env: *logdk.Env, src: anytype, column_type: zuckdb.Vector.Type.Scalar, i: usize, writer: anytype) !void {
 	if (src.isNull(i)) {
 		return writer.writeAll("null");
 	}
 
 	switch (column_type) {
-		.varchar => try std.json.encodeJsonString(src.get([]const u8, i), .{}, writer),
-		.bool => try writer.writeAll(if (src.get(bool, i)) "true" else "false"),
-		.i8 => try std.fmt.formatInt(src.get(i8, i), 10, .lower, .{}, writer),
-		.i16 => try std.fmt.formatInt(src.get(i16, i), 10, .lower, .{}, writer),
-		.i32 => try std.fmt.formatInt(src.get(i32, i), 10, .lower, .{}, writer),
-		.i64 => try std.fmt.formatInt(src.get(i64, i), 10, .lower, .{}, writer),
-		.i128 => try std.fmt.formatInt(src.get(i128, i), 10, .lower, .{}, writer),
-		.u8 => try std.fmt.formatInt(src.get(u8, i), 10, .lower, .{}, writer),
-		.u16 => try std.fmt.formatInt(src.get(u16, i), 10, .lower, .{}, writer),
-		.u32 => try std.fmt.formatInt(src.get(u32, i), 10, .lower, .{}, writer),
-		.u64 => try std.fmt.formatInt(src.get(u64, i), 10, .lower, .{}, writer),
-		.u128 => try std.fmt.formatInt(src.get(u128, i), 10, .lower, .{}, writer),
-		.f32 => try std.fmt.format(writer, "{d}", .{src.get(f32, i)}),
-		.f64, .decimal => try std.fmt.format(writer, "{d}", .{src.get(f64, i)}),
-		.uuid => try std.json.encodeJsonString(&src.get(zuckdb.UUID, i), .{}, writer),
-		.date => {
-			const date = src.get(zuckdb.Date, i);
-			try std.json.stringify(.{
-				.year = date.year,
-				.month = date.month,
-				.day = date.day,
-			}, .{}, writer);
+		.decimal => try std.fmt.format(writer, "{d}", .{src.get(f64, i)}),
+		.@"enum" => unreachable, // TODO
+		.simple => |s| switch (s) {
+			zuckdb.c.DUCKDB_TYPE_VARCHAR => try std.json.encodeJsonString(src.get([]const u8, i), .{}, writer),
+			zuckdb.c.DUCKDB_TYPE_BOOLEAN => try writer.writeAll(if (src.get(bool, i)) "true" else "false"),
+			zuckdb.c.DUCKDB_TYPE_TINYINT => try std.fmt.formatInt(src.get(i8, i), 10, .lower, .{}, writer),
+			zuckdb.c.DUCKDB_TYPE_SMALLINT  => try std.fmt.formatInt(src.get(i16, i), 10, .lower, .{}, writer),
+			zuckdb.c.DUCKDB_TYPE_INTEGER  => try std.fmt.formatInt(src.get(i32, i), 10, .lower, .{}, writer),
+			zuckdb.c.DUCKDB_TYPE_BIGINT  => try std.fmt.formatInt(src.get(i64, i), 10, .lower, .{}, writer),
+			zuckdb.c.DUCKDB_TYPE_HUGEINT  => try std.fmt.formatInt(src.get(i128, i), 10, .lower, .{}, writer),
+			zuckdb.c.DUCKDB_TYPE_UTINYINT  => try std.fmt.formatInt(src.get(u8, i), 10, .lower, .{}, writer),
+			zuckdb.c.DUCKDB_TYPE_USMALLINT  => try std.fmt.formatInt(src.get(u16, i), 10, .lower, .{}, writer),
+			zuckdb.c.DUCKDB_TYPE_UINTEGER  => try std.fmt.formatInt(src.get(u32, i), 10, .lower, .{}, writer),
+			zuckdb.c.DUCKDB_TYPE_UBIGINT  => try std.fmt.formatInt(src.get(u64, i), 10, .lower, .{}, writer),
+			zuckdb.c.DUCKDB_TYPE_UHUGEINT  => try std.fmt.formatInt(src.get(u128, i), 10, .lower, .{}, writer),
+			zuckdb.c.DUCKDB_TYPE_FLOAT  => try std.fmt.format(writer, "{d}", .{src.get(f32, i)}),
+			zuckdb.c.DUCKDB_TYPE_DOUBLE  => try std.fmt.format(writer, "{d}", .{src.get(f64, i)}),
+			zuckdb.c.DUCKDB_TYPE_UUID  => try std.json.encodeJsonString(&src.get(zuckdb.UUID, i), .{}, writer),
+			zuckdb.c.DUCKDB_TYPE_DATE  => {
+				const date = src.get(zuckdb.Date, i);
+				try std.json.stringify(.{
+					.year = date.year,
+					.month = date.month,
+					.day = date.day,
+				}, .{}, writer);
+			},
+			zuckdb.c.DUCKDB_TYPE_TIME, zuckdb.c.DUCKDB_TYPE_TIME_TZ => {
+				const time = src.get(zuckdb.Time, i);
+				try std.json.stringify(.{
+					.hour = time.hour,
+					.min = time.min,
+					.sec = time.sec,
+				}, .{}, writer);
+			},
+			zuckdb.c.DUCKDB_TYPE_TIMESTAMP, zuckdb.c.DUCKDB_TYPE_TIMESTAMP_TZ  => try std.fmt.formatInt(src.get(i64, i), 10, .lower, .{}, writer),
+			else => |duckdb_type| {
+				try writer.writeAll("???");
+				env.logger.level(.Warn).ctx("serialize.unknown_type").int("duckdb_type", duckdb_type).log();
+			}
 		},
-		.time, .timetz => {
-			const time = src.get(zuckdb.Time, i);
-			try std.json.stringify(.{
-				.hour = time.hour,
-				.min = time.min,
-				.sec = time.sec,
-			}, .{}, writer);
-		},
-		.timestamp, .timestamptz => try std.fmt.formatInt(src.get(i64, i), 10, .lower, .{}, writer),
-		else => try std.fmt.format(writer,  "\"cannot serialize {any}\"", .{column_type}),
 	}
 }
 
@@ -181,7 +186,7 @@ fn writeListType(result: *zuckdb.c.duckdb_result, column_index: usize, buf: *zul
 	defer zuckdb.c.duckdb_destroy_logical_type(&child_type);
 
 	const duckdb_type = zuckdb.c.duckdb_get_type_id(child_type);
-	const named_type = zuckdb.ParameterType.fromDuckDBType(duckdb_type);
+	const named_type = zuckdb.DataType.fromDuckDBType(duckdb_type);
 	try buf.write(@tagName(named_type));
 	try buf.write("[]");
 }
@@ -246,7 +251,7 @@ test "events.index: single row" {
 	try handler(tc.env(), tc.web.req, tc.web.res);
 	try tc.web.expectJson(.{
 		.cols = &[_][]const u8{"$id", "$inserted", "details", "false", "float_neg", "float_pos", "int", "list", "mixed_list", "null", "text", "true", "uint"},
-		.types = &[_][]const u8{"u64", "timestamp", "JSON", "bool", "f64", "f64", "i16", "f64[]", "JSON", "varchar", "varchar", "bool", "u32"},
+		.types = &[_][]const u8{"ubigint","timestamp","varchar","boolean","double","double","smallint","double[]","varchar","varchar","varchar","boolean","uinteger"},
 		.rows = &[_][]const std.json.Value{
 			&[_]std.json.Value{
 				.{.integer = 1},
@@ -280,7 +285,7 @@ test "events.index: multiple rows" {
 	try handler(tc.env(), tc.web.req, tc.web.res);
 	try tc.web.expectJson(.{
 		.cols = &[_][]const u8{"$id", "$inserted", "int"},
-		.types = &[_][]const u8{"u64", "timestamp", "u16"},
+		.types = &[_][]const u8{"ubigint", "timestamp", "usmallint"},
 		.rows = &[_][]const std.json.Value{
 			&[_]std.json.Value{
 				.{.integer = 2},
