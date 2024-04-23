@@ -28,7 +28,7 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 
 	if (dataset_id == null) {
 		const validator = try env.validator();
-		logdk.Validate.TableName("dataset", name, validator) catch |err| {
+		logdk.Validate.validateIdentifier("dataset", name, validator) catch |err| {
 			env.logger.level(.Warn).ctx("validation.dataset.name").string("name", name).log();
 			return err;
 		};

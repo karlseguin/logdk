@@ -119,7 +119,7 @@ pub const DataSet = struct {
 		var it = event.map.iterator();
 		while (it.next()) |kv| {
 			const name = kv.key_ptr.*;
-			if (Column.validName(name) == false) {
+			if (Column.isValidName(name) == false) {
 				_ = logger.string("name", name);
 				continue;
 			}
@@ -354,7 +354,7 @@ pub const DataSet = struct {
 					continue;
 				}
 				const name = kv.key_ptr.*;
-				if (Column.validName(name) == false) {
+				if (Column.isValidName(name) == false) {
 					self.logger.level(.Warn).ctx("DataSet.alter.invalid_name").string("name", name).log();
 					continue;
 				}
@@ -450,9 +450,8 @@ const Column = struct {
 	is_list: bool,
 	data_type: DataType,
 
-	pub fn validName(name: []const u8) bool {
-		if (name.len == 0) return false;
-		return std.mem.indexOfScalarPos(u8, name, 0, '"') == null;
+	pub fn isValidName(name: []const u8) bool {
+		return logdk.Validate.identifierIsValid(name);
 	}
 
 	pub fn writeDDL(self: *const Column, writer: anytype) !void {
@@ -546,9 +545,6 @@ fn columnTypeForEventList(list: []const Event.Value) DataType {
 	return candidate;
 }
 
-// It's impossible to get a null or list value since we expect that to already be
-// special-cased by the caller.
-//
 // This code can lead to unecesasrily widening a column. If a column is `tinyint`
 // and our value is `.{.utinyint = 10}`, then we know the column can stay `tinyint`.
 // However, if the inverse happens, and or column is utinyint and the value is
@@ -556,17 +552,17 @@ fn columnTypeForEventList(list: []const Event.Value) DataType {
 // This is because we don't know the max value of the column. As a utinyint, it
 // could be holding values from 0-255. if max(column) <= 127, we could use a tinyint.
 // If max(column) >= 128, we have to use a smallint. This could be solved by
-// tracking (or fetching) max(column).
+// tracking max(column).
 fn compatibleDataType(column_type: DataType, value: Event.Value) DataType {
 	switch (column_type) {
 		.bool => switch (value) {
-			.bool => return .bool,
+			.null, .bool => return .bool,
 			.json => return .json,
-			.null, .list => unreachable,
+			.list => unreachable,
 			else => return .text,
 		},
 		.tinyint => switch (value) {
-			.tinyint => return .tinyint,
+			.null, .tinyint => return .tinyint,
 			.smallint => return .smallint,
 			.integer => return .integer,
 			.bigint => return .bigint,
@@ -577,10 +573,10 @@ fn compatibleDataType(column_type: DataType, value: Event.Value) DataType {
 			.ubigint => |v| return if (v <= 9223372036854775807) .bigint else .text,
 			.text, .bool => return .text,
 			.json => return .json,
-			.null, .list => unreachable,
+			.list => unreachable,
 		},
 		.utinyint => switch (value) {
-			.utinyint => return .utinyint,
+			.null, .utinyint => return .utinyint,
 			.usmallint => return .usmallint,
 			.uinteger => return .uinteger,
 			.ubigint => return .ubigint,
@@ -590,10 +586,10 @@ fn compatibleDataType(column_type: DataType, value: Event.Value) DataType {
 			.bigint => return .bigint,
 			.text, .bool => return .text,
 			.json => return .json,
-			.null, .list => unreachable,
+			.list => unreachable,
 		},
 		.smallint => switch (value) {
-			.utinyint, .tinyint, .smallint => return .smallint,
+			.null, .utinyint, .tinyint, .smallint => return .smallint,
 			.integer => return .integer,
 			.bigint => return .bigint,
 			.double => return .double,
@@ -602,10 +598,10 @@ fn compatibleDataType(column_type: DataType, value: Event.Value) DataType {
 			.ubigint => |v| return if (v <= 9223372036854775807) .bigint else .text,
 			.text, .bool => return .text,
 			.json => return .json,
-			.null, .list => unreachable,
+			.list => unreachable,
 		},
 		.usmallint => switch (value) {
-			.utinyint, .usmallint => return .usmallint,
+			.null, .utinyint, .usmallint => return .usmallint,
 			.uinteger => return .uinteger,
 			.ubigint => return .ubigint,
 			.double => return .double,
@@ -613,55 +609,57 @@ fn compatibleDataType(column_type: DataType, value: Event.Value) DataType {
 			.bigint => return .bigint,
 			.text, .bool => return .text,
 			.json => return .json,
-			.null, .list => unreachable,
+			.list => unreachable,
 		},
 		.integer => switch (value) {
-			.utinyint, .tinyint, .smallint, .usmallint, .integer => return .integer,
+			.null, .utinyint, .tinyint, .smallint, .usmallint, .integer => return .integer,
 			.bigint => return .bigint,
 			.double => return .double,
 			.uinteger => |v| return if (v <= 2147483647) .integer else .bigint,
 			.ubigint => |v| return if (v <= 9223372036854775807) .bigint else .text,
 			.text, .bool => return .text,
 			.json => return .json,
-			.null, .list => unreachable,
+			.list => unreachable,
 		},
 		.uinteger => switch (value) {
-			.utinyint, .usmallint, .uinteger => return .uinteger,
+			.null, .utinyint, .usmallint, .uinteger => return .uinteger,
 			.ubigint => return .ubigint,
 			.double => return .double,
 			.tinyint, .smallint, .integer, .bigint => return .bigint,
 			.text, .bool => return .text,
 			.json => return .json,
-			.null, .list => unreachable,
+			.list => unreachable,
 		},
 		.bigint => switch (value) {
-			.utinyint, .tinyint, .smallint, .usmallint, .integer, .uinteger, .bigint => return .bigint,
+			.null, .utinyint, .tinyint, .smallint, .usmallint, .integer, .uinteger, .bigint => return .bigint,
 			.double => return .double,
 			.ubigint => |v| return if (v <= 9223372036854775807) .bigint else .text,
 			.text, .bool => return .text,
 			.json => return .json,
-			.null, .list => unreachable,
+			.list => unreachable,
 		},
 		.ubigint => switch (value) {
-			.utinyint, .usmallint, .uinteger, .ubigint => return .ubigint,
+			.null, .utinyint, .usmallint, .uinteger, .ubigint => return .ubigint,
 			.double => return .double,
 			.tinyint, .smallint, .integer, .bigint => return .bigint,
 			.text, .bool => return .text,
 			.json => return .json,
-			.null, .list => unreachable,
+			.list => unreachable,
 		},
 		.double => switch (value) {
-			.tinyint, .utinyint, .smallint, .usmallint, .integer, .uinteger, .bigint, .ubigint, .double => return .double,
+			.null, .tinyint, .utinyint, .smallint, .usmallint, .integer, .uinteger, .bigint, .ubigint, .double => return .double,
 			.text, .bool => return .text,
 			.json => return .json,
-			.null, .list => unreachable,
+			.list => unreachable,
 		},
 		.text => switch (value) {
+			.null => return .text,
 			.json => return .json,
 			else => return .text,
 		},
 		.json => return .json,
 		.unknown => switch (value) {
+			.null => return .unknown,
 			.tinyint => return .tinyint,
 			.utinyint => return .utinyint,
 			.smallint => return .smallint,
@@ -674,7 +672,7 @@ fn compatibleDataType(column_type: DataType, value: Event.Value) DataType {
 			.text => return .text,
 			.bool => return .bool,
 			.json => return .json,
-			.null, .list => unreachable,
+			.list => unreachable,
 		}
 	}
 }
@@ -966,6 +964,11 @@ test "columnTypeForEventList" {
 		try t.expectEqual(.text, testColumnTypeEventList("\"a\", \"abc\", \"213\""));
 		try t.expectEqual(.json, testColumnTypeEventList("\"a\", 0"));
 		try t.expectEqual(.json, testColumnTypeEventList("\"a\", 123.4, true"));
+	}
+
+	{
+		// with null
+		try t.expectEqual(.utinyint, testColumnTypeEventList("1, 2, null, 3"));
 	}
 }
 

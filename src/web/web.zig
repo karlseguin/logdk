@@ -2,6 +2,7 @@ const std = @import("std");
 const zul = @import("zul");
 const logz = @import("logz");
 const httpz = @import("httpz");
+const typed = @import("typed");
 const validate = @import("validate");
 
 const logdk = @import("../logdk.zig");
@@ -18,10 +19,9 @@ const datasets = @import("datasets/_datasets.zig");
 var request_counter: u32 = 0;
 
 pub fn init(allocator: std.mem.Allocator) !void {
-	 _ = allocator;
-	// const builder = try allocator.create(Validate.Builder);
-	// builder.* = try Validate.Builder.init(allocator);
-	// try datasets.init(builder);
+	const builder = try allocator.create(Validate.Builder);
+	builder.* = try Validate.Builder.init(allocator);
+	try datasets.init(builder);
 }
 
 pub fn start(app: *App, config: *const logdk.Config) !void {
@@ -128,6 +128,27 @@ const Dispatcher = struct {
 pub const Validate = struct {
 	pub const Object = validate.Object(void);
 	pub const Builder = validate.Builder(void);
+	pub const Context = validate.Context(void);
+
+	// This isn't great, but we turn out querystring args into a typed.Map where every
+	// value is a typed.Value.string. Validators can be configured to parse strings.
+	pub fn query(req: *httpz.Request, v: *Object, env: *Env) !typed.Map {
+		const q = try req.query();
+
+		var map = typed.Map.init(req.arena);
+		try map.ensureTotalCapacity(@intCast(q.len));
+
+		for (q.keys[0..q.len], q.values[0..q.len]) |name, value| {
+			try map.putAssumeCapacity(name, value);
+		}
+
+		var validator = try env.validator();
+		const input = try v.validate(map, validator);
+		if (!validator.isValid()) {
+			return error.Validation;
+		}
+		return input orelse typed.Map.readonlyEmpty();
+	}
 };
 
 pub fn metrics(_: *Env, _: *httpz.Request, res: *httpz.Response) !void {

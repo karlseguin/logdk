@@ -20,6 +20,7 @@ const leaking_allocator = gpa.allocator();
 
 pub fn setup() !void {
 	logz.setup(allocator, .{.pool_size = 2, .level = .Warn, .output = .stderr}) catch unreachable;
+	try @import("web/web.zig").init(leaking_allocator);
 }
 
 // Our Test.Context exists to help us write tests. It does this by:
@@ -87,6 +88,8 @@ pub const Context = struct {
 				val.reset();
 			}
 		}
+		self.web.deinit();
+		self.web = web.init(.{});
 	}
 
 	pub fn silenceLogs(self: *Context) void {

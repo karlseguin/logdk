@@ -7,8 +7,10 @@ ui/
 lib/zul
 lib/log.zig
 lib/http.zig
+lib/typed.zig
+lib/zuckdb.zig
 lib/metrics.zig
 lib/websocket.zig
-lib/zuckdb.zig
+lib/validate.zig
 db.duckdb*
 

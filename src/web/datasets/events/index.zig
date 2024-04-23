@@ -1,5 +1,6 @@
 const std = @import("std");
 const zul = @import("zul");
+const typed = @import("typed");
 const httpz = @import("httpz");
 const zuckdb = @import("zuckdb");
 
@@ -9,89 +10,120 @@ const Event = logdk.Event;
 
 const Allocator = std.mem.Allocator;
 
+var validator: *web.Validate.Object = undefined;
+pub fn init(builder: *web.Validate.Builder) !void {
+	validator = builder.object(&.{
+		builder.field("page", builder.int(u16, .{.parse = true, .min = 1, .default = 1})),
+		builder.field("limit", builder.int(u16, .{.parse = true, .min = 1, .max = 5000, .default = 100})),
+		builder.field("total", builder.boolean(.{.parse = true, .default = false})),
+		builder.field("order", builder.string(.{.min = 1, .max = logdk.MAX_IDENTIFIER_LEN, .function = validateOrder})),
+	}, .{});
+}
+
 pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void {
 	const app = env.app;
 	const name = req.params.get("name").?;
 	_ = app.getDataSet(name) orelse return web.notFound(res, "dataset not found");
 
-	const query = try req.query();
-	const include_total = if (query.get("total")) |value| std.mem.eql(u8, value, "true") else false;
-	_ = include_total;
+	const input = try web.Validate.query(req, validator, env);
+	const include_total = input.get("total").?.bool;
+	const page = input.get("page").?.u16;
+	const limit = input.get("limit").?.u16;
 
+	const query = try app.buffers.acquire();
+	defer query.release();
+
+	var builder = QueryBuilder.init(query);
+	try builder.select("*");
+	try builder.from(name);
+	if (input.get("order")) |value| {
+		const order = value.string;
+		if (order[0] == '-') {
+			try builder.order(order[1..], false);
+		} else if (order[0] == '+') {
+			try builder.order(order[1..], true);
+		} else {
+			try builder.order(order, true);
+		}
+	}
+	try builder.paging(page, limit);
+
+	// we can't re-use the query buf, because we might need it, intact, to get
+	// total count
 	const buf = try app.buffers.acquire();
 	defer buf.release();
-
-	// This is relatively safe because the name was validated when the dataset was
-	// created. If `name` was invalid/unsafe, then the dataset never wouldn't exist
-	// and app.getDataSet above would have returned null;
-	try buf.write("select * from \"");
-	try buf.write(name);
-	try buf.write("\" order by \"$id\" desc limit 100");
+	const writer = buf.writer();
 
 	var conn = try app.db.acquire();
 	defer conn.release();
 
-	var stmt = conn.prepare(buf.string(), .{}) catch |err| switch (err) {
-		error.DuckDBError => return web.invalidSQL(res, conn.err, buf.string()),
-		else => return err,
-	};
-	defer stmt.deinit();
+	{
+		var stmt = conn.prepare(query.string(), .{}) catch |err| switch (err) {
+			error.DuckDBError => return web.invalidSQL(res, conn.err, query.string()),
+			else => return err,
+		};
+		defer stmt.deinit();
 
-	var rows = stmt.query(null) catch |err| switch (err) {
-		error.DuckDBError => return web.invalidSQL(res, conn.err, buf.string()),
-		else => return err,
-	};
-	defer rows.deinit();
+		var rows = stmt.query(null) catch |err| switch (err) {
+			error.DuckDBError => return web.invalidSQL(res, conn.err, query.string()),
+			else => return err,
+		};
+		defer rows.deinit();
 
-	res.content_type = .JSON;
+		res.content_type = .JSON;
 
-	buf.clearRetainingCapacity();
-	const writer = buf.writer();
-
-	// const aa = res.arena;
-	// var column_types = try aa.alloc(zuckdb.DataType, rows.column_count);
-	// for (0..column_types.len) |i| {
-	// 	column_types[i] = rows.columnType(i);
-	// }
-
-	const vectors = rows.vectors;
-
-	try buf.write("{\n \"cols\": [");
-	for (0..vectors.len) |i| {
-		try std.json.encodeJsonString(std.mem.span(rows.columnName(i)), .{}, writer);
-		try buf.writeByte(',');
-	}
-	// strip out the last comma
-	buf.truncate(1);
-
-	if (try rows.next()) |first_row| {
-		try buf.write("],\n \"types\": [");
-
-		for (vectors) |*vector| {
-			try buf.writeByte('"');
-			try vector.writeType(writer);
-			try buf.write("\",");
+		const vectors = rows.vectors;
+		try buf.write("{\n \"cols\": [");
+		for (0..vectors.len) |i| {
+			try std.json.encodeJsonString(std.mem.span(rows.columnName(i)), .{}, writer);
+			try buf.writeByte(',');
 		}
+		// strip out the last comma
 		buf.truncate(1);
-		try buf.write("],\n \"rows\": [");
 
-		try buf.write("\n  [");
-		try serializeRow(env, &first_row, vectors, buf);
-		try res.chunk(buf.string());
-		buf.clearRetainingCapacity();
+		if (try rows.next()) |first_row| {
+			try buf.write("],\n \"types\": [");
 
-		while (try rows.next()) |row| {
-			buf.writeAssumeCapacity("],\n  [");
-			try serializeRow(env, &row, vectors, buf);
+			for (vectors) |*vector| {
+				try buf.writeByte('"');
+				try vector.writeType(writer);
+				try buf.write("\",");
+			}
+			buf.truncate(1);
+			try buf.write("],\n \"rows\": [");
+
+			try buf.write("\n  [");
+			try serializeRow(env, &first_row, vectors, buf);
 			try res.chunk(buf.string());
 			buf.clearRetainingCapacity();
+
+			while (try rows.next()) |row| {
+				buf.writeAssumeCapacity("],\n  [");
+				try serializeRow(env, &row, vectors, buf);
+				try res.chunk(buf.string());
+				buf.clearRetainingCapacity();
+			}
+			try buf.writeByte(']');
+		} else {
+			try buf.write("],\"rows\":[");
 		}
-		try buf.writeByte(']');
-	} else {
-		try buf.write("],\"rows\":[");
 	}
 
-	try buf.write("\n]\n}");
+	if (include_total) {
+		const select_count_sql = builder.toCount();
+		const row = conn.row(select_count_sql, .{}) catch |err| {
+			// If the main query suceeded, this should not possibly fail
+			return logdk.dbErr("events.total", err, conn, env.logger.string("sql", select_count_sql));
+		} orelse unreachable;
+		defer row.deinit();
+
+		try buf.write("\n ],\n \"total\": ");
+		try std.fmt.formatInt(row.get(i64, 0), 10, .lower, .{}, buf.writer());
+		try buf.write("\n}");
+	} else {
+		try buf.write("\n]\n}");
+	}
+
 	try res.chunk(buf.string());
 }
 
@@ -202,6 +234,98 @@ fn writeVarcharType(result: *zuckdb.c.duckdb_result, column_index: usize, buf: *
  	return buf.write(std.mem.span(alias));
 }
 
+fn parseInt(comptime T: type, value: ?[]const u8) ?T {
+	const v = value orelse return null;
+	return std.fmt.parseInt(T, v, 10) catch return null;
+}
+
+// The main reason we have a struct for building the query is to support paging.
+// If we didn't have paging, we could just glue our query together using a StringBuilder.
+// And while that's exactly what we do, to efficiently support paging, we want
+// to re-use _most_ of that query. For example, say our query ends up looking like:
+//
+//  select * from my table where size > $1 order by name desc limit $2 offset $3
+//
+// We'd like to reuse a good chunk of that and turn it into:
+//
+//  select count(*) from my table where size > $1
+//
+// In other words, replace the column list with a count(*) and elimite any order by
+// or limit/offsets.
+//
+// Thus, the main goal of the QueryBuilder is to efficiently (e.g. reusing
+// as much of the buffer as possible) facilitate this.
+//
+// As a side note: yes, cursor paging has many advantages, but also has drawbacks
+// Also, selecting count _with_ the main query, via a window function, is muhc
+// more expensive than doing 2 separate calls.
+const QueryBuilder = struct {
+	from_start: usize,
+	where_end: usize,
+	buf: *zul.StringBuilder,
+
+	fn init(buf: *zul.StringBuilder) QueryBuilder {
+		return .{
+			.from_start = 0,
+			.where_end = 0,
+			.buf = buf,
+		};
+	}
+
+	fn select(self: *QueryBuilder, columns: []const u8) !void {
+		var buf = self.buf;
+		// we want to make sure we have enough space to overwrite this with
+		// "select count(*)" if we need to convert this query using toCount()
+		try buf.write("         select ");
+		try buf.write(columns);
+	}
+
+	// We expect the table name to have been validated one way or another, and thus
+	// this injection to be safe. In fact, the table name is the dataset name
+	// and we made sure it existed before ever executing this. And, it can only
+	// exist if its valid, thus this should always be safe.
+	fn from(self: *QueryBuilder, table: []const u8) !void {
+		var buf = self.buf;
+		self.from_start = buf.len();
+		try buf.write(" from \"");
+		try buf.write(table);
+		try buf.write("\" ");
+
+		// todo: move once we have where!
+		self.where_end = buf.len();
+	}
+
+	fn order(self: *QueryBuilder, column: []const u8, asc: bool) !void {
+		var buf = self.buf;
+		try buf.write(" order by \"");
+		try buf.write(column);
+		if (asc) {
+			try buf.writeByte('"');
+		} else {
+			try buf.write("\" desc");
+		}
+	}
+
+	fn paging(self: *QueryBuilder, page: u16, limit: u16) !void {
+		const adjusted_page = if (page == 0) page else page - 1;
+		try std.fmt.format(self.buf.writer(), " limit {d} offset {d}", .{limit, adjusted_page * limit});
+	}
+
+	fn toCount(self: *QueryBuilder) []const u8 {
+		// the underlying []u8 of our StringBuilder
+		var buf = self.buf.buf;
+
+		const select_count = "select count(*) ";
+		const start = self.from_start - select_count.len;
+		// We wrote our select statament with padding so that even if it was a
+		// "select *", we have enough space now for "select count(*) "
+		std.debug.assert(start > 0);
+		@memcpy(buf[start..start + select_count.len], select_count);
+
+		return buf[start..self.where_end];
+	}
+};
+
 const t = logdk.testing;
 test "events.index: unknown dataset" {
 	var tc = t.context(.{});
@@ -210,6 +334,24 @@ test "events.index: unknown dataset" {
 	tc.web.param("name", "nope");
 	try handler(tc.env(), tc.web.req, tc.web.res);
 	try tc.expectNotFound("dataset not found");
+}
+
+test "events.index: validation" {
+	var tc = t.context(.{});
+	defer tc.deinit();
+
+	try tc.createDataSet("ds1", "{\"id\": 1}", false);
+	tc.web.param("name", "ds1");
+	tc.web.query("page", "0");
+	tc.web.query("limit", "10001");
+	tc.web.query("total", "what");
+	tc.web.query("order", "ha\"ck");
+
+	try t.expectError(error.Validation, handler(tc.env(), tc.web.req, tc.web.res));
+	try tc.expectInvalid(.{.code = 11, .field = "page"});
+	try tc.expectInvalid(.{.code = 12, .field = "limit"});
+	try tc.expectInvalid(.{.code = 6, .field = "total"});
+	try tc.expectInvalid(.{.code = 5000, .field = "order"});
 }
 
 test "events.index: empty result" {
@@ -249,6 +391,7 @@ test "events.index: single row" {
 
 	tc.web.param("name", "ds1");
 	try handler(tc.env(), tc.web.req, tc.web.res);
+
 	try tc.web.expectJson(.{
 		.cols = &[_][]const u8{"$id", "$inserted", "details", "false", "float_neg", "float_pos", "int", "list", "mixed_list", "null", "text", "true", "uint"},
 		.types = &[_][]const u8{"ubigint","timestamp","varchar","boolean","double","double","smallint","double[]","varchar","varchar","varchar","boolean","uinteger"},
@@ -299,4 +442,134 @@ test "events.index: multiple rows" {
 			},
 		},
 	});
+}
+
+test "events.index: single row with total" {
+	var tc = t.context(.{});
+	defer tc.deinit();
+
+	try tc.createDataSet("ds_count", "{\"int\": 44}", true);
+	tc.web.param("name", "ds_count");
+	tc.web.query("total", "true");
+	try handler(tc.env(), tc.web.req, tc.web.res);
+
+	try tc.web.expectJson(.{
+		.cols = &[_][]const u8{"$id", "$inserted", "int"},
+		.total = 1,
+	});
+}
+
+test "events.index: multiple row with total" {
+	var tc = t.context(.{});
+	defer tc.deinit();
+
+	try tc.createDataSet("ds_count", "{\"int\": 44}", true);
+	try tc.recordEvent("ds_count", "{\"int\": 22}");
+	try tc.recordEvent("ds_count", "{\"int\": 144}");
+	tc.web.param("name", "ds_count");
+	tc.web.query("total", "true");
+	try handler(tc.env(), tc.web.req, tc.web.res);
+
+	try tc.web.expectJson(.{
+		.cols = &[_][]const u8{"$id", "$inserted", "int"},
+		.total = 3,
+	});
+}
+
+test "events.index: paging" {
+	var tc = t.context(.{});
+	defer tc.deinit();
+
+	try tc.createDataSet("events", "[{\"x\": 1}, {\"x\": 2}, {\"x\": 3}, {\"x\": 4}, {\"x\": 5}]", true);
+
+	{
+		tc.web.param("name", "events");
+		tc.web.query("limit", "2");
+		try handler(tc.env(), tc.web.req, tc.web.res);
+		const res = try typed.fromJson(tc.arena, try tc.web.getJson());
+		const rows = res.map.get("rows").?.array.items;
+		try t.expectEqual(2, rows.len);
+		try t.expectEqual(5, rows[0].array.items[2].i64);
+		try t.expectEqual(4, rows[1].array.items[2].i64);
+	}
+
+	{
+		// same as above, but with an explicit page
+		tc.reset();
+		tc.web.param("name", "events");
+		tc.web.query("limit", "2");
+		tc.web.query("page", "1");
+		try handler(tc.env(), tc.web.req, tc.web.res);
+		const res = try typed.fromJson(tc.arena, try tc.web.getJson());
+		const rows = res.map.get("rows").?.array.items;
+		try t.expectEqual(2, rows.len);
+		try t.expectEqual(5, rows[0].array.items[2].i64);
+		try t.expectEqual(4, rows[1].array.items[2].i64);
+	}
+
+	{
+		// page 2
+		tc.reset();
+		tc.web.param("name", "events");
+		tc.web.query("limit", "2");
+		tc.web.query("page", "2");
+		try handler(tc.env(), tc.web.req, tc.web.res);
+		const res = try typed.fromJson(tc.arena, try tc.web.getJson());
+		const rows = res.map.get("rows").?.array.items;
+		try t.expectEqual(2, rows.len);
+		try t.expectEqual(3, rows[0].array.items[2].i64);
+		try t.expectEqual(2, rows[1].array.items[2].i64);
+	}
+}
+
+test "events.index: order" {
+	var tc = t.context(.{});
+	defer tc.deinit();
+
+	try tc.createDataSet("events", "[{\"x\": 2}, {\"x\": 1}, {\"x\": 5}, {\"x\": 4}, {\"x\": 3}]", true);
+
+	{
+		tc.web.param("name", "events");
+		tc.web.query("limit", "2");
+		tc.web.query("order", "-x");
+		try handler(tc.env(), tc.web.req, tc.web.res);
+		const res = try typed.fromJson(tc.arena, try tc.web.getJson());
+		const rows = res.map.get("rows").?.array.items;
+		try t.expectEqual(2, rows.len);
+		try t.expectEqual(5, rows[0].array.items[2].i64);
+		try t.expectEqual(4, rows[1].array.items[2].i64);
+	}
+
+	{
+		tc.reset();
+		tc.web.param("name", "events");
+		tc.web.query("limit", "2");
+		tc.web.query("order", "+x");
+		try handler(tc.env(), tc.web.req, tc.web.res);
+		const res = try typed.fromJson(tc.arena, try tc.web.getJson());
+		const rows = res.map.get("rows").?.array.items;
+		try t.expectEqual(2, rows.len);
+		try t.expectEqual(1, rows[0].array.items[2].i64);
+		try t.expectEqual(2, rows[1].array.items[2].i64);
+	}
+
+	{
+		tc.reset();
+		tc.web.param("name", "events");
+		tc.web.query("limit", "2");
+		tc.web.query("page", "2");
+		tc.web.query("order", "x");
+		try handler(tc.env(), tc.web.req, tc.web.res);
+		const res = try typed.fromJson(tc.arena, try tc.web.getJson());
+		const rows = res.map.get("rows").?.array.items;
+		try t.expectEqual(2, rows.len);
+		try t.expectEqual(3, rows[0].array.items[2].i64);
+		try t.expectEqual(4, rows[1].array.items[2].i64);
+	}
+}
+
+fn validateOrder(opt_value: ?[]const u8, ctx: *web.Validate.Context) anyerror!?[]const u8 {
+	const name = opt_value orelse return null;
+	logdk.Validate.validateIdentifier("order", name, ctx) catch {};
+	return name;
 }
