@@ -50,7 +50,6 @@ pub fn start(app: *App, config: *const logdk.Config) !void {
 		routes.get("/describe", info.describe);
 	}
 
-
 	router.getC("/metrics", info.metrics, .{.dispatcher = server.dispatchUndefined()});
 	router.getC("/*", ui.handler, .{.dispatcher = server.dispatchUndefined()});
 	logz.info().ctx("http.listen").fmt("address", "http://{s}:{d}", .{server.config.address.?, server.config.port.?}).boolean("log_http", config.log_http).log();

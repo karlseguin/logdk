@@ -90,15 +90,22 @@ fn addLibs(c: *std.Build.Step.Compile, modules: ModuleMap, static_link: bool) !v
 }
 
 fn addUIFiles(allocator: Allocator, b: *std.Build, c: *std.Build.Step.Compile) !void {
-	var files = std.ArrayList([]const u8).init(allocator);
+	// We use a MultiArryaList because addOption is broken when adding a struct
+	// https://github.com/ziglang/zig/issues/19594
+	// So instead of adding 1 option of type []StaticFile, we add 1 option for each field
+	var files = std.MultiArrayList(StaticFile){};
+	defer files.deinit(allocator);
+
 	try addUIFilesFrom(allocator, c, "ui", &files);
 
 	var files_option = b.addOptions();
-	files_option.addOption([]const []const u8, "names", files.items);
+	files_option.addOption([]const []const u8, "names", files.items(.name));
+	files_option.addOption([]const []const u8, "contents", files.items(.content));
+	files_option.addOption([]const bool, "compressed", files.items(.compressed));
 	c.root_module.addOptions("ui_files", files_option);
 }
 
-fn addUIFilesFrom(allocator: Allocator, c: *std.Build.Step.Compile, root: []const u8, files: *std.ArrayList([]const u8)) !void {
+fn addUIFilesFrom(allocator: Allocator, c: *std.Build.Step.Compile, root: []const u8, files: *std.MultiArrayList(StaticFile)) !void {
 	var dir = try std.fs.cwd().openDir(root, .{.iterate = true});
 	var it = dir.iterate();
 
@@ -107,13 +114,24 @@ fn addUIFilesFrom(allocator: Allocator, c: *std.Build.Step.Compile, root: []cons
 		switch (file.kind) {
 			.directory => try addUIFilesFrom(allocator, c, name, files),
 			.file => {
-				try files.append(name);
-				c.root_module.addAnonymousImport(name, .{.root_source_file = c.step.owner.path(name)});
+				const compressed = std.mem.endsWith(u8, name, ".br");
+				try files.append(allocator, .{
+					.name = if (compressed) name[0..name.len - 3] else name,
+					.compressed = compressed,
+					.content = try dir.readFileAlloc(allocator, file.name, 1_048_576),
+				});
+				// c.root_module.addAnonymousImport(name, .{.root_source_file = c.step.owner.path(name)});
 			},
 			else => unreachable,
 		}
 	}
 }
+
+pub const StaticFile = struct {
+	name: []const u8,
+	compressed: bool,
+	content: []const u8,
+};
 
 
 	// const httpz = b.addModule("httpz", .{
