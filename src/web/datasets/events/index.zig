@@ -17,6 +17,7 @@ pub fn init(builder: *web.Validate.Builder) !void {
 		builder.field("limit", builder.int(u16, .{.parse = true, .min = 1, .max = 5000, .default = 100})),
 		builder.field("total", builder.boolean(.{.parse = true, .default = false})),
 		builder.field("order", builder.string(.{.min = 1, .max = logdk.MAX_IDENTIFIER_LEN, .function = validateOrder})),
+		builder.field("filter", builder.string(.{.min = 1})),
 	}, .{});
 }
 
@@ -36,6 +37,12 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 	var builder = QueryBuilder.init(query);
 	try builder.select("*");
 	try builder.from(name);
+	if (input.get("filter")) |filter| {
+		try builder.where(filter.string);
+	} else {
+		try builder.where(null);
+	}
+
 	if (input.get("order")) |value| {
 		const order = value.string;
 		if (order[0] == '-') {
@@ -290,8 +297,14 @@ const QueryBuilder = struct {
 		try buf.write(" from \"");
 		try buf.write(table);
 		try buf.write("\" ");
+	}
 
-		// todo: move once we have where!
+	fn where(self: *QueryBuilder, _w: ?[]const u8)! void {
+		const buf = self.buf;
+		if (_w) |w| {
+			try buf.write("where ");
+			try buf.write(w);
+		}
 		self.where_end = buf.len();
 	}
 
@@ -425,6 +438,7 @@ test "events.index: multiple rows" {
 	try tc.recordEvent("ds1", "{\"int\": 4913}");
 
 	tc.web.param("name", "ds1");
+	tc.web.query("order", "-$id");
 	try handler(tc.env(), tc.web.req, tc.web.res);
 	try tc.web.expectJson(.{
 		.cols = &[_][]const u8{"$id", "$inserted", "int"},
@@ -485,6 +499,7 @@ test "events.index: paging" {
 	{
 		tc.web.param("name", "events");
 		tc.web.query("limit", "2");
+		tc.web.query("order", "-x");
 		try handler(tc.env(), tc.web.req, tc.web.res);
 		const res = try typed.fromJson(tc.arena, try tc.web.getJson());
 		const rows = res.map.get("rows").?.array.items;
@@ -499,6 +514,7 @@ test "events.index: paging" {
 		tc.web.param("name", "events");
 		tc.web.query("limit", "2");
 		tc.web.query("page", "1");
+		tc.web.query("order", "-x");
 		try handler(tc.env(), tc.web.req, tc.web.res);
 		const res = try typed.fromJson(tc.arena, try tc.web.getJson());
 		const rows = res.map.get("rows").?.array.items;
@@ -513,6 +529,7 @@ test "events.index: paging" {
 		tc.web.param("name", "events");
 		tc.web.query("limit", "2");
 		tc.web.query("page", "2");
+		tc.web.query("order", "-x");
 		try handler(tc.env(), tc.web.req, tc.web.res);
 		const res = try typed.fromJson(tc.arena, try tc.web.getJson());
 		const rows = res.map.get("rows").?.array.items;
@@ -537,6 +554,53 @@ test "events.index: order" {
 		const rows = res.map.get("rows").?.array.items;
 		try t.expectEqual(2, rows.len);
 		try t.expectEqual(5, rows[0].array.items[2].i64);
+		try t.expectEqual(4, rows[1].array.items[2].i64);
+	}
+
+	{
+		tc.reset();
+		tc.web.param("name", "events");
+		tc.web.query("limit", "2");
+		tc.web.query("order", "+x");
+		try handler(tc.env(), tc.web.req, tc.web.res);
+		const res = try typed.fromJson(tc.arena, try tc.web.getJson());
+		const rows = res.map.get("rows").?.array.items;
+		try t.expectEqual(2, rows.len);
+		try t.expectEqual(1, rows[0].array.items[2].i64);
+		try t.expectEqual(2, rows[1].array.items[2].i64);
+	}
+
+	{
+		tc.reset();
+		tc.web.param("name", "events");
+		tc.web.query("limit", "2");
+		tc.web.query("page", "2");
+		tc.web.query("order", "x");
+		try handler(tc.env(), tc.web.req, tc.web.res);
+		const res = try typed.fromJson(tc.arena, try tc.web.getJson());
+		const rows = res.map.get("rows").?.array.items;
+		try t.expectEqual(2, rows.len);
+		try t.expectEqual(3, rows[0].array.items[2].i64);
+		try t.expectEqual(4, rows[1].array.items[2].i64);
+	}
+}
+
+test "events.index: filter" {
+	var tc = t.context(.{});
+	defer tc.deinit();
+
+	try tc.createDataSet("events", "[{\"x\": 2}, {\"x\": 1}, {\"x\": 5}, {\"x\": 4}, {\"x\": 3}]", true);
+
+	{
+		tc.web.param("name", "events");
+		tc.web.query("limit", "2");
+		tc.web.query("filter", "(x > 2)");
+		tc.web.query("order", "x");
+		try handler(tc.env(), tc.web.req, tc.web.res);
+		const res = try typed.fromJson(tc.arena, try tc.web.getJson());
+		const rows = res.map.get("rows").?.array.items;
+		try t.expectEqual(2, rows.len);
+		try t.expectEqual(3, rows[0].array.items[2].i64);
 		try t.expectEqual(4, rows[1].array.items[2].i64);
 	}
 
