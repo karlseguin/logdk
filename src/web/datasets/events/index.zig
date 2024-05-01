@@ -3,6 +3,7 @@ const zul = @import("zul");
 const typed = @import("typed");
 const httpz = @import("httpz");
 const zuckdb = @import("zuckdb");
+const validate = @import("validate");
 
 const logdk = @import("../../../logdk.zig");
 const web = logdk.web;
@@ -10,15 +11,91 @@ const Event = logdk.Event;
 
 const Allocator = std.mem.Allocator;
 
-var validator: *web.Validate.Object = undefined;
-pub fn init(builder: *web.Validate.Builder) !void {
-	validator = builder.object(&.{
+var input_validator: *logdk.Validate.Object = undefined;
+pub fn init(builder: *logdk.Validate.Builder) !void {
+	// The "filters" field should be an arary of arrays.
+	//   [["id", "e", 10], ["name", "nn"]]
+	//
+	// translates to:
+	//   id = 10 and name is not null
+	//
+	// Although it's dynamic, it's fairly structured and can mostly be validated
+	// by our validation framework.
+	// 1 - Filters must be an array
+	// 2 - It must contain arrays
+	// 3 - Each fo these child arrays must have at least 2 values
+	// 4 - The first value must be a column name (string)
+	// 5 - The second value must be a valid operation (string)
+	// 6 - Any other value depends on the second value (the operation)
+	// Further validation can only be done later, once we've prepared the statement
+	// and know the parameter types.
+	const filter_validator = builder.array(null, .{.function = validateFilter, .min = 2});
+	input_validator = builder.object(&.{
 		builder.field("page", builder.int(u16, .{.parse = true, .min = 1, .default = 1})),
 		builder.field("limit", builder.int(u16, .{.parse = true, .min = 1, .max = 5000, .default = 100})),
 		builder.field("total", builder.boolean(.{.parse = true, .default = false})),
 		builder.field("order", builder.string(.{.min = 1, .max = logdk.MAX_IDENTIFIER_LEN, .function = validateOrder})),
-		builder.field("filter", builder.string(.{.min = 1})),
+		builder.field("filters", builder.array(filter_validator, .{.parse = true})),
 	}, .{});
+}
+
+fn validateOrder(opt_value: ?[]const u8, ctx: *logdk.Validate.Context) anyerror!?[]const u8 {
+	const name = opt_value orelse return null;
+	logdk.Validate.validateIdentifier("order", name, ctx) catch {};
+	return name;
+}
+
+// Validates 1 filter. Once we've reached this point, we're sure that
+// (a) value is not null
+// (b) has a length of at least 2
+fn validateFilter(opt_value: ?typed.Array, context: *logdk.Validate.Context) !?typed.Array {
+	context.startArray();
+	defer context.endArray();
+
+	const filter = opt_value orelse unreachable;
+	const items = filter.items;
+	std.debug.assert(items.len > 1);
+
+	context.arrayIndex(0);
+	switch (items[0]) {
+		.string => |column_name| logdk.Validate.validateIdentifier(null, column_name, context) catch {},
+		else => try context.add(.{.code = logdk.Validate.TYPE_STRING, .err = "column name must be a string"}),
+	}
+
+	context.arrayIndex(1);
+	const op = switch (items[1]) {
+		.string => |str| std.meta.stringToEnum(QueryBuilder.Operator, str) orelse {
+			try context.add(.{.code = logdk.Validate.STRING_CHOICE, .err = "must be one of: e, n, l, le, g, ge, rel"});
+			return null;
+		},
+		else => {
+			try context.add(.{.code = logdk.Validate.TYPE_STRING, .err = "must be a string"});
+			return null;
+		}
+	};
+
+	const expected_value_count = switch (op) {
+		.e, .n, .l, .le, .g, .ge, .rel => 1,
+	};
+
+	// +1 for the column name, +1 for the operator
+	const expected_filter_length = 2 + expected_value_count;
+
+	context.arrayIndex(2);
+	if (items.len != expected_filter_length) {
+		const plural = if (expected_filter_length == 1) "" else "s";
+		try context.add(.{
+			.code = logdk.Validate.INVALID_FILTER_VALUE_COUNT,
+			.data = try context.dataBuilder().put("length", expected_value_count).done(),
+			.err = try std.fmt.allocPrint(context.allocator, "must have {d} value{s}", .{expected_value_count, plural}),
+		});
+		return null;
+	}
+
+	// Replace the string operation value with an integer, this is cheaper to turn
+	// back tinto a QueryBuikler.Operator later.
+	items[1] = .{.i64 = @intFromEnum(op)};
+	return filter;
 }
 
 pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void {
@@ -26,21 +103,20 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 	const name = req.params.get("name").?;
 	_ = app.getDataSet(name) orelse return web.notFound(res, "dataset not found");
 
-	const input = try web.Validate.query(req, validator, env);
+	const input = try web.validateQuery(req, input_validator, env);
 	const include_total = input.get("total").?.bool;
 	const page = input.get("page").?.u16;
 	const limit = input.get("limit").?.u16;
 
-	const query = try app.buffers.acquire();
-	defer query.release();
+	var builder = try QueryBuilder.init(res.arena, env);
+	defer builder.deinit();
 
-	var builder = QueryBuilder.init(query);
 	try builder.select("*");
 	try builder.from(name);
-	if (input.get("filter")) |filter| {
-		try builder.where(filter.string);
+	if (input.get("filters")) |filters| {
+		try builder.filters(filters.array);
 	} else {
-		try builder.where(null);
+		try builder.filters(null);
 	}
 
 	if (input.get("order")) |value| {
@@ -55,7 +131,7 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 	}
 	try builder.paging(page, limit);
 
-	// we can't re-use the query buf, because we might need it, intact, to get
+	// we can't re-use the builder buf, because we might need it, intact, to get
 	// total count
 	const buf = try app.buffers.acquire();
 	defer buf.release();
@@ -65,14 +141,20 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 	defer conn.release();
 
 	{
-		var stmt = conn.prepare(query.string(), .{}) catch |err| switch (err) {
-			error.DuckDBError => return web.invalidSQL(res, conn.err, query.string()),
+		var stmt = conn.prepare(builder.string(), .{}) catch |err| switch (err) {
+			error.DuckDBError => return web.invalidSQL(res, conn.err, builder.string()),
 			else => return err,
 		};
 		defer stmt.deinit();
 
+		const validator = try env.validator();
+		try logdk.binder.validateAndBind(res.arena, stmt, builder.values.items, validator);
+		if (!validator.isValid()) {
+			return error.Validation;
+		}
+
 		var rows = stmt.query(null) catch |err| switch (err) {
-			error.DuckDBError => return web.invalidSQL(res, conn.err, query.string()),
+			error.DuckDBError => return web.invalidSQL(res, conn.err, builder.string()),
 			else => return err,
 		};
 		defer rows.deinit();
@@ -118,11 +200,23 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 
 	if (include_total) {
 		const select_count_sql = builder.toCount();
-		const row = conn.row(select_count_sql, .{}) catch |err| {
-			// If the main query suceeded, this should not possibly fail
-			return logdk.dbErr("events.total", err, conn, env.logger.string("sql", select_count_sql));
-		} orelse unreachable;
-		defer row.deinit();
+		var stmt = conn.prepare(select_count_sql, .{}) catch |err| switch (err) {
+			error.DuckDBError => return web.invalidSQL(res, conn.err, select_count_sql),
+			else => return err,
+		};
+		defer stmt.deinit();
+
+		// don't need to revalidate this
+		try logdk.binder.bindValues(stmt, builder.values.items);
+
+		var rows = stmt.query(null) catch |err| switch (err) {
+			error.DuckDBError => return web.invalidSQL(res, conn.err, select_count_sql),
+			else => return err,
+		};
+		defer rows.deinit();
+
+		// count must return a row
+		const row = (try rows.next()) orelse unreachable;
 
 		try buf.write("\n ],\n \"total\": ");
 		try std.fmt.formatInt(row.get(i64, 0), 10, .lower, .{}, buf.writer());
@@ -257,26 +351,57 @@ fn parseInt(comptime T: type, value: ?[]const u8) ?T {
 //
 //  select count(*) from my table where size > $1
 //
-// In other words, replace the column list with a count(*) and elimite any order by
+// In other words, replace the column list with a count(*) and eliminate any order by
 // or limit/offsets.
 //
 // Thus, the main goal of the QueryBuilder is to efficiently (e.g. reusing
 // as much of the buffer as possible) facilitate this.
 //
 // As a side note: yes, cursor paging has many advantages, but also has drawbacks
-// Also, selecting count _with_ the main query, via a window function, is muhc
+// Also, selecting count _with_ the main query, via a window function, is much
 // more expensive than doing 2 separate calls.
 const QueryBuilder = struct {
-	from_start: usize,
+	env: *logdk.Env,
+	allocator: Allocator,
+	cols_end: usize,
 	where_end: usize,
 	buf: *zul.StringBuilder,
+	values: std.ArrayList(typed.Value),
 
-	fn init(buf: *zul.StringBuilder) QueryBuilder {
+	const Operator = enum {
+		e,
+		n,
+		l,
+		le,
+		g,
+		ge,
+		rel,
+	};
+
+	fn init(allocator: Allocator, env: *logdk.Env) !QueryBuilder {
+		const buf = try env.app.buffers.acquire();
+		errdefer buf.release();
+
+		const values = std.ArrayList(typed.Value).init(allocator);
+		errdefer values.deinit();
+
 		return .{
-			.from_start = 0,
-			.where_end = 0,
+			.env = env,
 			.buf = buf,
+			.cols_end = 0,
+			.where_end = 0,
+			.values = values,
+			.allocator = allocator,
 		};
+	}
+
+	fn deinit(self: *QueryBuilder) void {
+		self.buf.release();
+		self.values.deinit();
+	}
+
+	fn string(self: *const QueryBuilder) []const u8 {
+		return self.buf.string();
 	}
 
 	fn select(self: *QueryBuilder, columns: []const u8) !void {
@@ -285,6 +410,7 @@ const QueryBuilder = struct {
 		// "select count(*)" if we need to convert this query using toCount()
 		try buf.write("         select ");
 		try buf.write(columns);
+		self.cols_end = buf.len();
 	}
 
 	// We expect the table name to have been validated one way or another, and thus
@@ -293,19 +419,97 @@ const QueryBuilder = struct {
 	// exist if its valid, thus this should always be safe.
 	fn from(self: *QueryBuilder, table: []const u8) !void {
 		var buf = self.buf;
-		self.from_start = buf.len();
 		try buf.write(" from \"");
 		try buf.write(table);
 		try buf.write("\" ");
 	}
 
-	fn where(self: *QueryBuilder, _w: ?[]const u8)! void {
-		const buf = self.buf;
-		if (_w) |w| {
-			try buf.write("where ");
-			try buf.write(w);
+	fn filters(self: *QueryBuilder, opt_filters: ?typed.Array) !void {
+		var buf = self.buf;
+
+		const filters_ = opt_filters orelse {
+			self.where_end = buf.len();
+			return;
+		};
+
+		if (filters_.items.len == 0) {
+			self.where_end = buf.len();
+			return;
 		}
+
+		// reasonable assumption
+		try self.values.ensureTotalCapacity(filters_.items.len);
+
+		try buf.write("where ");
+		// Much of this has already been validated
+		for (filters_.items) |untyped| {
+			const filter = untyped.array.items;
+
+			try buf.writeByte('"');
+			try buf.write(filter[0].string);
+			try buf.writeByte('"');
+
+			const operator: Operator = @enumFromInt(filter[1].i64);
+			switch (operator) {
+				.e => {
+					try buf.write(" = ");
+					try self.writePlaceHolderFor(filter[2]);
+				},
+				.n => {
+					try buf.write(" != ");
+					try self.writePlaceHolderFor(filter[2]);
+				},
+				.l => {
+					try buf.write(" < ");
+					try self.writePlaceHolderFor(filter[2]);
+				},
+				.le => {
+					try buf.write(" <= ");
+					try self.writePlaceHolderFor(filter[2]);
+				},
+				.g => {
+					try buf.write(" > ");
+					try self.writePlaceHolderFor(filter[2]);
+				},
+				.ge => {
+					try buf.write(" >= ");
+					try self.writePlaceHolderFor(filter[2]);
+				},
+				.rel => unreachable, // todo
+			}
+
+			try buf.write(" and ");
+		}
+		// truncate the trailing " and "
+		// we wouldn't be here if we didn't have at least 1 filter
+		buf.truncate(5);
 		self.where_end = buf.len();
+	}
+
+	fn writePlaceHolderFor(self: *QueryBuilder, value: typed.Value) !void {
+		try self.values.append(value);
+		switch (self.values.items.len) {
+			1 => try self.buf.write(" $1 "),
+			2 => try self.buf.write(" $2 "),
+			3 => try self.buf.write(" $3 "),
+			4 => try self.buf.write(" $4 "),
+			5 => try self.buf.write(" $5 "),
+			6 => try self.buf.write(" $6 "),
+			7 => try self.buf.write(" $7 "),
+			8 => try self.buf.write(" $8 "),
+			9 => try self.buf.write(" $9 "),
+			10 => try self.buf.write(" $10 "),
+			11 => try self.buf.write(" $11 "),
+			12 => try self.buf.write(" $12 "),
+			13 => try self.buf.write(" $13 "),
+			14 => try self.buf.write(" $14 "),
+			15 => try self.buf.write(" $15 "),
+			16 => try self.buf.write(" $16 "),
+			17 => try self.buf.write(" $17 "),
+			18 => try self.buf.write(" $18 "),
+			19 => try self.buf.write(" $19 "),
+			else => |n| try std.fmt.format(self.buf.writer(), " ${d} ", .{n}),
+		}
 	}
 
 	fn order(self: *QueryBuilder, column: []const u8, asc: bool) !void {
@@ -329,7 +533,7 @@ const QueryBuilder = struct {
 		var buf = self.buf.buf;
 
 		const select_count = "select count(*) ";
-		const start = self.from_start - select_count.len;
+		const start = self.cols_end - select_count.len;
 		// We wrote our select statament with padding so that even if it was a
 		// "select *", we have enough space now for "select count(*) "
 		std.debug.assert(start > 0);
@@ -349,7 +553,7 @@ test "events.index: unknown dataset" {
 	try tc.expectNotFound("dataset not found");
 }
 
-test "events.index: validation" {
+test "events.index: simple validation" {
 	var tc = t.context(.{});
 	defer tc.deinit();
 
@@ -361,10 +565,68 @@ test "events.index: validation" {
 	tc.web.query("order", "ha\"ck");
 
 	try t.expectError(error.Validation, handler(tc.env(), tc.web.req, tc.web.res));
-	try tc.expectInvalid(.{.code = 11, .field = "page"});
-	try tc.expectInvalid(.{.code = 12, .field = "limit"});
-	try tc.expectInvalid(.{.code = 6, .field = "total"});
-	try tc.expectInvalid(.{.code = 5000, .field = "order"});
+	try tc.expectInvalid(.{.code = logdk.Validate.INT_MIN, .field = "page"});
+	try tc.expectInvalid(.{.code = logdk.Validate.INT_MAX, .field = "limit"});
+	try tc.expectInvalid(.{.code = logdk.Validate.TYPE_BOOL, .field = "total"});
+	try tc.expectInvalid(.{.code = logdk.Validate.INVALID_IDENTIFIER, .field = "order"});
+}
+
+test "events.index: filter validation" {
+	var tc = t.context(.{});
+	defer tc.deinit();
+
+	try tc.createDataSet("ds1", "{\"id\": 1}", false);
+
+	{
+		tc.web.param("name", "ds1");
+		tc.web.query("filters", "{}");
+		try t.expectError(error.Validation, handler(tc.env(), tc.web.req, tc.web.res));
+		try tc.expectInvalid(.{.code = logdk.Validate.TYPE_ARRAY, .field = "filters"});
+	}
+
+	{
+		tc.reset();
+		tc.web.param("name", "ds1");
+		tc.web.query("filters", "[[]]");
+		try t.expectError(error.Validation, handler(tc.env(), tc.web.req, tc.web.res));
+		try tc.expectInvalid(.{.code = logdk.Validate.ARRAY_LEN_MIN, .field = "filters.0", .data = .{.min = 2}});
+	}
+
+	{
+		tc.reset();
+		tc.web.param("name", "ds1");
+		tc.web.query("filters", "[[\"inv\\\"alid\", null]]");
+		try t.expectError(error.Validation, handler(tc.env(), tc.web.req, tc.web.res));
+		try tc.expectInvalid(.{.code = logdk.Validate.INVALID_IDENTIFIER, .field = "filters.0.0"});
+		try tc.expectInvalid(.{.code = logdk.Validate.TYPE_STRING, .field = "filters.0.1"});
+	}
+
+	{
+		tc.reset();
+		tc.web.param("name", "ds1");
+		tc.web.query("filters", "[[23, \"xx\"]]");
+		try t.expectError(error.Validation, handler(tc.env(), tc.web.req, tc.web.res));
+		try tc.expectInvalid(.{.code = logdk.Validate.TYPE_STRING, .field = "filters.0.0"});
+		try tc.expectInvalid(.{.code = logdk.Validate.STRING_CHOICE, .field = "filters.0.1"});
+	}
+
+	{
+		// not enough values
+		tc.reset();
+		tc.web.param("name", "ds1");
+		tc.web.query("filters", "[[\"a\", \"e\"]]");
+		try t.expectError(error.Validation, handler(tc.env(), tc.web.req, tc.web.res));
+		try tc.expectInvalid(.{.code = logdk.Validate.INVALID_FILTER_VALUE_COUNT, .field = "filters.0.2"});
+	}
+
+	{
+		// too many values
+		tc.reset();
+		tc.web.param("name", "ds1");
+		tc.web.query("filters", "[[\"a\", \"e\", 0, 1]]");
+		try t.expectError(error.Validation, handler(tc.env(), tc.web.req, tc.web.res));
+		try tc.expectInvalid(.{.code = logdk.Validate.INVALID_FILTER_VALUE_COUNT, .field = "filters.0.2"});
+	}
 }
 
 test "events.index: empty result" {
@@ -594,7 +856,7 @@ test "events.index: filter" {
 	{
 		tc.web.param("name", "events");
 		tc.web.query("limit", "2");
-		tc.web.query("filter", "(x > 2)");
+		tc.web.query("filters", "[[\"x\", \"g\", 2]]");
 		tc.web.query("order", "x");
 		try handler(tc.env(), tc.web.req, tc.web.res);
 		const res = try typed.fromJson(tc.arena, try tc.web.getJson());
@@ -607,33 +869,16 @@ test "events.index: filter" {
 	{
 		tc.reset();
 		tc.web.param("name", "events");
-		tc.web.query("limit", "2");
+		tc.web.query("limit", "3");
 		tc.web.query("order", "+x");
+		tc.web.query("total", "true");
+		tc.web.query("filters", "[[\"x\", \"ge\", 2], [\"x\", \"n\", 4]]");
 		try handler(tc.env(), tc.web.req, tc.web.res);
 		const res = try typed.fromJson(tc.arena, try tc.web.getJson());
 		const rows = res.map.get("rows").?.array.items;
-		try t.expectEqual(2, rows.len);
-		try t.expectEqual(1, rows[0].array.items[2].i64);
-		try t.expectEqual(2, rows[1].array.items[2].i64);
+		try t.expectEqual(3, rows.len);
+		try t.expectEqual(2, rows[0].array.items[2].i64);
+		try t.expectEqual(3, rows[1].array.items[2].i64);
+		try t.expectEqual(5, rows[2].array.items[2].i64);
 	}
-
-	{
-		tc.reset();
-		tc.web.param("name", "events");
-		tc.web.query("limit", "2");
-		tc.web.query("page", "2");
-		tc.web.query("order", "x");
-		try handler(tc.env(), tc.web.req, tc.web.res);
-		const res = try typed.fromJson(tc.arena, try tc.web.getJson());
-		const rows = res.map.get("rows").?.array.items;
-		try t.expectEqual(2, rows.len);
-		try t.expectEqual(3, rows[0].array.items[2].i64);
-		try t.expectEqual(4, rows[1].array.items[2].i64);
-	}
-}
-
-fn validateOrder(opt_value: ?[]const u8, ctx: *web.Validate.Context) anyerror!?[]const u8 {
-	const name = opt_value orelse return null;
-	logdk.Validate.validateIdentifier("order", name, ctx) catch {};
-	return name;
 }

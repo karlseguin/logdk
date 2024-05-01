@@ -2,7 +2,6 @@ const std = @import("std");
 const logz = @import("logz");
 const zuckdb = @import("zuckdb");
 const logdk = @import("logdk.zig");
-const validate = @import("validate");
 
 const App = logdk.App;
 
@@ -16,7 +15,7 @@ pub const Env = struct {
 	logger: logz.Logger,
 
 	// should be loaded via the env.validator() function
-	_validator: ?*validate.Context(void) = null,
+	_validator: ?*logdk.Validate.Context = null,
 
 	pub fn deinit(self: Env) void {
 		self.logger.release();
@@ -25,7 +24,7 @@ pub const Env = struct {
 		}
 	}
 
-	pub fn validator(self: *Env) !*validate.Context(void) {
+	pub fn validator(self: *Env) !*logdk.Validate.Context {
 		if (self._validator) |val| {
 			return val;
 		}

@@ -3,6 +3,8 @@ pub const web = @import("web/web.zig");
 pub const metrics = @import("metrics.zig");
 pub const dispatcher = @import("dispatcher.zig");
 
+pub const binder = @import("binder.zig");
+
 pub const App = @import("app.zig").App;
 pub const Env = @import("env.zig").Env;
 pub const Meta = @import("meta.zig").Meta;
@@ -35,8 +37,23 @@ pub fn dbErr(ctx: []const u8, err: anyerror, conn: *const zuckdb.Conn, logger: l
 pub const Validate = struct {
 	const validate = @import("validate");
 
-	const INVALID_IDENTIFIER = 5000;
-	const INVALID_IDENTIFIER_LEN = 5001;
+	pub const Object = validate.Object(void);
+	pub const Builder = validate.Builder(void);
+	pub const Context = validate.Context(void);
+
+	pub const TYPE_STRING = validate.codes.TYPE_STRING;
+	pub const STRING_CHOICE = validate.codes.STRING_CHOICE;
+	pub const INT_MIN = validate.codes.INT_MIN;
+	pub const INT_MAX  = validate.codes.INT_MAX ;
+	pub const TYPE_BOOL = validate.codes.TYPE_BOOL;
+	pub const TYPE_ARRAY = validate.codes.TYPE_ARRAY;
+	pub const ARRAY_LEN_MIN = validate.codes.ARRAY_LEN_MIN;
+
+	pub const INVALID_IDENTIFIER = 5000;
+	pub const INVALID_IDENTIFIER_LEN = 5001;
+	pub const INVALID_FILTER_VALUE_COUNT = 5003;
+	pub const UNSUPPORTED_PARAMETER_TYPE = 5004;
+	pub const INVALID_BITSTRING = 5005;
 
 	pub fn identifier(value: []const u8) !void {
 		if (value.len == 0) return error.Required;
@@ -49,30 +66,30 @@ pub const Validate = struct {
 		return true;
 	}
 
-	pub fn validateIdentifier(field: []const u8, value: []const u8, context: *validate.Context(void)) !void {
+	// when field is null, it means this code is (probably) being executed within
+	// an input validation, and the field is being implictly tracked by the context
+	// object.
+	// When field isn't null, it (probably) means we're calling this directly.
+	pub fn validateIdentifier(field: ?[]const u8, value: []const u8, context: *validate.Context(void)) !void {
 		identifier(value) catch |err| {
-			switch (err) {
-				error.Required => {
-					context.addInvalidField(.{
-						.field = field,
-						.err = "is required",
-						.code = validate.codes.REQUIRED,
-					});
+			const invalid: validate.Invalid = switch (err) {
+				error.Required => .{.err = "is required", .code = validate.codes.REQUIRED},
+				error.Invalid => .{.err = "cannot contain double quote", .code = INVALID_IDENTIFIER},
+				error.TooLong => .{
+					.code = INVALID_IDENTIFIER_LEN,
+					.err = std.fmt.comptimePrint("name cannot be longer than {d} characters", .{MAX_IDENTIFIER_LEN}),
+					.data = try context.dataBuilder().put("max", MAX_IDENTIFIER_LEN).done(),
 				},
-				error.TooLong => {
-					context.addInvalidField(.{
-						.field = field,
-						.code = INVALID_IDENTIFIER_LEN,
-						.err = std.fmt.comptimePrint("name cannot be longer than {d} characters", .{MAX_IDENTIFIER_LEN}),
-					});
-				},
-				error.Invalid => {
-					context.addInvalidField(.{
-						.field = field,
-						.code = INVALID_IDENTIFIER,
-						.err = "cannot contain double quote",
-					});
-				},
+			};
+
+			if (field) |f| {
+				context.addInvalidField(.{
+					.field = f,
+					.err = invalid.err,
+					.code = invalid.code,
+				});
+			} else {
+				try context.add(invalid);
 			}
 			return error.Validation;
 		};
