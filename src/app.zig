@@ -171,8 +171,8 @@ pub const App = struct {
 			{
 				try std.fmt.format(create.writer(),
 					\\ create table {s} (
-					\\  "$id" ubigint not null primary key,
-					\\  "$inserted" timestamp not null
+					\\  "ldk_id" ubigint not null primary key,
+					\\  "ldk_ts" timestamp not null
 				, .{name});
 
 				const writer = create.writer();
@@ -287,7 +287,7 @@ test "App: loadDataSets" {
 	\\]
 	;
 	try tc.exec("insert into logdk.datasets (name, columns) values ($1, $2)", .{"system", columns});
-	try tc.exec("create table system (\"$id\" ubigint not null primary key, \"$inserted\" timestamp not null, id integer, type text, value double null, tags text[])", .{});
+	try tc.exec("create table system (ldk_id ubigint not null primary key, ldk_ts timestamp not null, id integer, type text, value double null, tags text[])", .{});
 
 	var app = tc.app;
 	try app.loadDataSets();
@@ -329,7 +329,7 @@ test "App: createDataSet success" {
 	defer rows.deinit();
 	{
 		const row = (try rows.next()).?;
-		try t.expectEqual("$id", row.get([]u8, 0));  // name
+		try t.expectEqual("ldk_id", row.get([]u8, 0));  // name
 		try t.expectEqual("UBIGINT", row.get([]u8, 1));  // type
 		try t.expectEqual("NO", row.get([]u8, 2));  // nullable
 		try t.expectEqual("PRI", row.get([]u8, 3));  // key
@@ -339,7 +339,7 @@ test "App: createDataSet success" {
 
 	{
 		const row = (try rows.next()).?;
-		try t.expectEqual("$inserted", row.get([]u8, 0));  // name
+		try t.expectEqual("ldk_ts", row.get([]u8, 0));  // name
 		try t.expectEqual("TIMESTAMP", row.get([]u8, 1));  // type
 		try t.expectEqual("NO", row.get([]u8, 2));  // nullable
 		try t.expectEqual(null, row.get(?[]u8, 3));  // key

@@ -444,9 +444,16 @@ const QueryBuilder = struct {
 		// Much of this has already been validated
 		for (filters_.items) |untyped| {
 			const filter = untyped.array.items;
+			var column_name = filter[0].string;
 
+			// this is a special case that we'll eventually handle. The idea is that
+			// the $ts column can be configured per dataset. So we should translate
+			// $ts to soething like: dataset.default_time_column orelse "ldk_ts".
+			if (std.mem.eql(u8, column_name, "$ts")) {
+				column_name = "ldk_ts";
+			}
 			try buf.writeByte('"');
-			try buf.write(filter[0].string);
+			try buf.write(column_name);
 			try buf.writeByte('"');
 
 			const operator: Operator = @enumFromInt(filter[1].i64);
@@ -638,7 +645,7 @@ test "events.index: empty result" {
 	tc.web.param("name", "ds1");
 	try handler(tc.env(), tc.web.req, tc.web.res);
 	try tc.web.expectJson(.{
-		.cols = &[_][]const u8{"$id", "$inserted", "id"},
+		.cols = &[_][]const u8{"ldk_id", "ldk_ts", "id"},
 		.rows = &[_][]const u8{},
 	});
 }
@@ -668,12 +675,12 @@ test "events.index: single row" {
 	try handler(tc.env(), tc.web.req, tc.web.res);
 
 	try tc.web.expectJson(.{
-		.cols = &[_][]const u8{"$id", "$inserted", "details", "false", "float_neg", "float_pos", "int", "list", "mixed_list", "null", "text", "true", "uint"},
+		.cols = &[_][]const u8{"ldk_id", "ldk_ts", "details", "false", "float_neg", "float_pos", "int", "list", "mixed_list", "null", "text", "true", "uint"},
 		.types = &[_][]const u8{"ubigint","timestamp","varchar","boolean","double","double","smallint","double[]","varchar","varchar","varchar","boolean","uinteger"},
 		.rows = &[_][]const std.json.Value{
 			&[_]std.json.Value{
 				.{.integer = 1},
-				.{.integer = try tc.scalar(i64, "select \"$inserted\" from ds1 where \"$id\" = 1", .{})},
+				.{.integer = try tc.scalar(i64, "select ldk_ts from ds1 where ldk_id = 1", .{})},
 				.{.string = "{\"message\": \"1\", \"tags\": [1, 2, 3]}"},
 				.{.bool = false},
 				.{.float = -9949283.44221},
@@ -700,20 +707,20 @@ test "events.index: multiple rows" {
 	try tc.recordEvent("ds1", "{\"int\": 4913}");
 
 	tc.web.param("name", "ds1");
-	tc.web.query("order", "-$id");
+	tc.web.query("order", "-ldk_id");
 	try handler(tc.env(), tc.web.req, tc.web.res);
 	try tc.web.expectJson(.{
-		.cols = &[_][]const u8{"$id", "$inserted", "int"},
+		.cols = &[_][]const u8{"ldk_id", "ldk_ts", "int"},
 		.types = &[_][]const u8{"ubigint", "timestamp", "usmallint"},
 		.rows = &[_][]const std.json.Value{
 			&[_]std.json.Value{
 				.{.integer = 2},
-				.{.integer = try tc.scalar(i64, "select \"$inserted\" from ds1 where \"$id\" = 2", .{})},
+				.{.integer = try tc.scalar(i64, "select ldk_ts from ds1 where ldk_id = 2", .{})},
 				.{.integer = 4913},
 			},
 			&[_]std.json.Value{
 				.{.integer = 1},
-				.{.integer = try tc.scalar(i64, "select \"$inserted\" from ds1 where \"$id\" = 1", .{})},
+				.{.integer = try tc.scalar(i64, "select ldk_ts from ds1 where ldk_id = 1", .{})},
 				.{.integer = 99},
 			},
 		},
@@ -730,7 +737,7 @@ test "events.index: single row with total" {
 	try handler(tc.env(), tc.web.req, tc.web.res);
 
 	try tc.web.expectJson(.{
-		.cols = &[_][]const u8{"$id", "$inserted", "int"},
+		.cols = &[_][]const u8{"ldk_id", "ldk_ts", "int"},
 		.total = 1,
 	});
 }
@@ -747,7 +754,7 @@ test "events.index: multiple row with total" {
 	try handler(tc.env(), tc.web.req, tc.web.res);
 
 	try tc.web.expectJson(.{
-		.cols = &[_][]const u8{"$id", "$inserted", "int"},
+		.cols = &[_][]const u8{"ldk_id", "ldk_ts", "int"},
 		.total = 3,
 	});
 }

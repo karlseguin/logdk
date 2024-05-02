@@ -14,7 +14,7 @@ const ArenaAllocator = std.heap.ArenaAllocator;
 pub const DataSet = struct {
 	logger: logz.Logger,
 
-	// the next $id value to insert
+	// the next ldk_id value to insert
 	next_id: u64,
 
 	// DataSet doesn't usually need anything from the app, except when it modifies
@@ -76,7 +76,7 @@ pub const DataSet = struct {
 
 		const next_id = blk: {
 			var buf: [logdk.MAX_IDENTIFIER_LEN + 50]u8 = undefined;
-			const sql = try std.fmt.bufPrint(&buf, "select max(\"$id\") from \"{s}\"", .{name});
+			const sql = try std.fmt.bufPrint(&buf, "select max(ldk_id) from \"{s}\"", .{name});
 			const max_id_row = try conn.row(sql, .{}) orelse break :blk 1;
 			defer max_id_row.deinit();
 			break :blk max_id_row.get(?u64, 0) orelse 1;
@@ -770,7 +770,7 @@ fn generateInsertOnePrepared(allocator: Allocator, conn: *zuckdb.Conn, name: []c
 
 	try sb.write("insert into ");
 	try sb.write(name);
-	try sb.write(" (\"$id\", \"$inserted\", ");
+	try sb.write(" (ldk_id, ldk_ts, ");
 	for (columns) |c| {
 		try sb.writeByte('"');
 		try sb.write(c.name);
@@ -1014,7 +1014,7 @@ test "DataSet: record simple" {
 		const event_list = try Event.parse(t.allocator, "{\"id\": 1, \"system\": \"catalog\", \"active\": true, \"record\": 0.932, \"category\": null}");
 		try ds.record(event_list);
 
-		var row = (try ds.conn.row("select \"$id\", \"$inserted\", id, system, active, record, category from dataset_test where id =  1", .{})).?;
+		var row = (try ds.conn.row("select ldk_id, ldk_ts, id, system, active, record, category from dataset_test where id =  1", .{})).?;
 		defer row.deinit();
 
 		try t.expectEqual(1, row.get(u64, 0));
@@ -1031,7 +1031,7 @@ test "DataSet: record simple" {
 		const event_list = try Event.parse(t.allocator, "{\"id\": 2, \"system\": \"other\", \"active\": false, \"record\": 4}");
 		try ds.record(event_list);
 
-		var row = (try ds.conn.row("select \"$id\", \"$inserted\", id, system, active, record, category from dataset_test where id =  2", .{})).?;
+		var row = (try ds.conn.row("select ldk_id, ldk_ts, id, system, active, record, category from dataset_test where id =  2", .{})).?;
 		defer row.deinit();
 
 		try t.expectEqual(2, row.get(u64, 0));
@@ -1048,7 +1048,7 @@ test "DataSet: record simple" {
 		const event_list = try Event.parse(t.allocator, "{\"id\": null, \"system\": null, \"active\": null, \"record\": null}");
 		try ds.record(event_list);
 
-		var row = (try ds.conn.row("select \"$id\", \"$inserted\", id, system, active, record, category from dataset_test where id is null", .{})).?;
+		var row = (try ds.conn.row("select ldk_id, ldk_ts, id, system, active, record, category from dataset_test where id is null", .{})).?;
 		defer row.deinit();
 
 		try t.expectEqual(3, row.get(u64, 0));
@@ -1069,7 +1069,7 @@ test "DataSet: record simple" {
 		const event_list = try Event.parse(t.allocator, "{\"id\": -1003843293448, \"system\": 43, \"active\": \"maybe\", \"record\": 229, \"category\": -2}");
 		try ds.record(event_list);
 
-		var row = (try ds.conn.row("select \"$id\", \"$inserted\", id, system, active, record, category from dataset_test where id = -1003843293448", .{})).?;
+		var row = (try ds.conn.row("select ldk_id, ldk_ts, id, system, active, record, category from dataset_test where id = -1003843293448", .{})).?;
 		defer row.deinit();
 
 		try t.expectEqual(4, row.get(u64, 0));
@@ -1093,7 +1093,7 @@ test "DataSet: record with list" {
 		const event_list = try Event.parse(t.allocator, "{\"id\": 1, \"tags\": [1, 9], \"history\": 9991}");
 		try ds.record(event_list);
 
-		var row = (try ds.conn.row("select \"$id\", \"$inserted\", id, tags from dataset_list_test where id =  1", .{})).?;
+		var row = (try ds.conn.row("select ldk_id, ldk_ts, id, tags from dataset_list_test where id =  1", .{})).?;
 		defer row.deinit();
 
 		try t.expectEqual(1, row.get(u64, 0));
@@ -1202,7 +1202,7 @@ test "DataSet: record add column" {
 		const event_list = try Event.parse(t.allocator, "{\"id\": 5, \"new\": true}");
 		try ds.record(event_list);
 
-		var row = (try ds.conn.row("select \"$id\", \"$inserted\", id, system, active, record, category, new from dataset_test where id =  5", .{})).?;
+		var row = (try ds.conn.row("select ldk_id, ldk_ts, id, system, active, record, category, new from dataset_test where id =  5", .{})).?;
 		defer row.deinit();
 
 		try t.expectEqual(1, row.get(u64, 0));
@@ -1237,7 +1237,7 @@ test "DataSet: record add column" {
 		);
 		try ds.record(event_list);
 
-		var row = (try ds.conn.row("select \"$id\", \"$inserted\", id, system, active, record, category, new, tag1, tag2 from dataset_test where id =  6", .{})).?;
+		var row = (try ds.conn.row("select ldk_id, ldk_ts, id, system, active, record, category, new, tag1, tag2 from dataset_test where id =  6", .{})).?;
 		defer row.deinit();
 
 		try t.expectEqual(2, row.get(u64, 0));
