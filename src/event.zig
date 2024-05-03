@@ -11,6 +11,7 @@ pub const Event = struct {
 	map: std.StringHashMapUnmanaged(Value),
 
 	pub const List = struct {
+		created: i64,
 		events: []Event,
 		arena: *std.heap.ArenaAllocator,
 
@@ -70,6 +71,7 @@ pub const Event = struct {
 	};
 
 	pub fn parse(allocator: Allocator, input: []const u8) !Event.List {
+		const created = std.time.microTimestamp();
 		const arena = try allocator.create(std.heap.ArenaAllocator);
 		errdefer allocator.destroy(arena);
 
@@ -89,6 +91,7 @@ pub const Event = struct {
 		};
 
 		return .{
+			.created = created,
 			.arena = arena,
 			.events = events,
 		};

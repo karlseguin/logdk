@@ -54,6 +54,7 @@ pub const Validate = struct {
 	pub const INVALID_FILTER_VALUE_COUNT = 5003;
 	pub const UNSUPPORTED_PARAMETER_TYPE = 5004;
 	pub const INVALID_BITSTRING = 5005;
+	pub const INVALID_RELATIVE_TIME = 5006;
 
 	pub fn identifier(value: []const u8) !void {
 		if (value.len == 0) return error.Required;

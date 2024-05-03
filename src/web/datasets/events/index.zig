@@ -34,7 +34,7 @@ pub fn init(builder: *logdk.Validate.Builder) !void {
 		builder.field("page", builder.int(u16, .{.parse = true, .min = 1, .default = 1})),
 		builder.field("limit", builder.int(u16, .{.parse = true, .min = 1, .max = 5000, .default = 100})),
 		builder.field("total", builder.boolean(.{.parse = true, .default = false})),
-		builder.field("order", builder.string(.{.min = 1, .max = logdk.MAX_IDENTIFIER_LEN, .function = validateOrder})),
+		builder.field("order", builder.string(.{.min = 1, .max = logdk.MAX_IDENTIFIER_LEN, .function = validateOrder, .default = "ldk_id"})),
 		builder.field("filters", builder.array(filter_validator, .{.parse = true})),
 	}, .{});
 }
@@ -92,6 +92,26 @@ fn validateFilter(opt_value: ?typed.Array, context: *logdk.Validate.Context) !?t
 		return null;
 	}
 
+	if (op == .rel) {
+		var valid = false;
+		switch (items[2]) {
+			.i64 => valid = true, // relative time in minutes from now, always valid
+			.string => |str| if (std.meta.stringToEnum(QueryBuilder.RelativeTime, str)) |rel_time| {
+				valid = true;
+				// later, we'll differentiate between this and the relative minutes, by the
+				// fact that this is a u16, and relative minutes is a i64. Yes, that's ugly.
+				items[2] = .{.u16 = @intFromEnum(rel_time)};
+			},
+			else => {},
+		}
+		if (valid == false) {
+			try context.add(.{
+				.code = logdk.Validate.INVALID_RELATIVE_TIME,
+				.err = "relative time must be a number (minutes since now), or one of: y, cm, lm, ytd",
+			});
+		}
+	}
+
 	// Replace the string operation value with an integer, this is cheaper to turn
 	// back tinto a QueryBuikler.Operator later.
 	items[1] = .{.i64 = @intFromEnum(op)};
@@ -105,8 +125,6 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 
 	const input = try web.validateQuery(req, input_validator, env);
 	const include_total = input.get("total").?.bool;
-	const page = input.get("page").?.u16;
-	const limit = input.get("limit").?.u16;
 
 	var builder = try QueryBuilder.init(res.arena, env);
 	defer builder.deinit();
@@ -119,16 +137,17 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 		try builder.filters(null);
 	}
 
-	if (input.get("order")) |value| {
-		const order = value.string;
-		if (order[0] == '-') {
-			try builder.order(order[1..], false);
-		} else if (order[0] == '+') {
-			try builder.order(order[1..], true);
-		} else {
-			try builder.order(order, true);
-		}
+	const order = input.get("order").?.string;
+	if (order[0] == '-') {
+		try builder.order(order[1..], false);
+	} else if (order[0] == '+') {
+		try builder.order(order[1..], true);
+	} else {
+		try builder.order(order, true);
 	}
+
+	const page = input.get("page").?.u16;
+	const limit = input.get("limit").?.u16;
 	try builder.paging(page, limit);
 
 	// we can't re-use the builder buf, because we might need it, intact, to get
@@ -378,6 +397,14 @@ const QueryBuilder = struct {
 		rel,
 	};
 
+	const RelativeTime = enum {
+		t,   // today
+		y,   // yesterday
+		cm,  //current month
+		lm,  // last month
+		ytd, // year to date
+	};
+
 	fn init(allocator: Allocator, env: *logdk.Env) !QueryBuilder {
 		const buf = try env.app.buffers.acquire();
 		errdefer buf.release();
@@ -452,6 +479,7 @@ const QueryBuilder = struct {
 			if (std.mem.eql(u8, column_name, "$ts")) {
 				column_name = "ldk_ts";
 			}
+
 			try buf.writeByte('"');
 			try buf.write(column_name);
 			try buf.writeByte('"');
@@ -482,7 +510,31 @@ const QueryBuilder = struct {
 					try buf.write(" >= ");
 					try self.writePlaceHolderFor(filter[2]);
 				},
-				.rel => unreachable, // todo
+				.rel => {
+					switch (filter[2]) {
+						.i64 => |mins| {
+							// relative minutes since now
+							try buf.write(" >= ");
+							try self.writePlaceHolderFor(.{.i64 = std.time.microTimestamp() - mins * std.time.us_per_min});
+						},
+						.u16 => |rel_time| switch (@as(RelativeTime, @enumFromInt(rel_time))) {
+							.t => try buf.write(" >= current_date::timestamp"),
+							.y => {
+								try buf.write(" >= (current_date-1)::timestamp and \"");
+								try buf.write(column_name);
+								try buf.write("\" < current_date::timestamp");
+							},
+							.cm => try buf.write(" >= date_trunc('month', current_date)::timestamp"),
+							.lm => {
+								try buf.write(" >= date_trunc('month', current_date - interval '1 month')::timestamp  and \"");
+								try buf.write(column_name);
+								try buf.write("\" < date_trunc('month', current_date)::timestamp");
+							},
+							.ytd => try buf.write(" >= date_trunc('year', current_date)::timestamp"),
+						},
+						else => unreachable,  // validation wouldn't allow this
+					}
+				}
 			}
 
 			try buf.write(" and ");
@@ -577,8 +629,8 @@ test "events.index: simple validation" {
 	try tc.expectInvalid(.{.code = logdk.Validate.TYPE_BOOL, .field = "total"});
 	try tc.expectInvalid(.{.code = logdk.Validate.INVALID_IDENTIFIER, .field = "order"});
 }
-
 test "events.index: filter validation" {
+
 	var tc = t.context(.{});
 	defer tc.deinit();
 
@@ -633,6 +685,15 @@ test "events.index: filter validation" {
 		tc.web.query("filters", "[[\"a\", \"e\", 0, 1]]");
 		try t.expectError(error.Validation, handler(tc.env(), tc.web.req, tc.web.res));
 		try tc.expectInvalid(.{.code = logdk.Validate.INVALID_FILTER_VALUE_COUNT, .field = "filters.0.2"});
+	}
+
+	{
+		// invalid relative time
+		tc.reset();
+		tc.web.param("name", "ds1");
+		tc.web.query("filters", "[[\"a\", \"rel\", \"nope\"]]");
+		try t.expectError(error.Validation, handler(tc.env(), tc.web.req, tc.web.res));
+		try tc.expectInvalid(.{.code = logdk.Validate.INVALID_RELATIVE_TIME, .field = "filters.0.2"});
 	}
 }
 
@@ -854,7 +915,7 @@ test "events.index: order" {
 	}
 }
 
-test "events.index: filter" {
+test "events.index: filter simple" {
 	var tc = t.context(.{});
 	defer tc.deinit();
 
@@ -887,5 +948,136 @@ test "events.index: filter" {
 		try t.expectEqual(2, rows[0].array.items[2].i64);
 		try t.expectEqual(3, rows[1].array.items[2].i64);
 		try t.expectEqual(5, rows[2].array.items[2].i64);
+	}
+}
+
+test "events.index: filter relative time shortcuts" {
+	var tc = t.context(.{});
+	defer tc.deinit();
+
+	// not ideal, but we'll manually insert data into the table since we want fine
+	// control over the ldk_ts values
+	try tc.createDataSet("ts_test", "[{\"v\": null}]", false);
+
+	const now = zul.DateTime.now();
+	try tc.exec(
+		\\ insert into ts_test (ldk_id, ldk_ts) values
+		\\ (1, $1), (2, $2), (3, $3), (4, now() - interval '1 month'), (5, date_trunc('year', now()) - interval '1 minute')
+	, .{
+		now.unix(.microseconds),
+		(try now.add(-1, .days)).unix(.microseconds),
+		(try now.add(-2, .days)).unix(.microseconds),
+	});
+
+	{
+		tc.web.param("name", "ts_test");
+		tc.web.query("filters", "[[\"$ts\", \"rel\", \"t\"]]");
+		try handler(tc.env(), tc.web.req, tc.web.res);
+		const res = try typed.fromJson(tc.arena, try tc.web.getJson());
+		const rows = res.map.get("rows").?.array.items;
+		try t.expectEqual(1, rows.len);
+		try t.expectEqual(1, rows[0].array.items[0].i64);
+	}
+
+	{
+		tc.reset();
+		tc.web.param("name", "ts_test");
+		tc.web.query("filters", "[[\"$ts\", \"rel\", \"y\"]]");
+		try handler(tc.env(), tc.web.req, tc.web.res);
+		const res = try typed.fromJson(tc.arena, try tc.web.getJson());
+		const rows = res.map.get("rows").?.array.items;
+		try t.expectEqual(1, rows.len);
+		try t.expectEqual(2, rows[0].array.items[0].i64);
+	}
+
+	// hard to test current month on the first or 2nd on the month, as it'll
+	// behave like a "today" or "yesterday" filter.
+	if (now.date().day > 2) {
+		tc.reset();
+		tc.web.param("name", "ts_test");
+		tc.web.query("filters", "[[\"$ts\", \"rel\", \"cm\"]]");
+		try handler(tc.env(), tc.web.req, tc.web.res);
+		const res = try typed.fromJson(tc.arena, try tc.web.getJson());
+		const rows = res.map.get("rows").?.array.items;
+		try t.expectEqual(3, rows.len);
+		try t.expectEqual(1, rows[0].array.items[0].i64);
+		try t.expectEqual(2, rows[1].array.items[0].i64);
+		try t.expectEqual(3, rows[2].array.items[0].i64);
+	}
+
+	{
+		tc.reset();
+		tc.web.param("name", "ts_test");
+		tc.web.query("filters", "[[\"$ts\", \"rel\", \"lm\"]]");
+		try handler(tc.env(), tc.web.req, tc.web.res);
+		const res = try typed.fromJson(tc.arena, try tc.web.getJson());
+		const rows = res.map.get("rows").?.array.items;
+		try t.expectEqual(1, rows.len);
+		try t.expectEqual(4, rows[0].array.items[0].i64);
+	}
+
+	{
+		tc.reset();
+		tc.web.param("name", "ts_test");
+		tc.web.query("filters", "[[\"$ts\", \"rel\", \"ytd\"]]");
+		try handler(tc.env(), tc.web.req, tc.web.res);
+		const res = try typed.fromJson(tc.arena, try tc.web.getJson());
+		const rows = res.map.get("rows").?.array.items;
+		try t.expectEqual(4, rows.len);
+		try t.expectEqual(1, rows[0].array.items[0].i64);
+		try t.expectEqual(2, rows[1].array.items[0].i64);
+		try t.expectEqual(3, rows[2].array.items[0].i64);
+		try t.expectEqual(4, rows[3].array.items[0].i64);
+	}
+}
+
+test "events.index: filter relative time minutes" {
+	var tc = t.context(.{});
+	defer tc.deinit();
+
+	// not ideal, but we'll manually insert data into the table since we want fine
+	// control over the ldk_ts values
+	try tc.createDataSet("ts_test", "[{\"v\": null}]", false);
+
+	try tc.exec(
+		\\ insert into ts_test (ldk_id, ldk_ts) values
+		\\ (1, now() at time zone 'utc' - interval '2 minute'),
+		\\ (2, now() at time zone 'utc' - interval '5 minutes'),
+		\\ (3, now() at time zone 'utc' - interval '10 minutes'),
+		\\ (4, now() at time zone 'utc' - interval '15 minutes')
+	, .{});
+
+	{
+		tc.web.param("name", "ts_test");
+		tc.web.query("filters", "[[\"$ts\", \"rel\", 1]]");
+		try handler(tc.env(), tc.web.req, tc.web.res);
+		try tc.web.expectJson(.{
+			.rows = &[_][]const u8{},
+		});
+	}
+
+	{
+		tc.reset();
+		tc.web.param("name", "ts_test");
+		tc.web.query("filters", "[[\"$ts\", \"rel\", 3]]");
+		try handler(tc.env(), tc.web.req, tc.web.res);
+		const res = try typed.fromJson(tc.arena, try tc.web.getJson());
+		const rows = res.map.get("rows").?.array.items;
+		try t.expectEqual(1, rows.len);
+		try t.expectEqual(1, rows[0].array.items[0].i64);
+	}
+
+
+	{
+		tc.reset();
+		tc.web.param("name", "ts_test");
+		tc.web.query("filters", "[[\"$ts\", \"rel\", 11]]");
+		try handler(tc.env(), tc.web.req, tc.web.res);
+		const res = try typed.fromJson(tc.arena, try tc.web.getJson());
+		const rows = res.map.get("rows").?.array.items;
+		try t.expectEqual(3, rows.len);
+		try t.expectEqual(1, rows[0].array.items[0].i64);
+		try t.expectEqual(2, rows[1].array.items[0].i64);
+		try t.expectEqual(3, rows[2].array.items[0].i64);
 	}
 }

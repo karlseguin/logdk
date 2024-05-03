@@ -165,7 +165,7 @@ pub const DataSet = struct {
 		var next_id = self.next_id;
 		defer self.next_id = next_id;
 
-		const now = std.time.microTimestamp();
+		const created = event_list.created;
 
 		var insert = &self.insert_one;
 		for (event_list.events) |event| {
@@ -173,7 +173,7 @@ pub const DataSet = struct {
 
 			try insert.clearBindings();
 			try insert.bindValue(0, next_id);
-			try insert.bindValue(1, now);
+			try insert.bindValue(1, created);
 
 			// first_pass is an attempt to bind the event values to our prepared
 			// statement as-is. This is the optimized case where we don't need to
@@ -261,7 +261,7 @@ pub const DataSet = struct {
 			insert = &self.insert_one;
 			try insert.clearBindings();
 			try insert.bindValue(0, next_id);
-			try insert.bindValue(1, now);
+			try insert.bindValue(1, created);
 
 			for (self.columns.items, 2..) |*column, param_index| {
 				const value = event.get(column.name) orelse Event.Value{.null = {}};
