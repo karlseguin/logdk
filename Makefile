@@ -12,4 +12,4 @@ ui:
 	rm -fr ui
 	cd ../ui && make d
 	cp -R ../ui/dist ui/
-	brotli -9 --keep ui/*
+	find ui -type f -not -name "*.png" -exec brotli -Z --keep {} \;

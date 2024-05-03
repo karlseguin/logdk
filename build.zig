@@ -20,20 +20,19 @@ pub fn build(b: *std.Build) !void {
 	try modules.put("typed", b.dependency("typed", dep_opts).module("typed"));
 	try modules.put("metrics", b.dependency("metrics", dep_opts).module("metrics"));
 	try modules.put("logz", b.dependency("logz", dep_opts).module("logz"));
-	// try modules.put("validate", b.dependency("validate", dep_opts).module("validate"));
+	try modules.put("validate", b.dependency("validate", dep_opts).module("validate"));
 	try modules.put("zul", b.dependency("zul", dep_opts).module("zul"));
 
 	const zuckdb = b.dependency("zuckdb", dep_opts).module("zuckdb");
 	try modules.put("zuckdb",  zuckdb);
 
-
-	try modules.put("validate", b.addModule("validate", .{
-		.root_source_file = .{.path = "lib/validate.zig/src/validate.zig"},
-		.imports = &.{
-			.{.name = "typed", .module = modules.get("typed").?},
-			// .{.name = "metrics", .module = b.addModule("metrics", .{.root_source_file = .{.path = "lib/metrics.zig/src/metrics.zig"}})},
-		},
-	}));
+	// try modules.put("validate", b.addModule("validate", .{
+	// 	.root_source_file = .{.path = "lib/validate.zig/src/validate.zig"},
+	// 	.imports = &.{
+	// 		.{.name = "typed", .module = modules.get("typed").?},
+	// 		// .{.name = "metrics", .module = b.addModule("metrics", .{.root_source_file = .{.path = "lib/metrics.zig/src/metrics.zig"}})},
+	// 	},
+	// }));
 
 	zuckdb.addIncludePath(b.path("lib"));
 

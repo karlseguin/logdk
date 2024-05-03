@@ -169,16 +169,16 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 		}
 		// strip out the last comma
 		buf.truncate(1);
+		try buf.write("],\n \"types\": [");
+
+		for (vectors) |*vector| {
+			try buf.writeByte('"');
+			try vector.writeType(writer);
+			try buf.write("\",");
+		}
+		buf.truncate(1);
 
 		if (try rows.next()) |first_row| {
-			try buf.write("],\n \"types\": [");
-
-			for (vectors) |*vector| {
-				try buf.writeByte('"');
-				try vector.writeType(writer);
-				try buf.write("\",");
-			}
-			buf.truncate(1);
 			try buf.write("],\n \"rows\": [");
 
 			try buf.write("\n  [");
