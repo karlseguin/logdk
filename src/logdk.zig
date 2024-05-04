@@ -3,6 +3,7 @@ pub const web = @import("web/web.zig");
 pub const metrics = @import("metrics.zig");
 pub const dispatcher = @import("dispatcher.zig");
 
+pub const hrm = @import("hrm.zig");
 pub const binder = @import("binder.zig");
 
 pub const App = @import("app.zig").App;
@@ -25,6 +26,7 @@ pub const codes = struct {
 	pub const VALIDATION_ERROR = 5;
 	pub const INVALID_JSON = 6;
 	pub const INVALID_SQL = 7;
+	pub const ILLEGAL_DB_WRITE = 8;
 };
 
 const logz = @import("logz");
@@ -41,6 +43,8 @@ pub const Validate = struct {
 	pub const Builder = validate.Builder(void);
 	pub const Context = validate.Context(void);
 
+	pub const REQUIRED = validate.codes.REQUIRED;
+	pub const STRING_LEN = validate.codes.STRING_LEN;
 	pub const TYPE_STRING = validate.codes.TYPE_STRING;
 	pub const STRING_CHOICE = validate.codes.STRING_CHOICE;
 	pub const INT_MIN = validate.codes.INT_MIN;

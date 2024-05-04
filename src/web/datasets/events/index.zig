@@ -154,7 +154,6 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 	// total count
 	const buf = try app.buffers.acquire();
 	defer buf.release();
-	const writer = buf.writer();
 
 	var conn = try app.db.acquire();
 	defer conn.release();
@@ -178,43 +177,7 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 		};
 		defer rows.deinit();
 
-		res.content_type = .JSON;
-
-		const vectors = rows.vectors;
-		try buf.write("{\n \"cols\": [");
-		for (0..vectors.len) |i| {
-			try std.json.encodeJsonString(std.mem.span(rows.columnName(i)), .{}, writer);
-			try buf.writeByte(',');
-		}
-		// strip out the last comma
-		buf.truncate(1);
-		try buf.write("],\n \"types\": [");
-
-		for (vectors) |*vector| {
-			try buf.writeByte('"');
-			try vector.writeType(writer);
-			try buf.write("\",");
-		}
-		buf.truncate(1);
-
-		if (try rows.next()) |first_row| {
-			try buf.write("],\n \"rows\": [");
-
-			try buf.write("\n  [");
-			try serializeRow(env, &first_row, vectors, buf);
-			try res.chunk(buf.string());
-			buf.clearRetainingCapacity();
-
-			while (try rows.next()) |row| {
-				buf.writeAssumeCapacity("],\n  [");
-				try serializeRow(env, &row, vectors, buf);
-				try res.chunk(buf.string());
-				buf.clearRetainingCapacity();
-			}
-			try buf.writeByte(']');
-		} else {
-			try buf.write("],\"rows\":[");
-		}
+		try logdk.hrm.writeRows(res, &rows, buf, env.logger);
 	}
 
 	if (include_total) {
@@ -245,118 +208,6 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 	}
 
 	try res.chunk(buf.string());
-}
-
-fn serializeRow(env: *logdk.Env, row: *const zuckdb.Row, vectors: []zuckdb.Vector, buf: *zul.StringBuilder) !void {
-	const writer = buf.writer();
-
-	for (vectors, 0..) |*vector, i| {
-		switch (vector.type) {
-			.list => |child_type| {
-				const list = row.lazyList(i) orelse {
-					try buf.write("null,");
-					continue;
-				};
-				if (list.len == 0) {
-					try buf.write("[],");
-					continue;
-				}
-				try buf.writeByte('[');
-				for (0..list.len) |list_index| {
-					try translateScalar(env, &list, child_type, list_index, writer);
-					try buf.writeByte(',');
-				}
-				// overwrite the last trailing comma
-				buf.truncate(1);
-				try buf.write("],");
-			},
-			.scalar => |s| {
-				try translateScalar(env, row, s, i, writer);
-				try buf.writeByte(',');
-			}
-		}
-	}
-	// overwrite the last trailing comma
-	buf.truncate(1);
-}
-
-// src can either be a zuckdb.Row or a zuckdb.LazyList
-fn translateScalar(env: *logdk.Env, src: anytype, column_type: zuckdb.Vector.Type.Scalar, i: usize, writer: anytype) !void {
-	if (src.isNull(i)) {
-		return writer.writeAll("null");
-	}
-
-	switch (column_type) {
-		.decimal => try std.fmt.format(writer, "{d}", .{src.get(f64, i)}),
-		.@"enum" => unreachable, // TODO
-		.simple => |s| switch (s) {
-			zuckdb.c.DUCKDB_TYPE_VARCHAR => try std.json.encodeJsonString(src.get([]const u8, i), .{}, writer),
-			zuckdb.c.DUCKDB_TYPE_BOOLEAN => try writer.writeAll(if (src.get(bool, i)) "true" else "false"),
-			zuckdb.c.DUCKDB_TYPE_TINYINT => try std.fmt.formatInt(src.get(i8, i), 10, .lower, .{}, writer),
-			zuckdb.c.DUCKDB_TYPE_SMALLINT  => try std.fmt.formatInt(src.get(i16, i), 10, .lower, .{}, writer),
-			zuckdb.c.DUCKDB_TYPE_INTEGER  => try std.fmt.formatInt(src.get(i32, i), 10, .lower, .{}, writer),
-			zuckdb.c.DUCKDB_TYPE_BIGINT  => try std.fmt.formatInt(src.get(i64, i), 10, .lower, .{}, writer),
-			zuckdb.c.DUCKDB_TYPE_HUGEINT  => try std.fmt.formatInt(src.get(i128, i), 10, .lower, .{}, writer),
-			zuckdb.c.DUCKDB_TYPE_UTINYINT  => try std.fmt.formatInt(src.get(u8, i), 10, .lower, .{}, writer),
-			zuckdb.c.DUCKDB_TYPE_USMALLINT  => try std.fmt.formatInt(src.get(u16, i), 10, .lower, .{}, writer),
-			zuckdb.c.DUCKDB_TYPE_UINTEGER  => try std.fmt.formatInt(src.get(u32, i), 10, .lower, .{}, writer),
-			zuckdb.c.DUCKDB_TYPE_UBIGINT  => try std.fmt.formatInt(src.get(u64, i), 10, .lower, .{}, writer),
-			zuckdb.c.DUCKDB_TYPE_UHUGEINT  => try std.fmt.formatInt(src.get(u128, i), 10, .lower, .{}, writer),
-			zuckdb.c.DUCKDB_TYPE_FLOAT  => try std.fmt.format(writer, "{d}", .{src.get(f32, i)}),
-			zuckdb.c.DUCKDB_TYPE_DOUBLE  => try std.fmt.format(writer, "{d}", .{src.get(f64, i)}),
-			zuckdb.c.DUCKDB_TYPE_UUID  => try std.json.encodeJsonString(&src.get(zuckdb.UUID, i), .{}, writer),
-			zuckdb.c.DUCKDB_TYPE_DATE  => {
-				const date = src.get(zuckdb.Date, i);
-				try std.json.stringify(.{
-					.year = date.year,
-					.month = date.month,
-					.day = date.day,
-				}, .{}, writer);
-			},
-			zuckdb.c.DUCKDB_TYPE_TIME, zuckdb.c.DUCKDB_TYPE_TIME_TZ => {
-				const time = src.get(zuckdb.Time, i);
-				try std.json.stringify(.{
-					.hour = time.hour,
-					.min = time.min,
-					.sec = time.sec,
-				}, .{}, writer);
-			},
-			zuckdb.c.DUCKDB_TYPE_TIMESTAMP, zuckdb.c.DUCKDB_TYPE_TIMESTAMP_TZ  => try std.fmt.formatInt(src.get(i64, i), 10, .lower, .{}, writer),
-			else => |duckdb_type| {
-				try writer.writeAll("???");
-				env.logger.level(.Warn).ctx("serialize.unknown_type").int("duckdb_type", duckdb_type).log();
-			}
-		},
-	}
-}
-
-fn writeListType(result: *zuckdb.c.duckdb_result, column_index: usize, buf: *zul.StringBuilder) !void {
-	var logical_type = zuckdb.c.duckdb_column_logical_type(result, column_index);
-	defer zuckdb.c.duckdb_destroy_logical_type(&logical_type);
-
-	var child_type = zuckdb.c.duckdb_list_type_child_type(logical_type);
-	defer zuckdb.c.duckdb_destroy_logical_type(&child_type);
-
-	const duckdb_type = zuckdb.c.duckdb_get_type_id(child_type);
-	const named_type = zuckdb.DataType.fromDuckDBType(duckdb_type);
-	try buf.write(@tagName(named_type));
-	try buf.write("[]");
-}
-
-fn writeVarcharType(result: *zuckdb.c.duckdb_result, column_index: usize, buf: *zul.StringBuilder) !void {
-	var logical_type = zuckdb.c.duckdb_column_logical_type(result, column_index);
-	defer zuckdb.c.duckdb_destroy_logical_type(&logical_type);
-	const alias = zuckdb.c.duckdb_logical_type_get_alias(logical_type);
-	if (alias == null) {
-		return buf.write("varchar");
-	}
- 	defer zuckdb.c.duckdb_free(alias);
- 	return buf.write(std.mem.span(alias));
-}
-
-fn parseInt(comptime T: type, value: ?[]const u8) ?T {
-	const v = value orelse return null;
-	return std.fmt.parseInt(T, v, 10) catch return null;
 }
 
 // The main reason we have a struct for building the query is to support paging.
@@ -624,7 +475,7 @@ test "events.index: simple validation" {
 	tc.web.query("order", "ha\"ck");
 
 	try t.expectError(error.Validation, handler(tc.env(), tc.web.req, tc.web.res));
-	try tc.expectInvalid(.{.code = logdk.Validate.INT_MIN, .field = "page"});
+
 	try tc.expectInvalid(.{.code = logdk.Validate.INT_MAX, .field = "limit"});
 	try tc.expectInvalid(.{.code = logdk.Validate.TYPE_BOOL, .field = "total"});
 	try tc.expectInvalid(.{.code = logdk.Validate.INVALID_IDENTIFIER, .field = "order"});

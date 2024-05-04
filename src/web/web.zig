@@ -11,6 +11,7 @@ const App = logdk.App;
 const Env = logdk.Env;
 
 const ui = @import("ui.zig");
+const exec = @import("exec.zig");
 const info = @import("info/_info.zig");
 const datasets = @import("datasets/_datasets.zig");
 
@@ -20,6 +21,7 @@ var request_counter: u32 = 0;
 
 pub fn init(builder: *logdk.Validate.Builder) !void {
 	try datasets.init(builder);
+	try exec.init(builder);
 }
 
 pub fn start(app: *App, config: *const logdk.Config) !void {
@@ -45,6 +47,7 @@ pub fn start(app: *App, config: *const logdk.Config) !void {
 	{
 		var routes = router.group("/api/1", .{});
 		datasets.routes(&routes);
+		routes.get("/exec", exec.handler);
 		routes.get("/describe", info.describe);
 	}
 
@@ -211,6 +214,7 @@ pub const errors = struct {
 	pub const ServerError = Error.init(500, codes.INTERNAL_SERVER_ERROR_UNCAUGHT, "internal server error");
 	pub const RouterNotFound = Error.init(404, codes.ROUTER_NOT_FOUND, "not found");
 	pub const InvalidJson = Error.init(400, codes.INVALID_JSON, "invalid JSON");
+	pub const IllegalDBWrite = Error.init(400, codes.ILLEGAL_DB_WRITE, "only read statements are allowed (e.g. select)");
 };
 
 const t = logdk.testing;

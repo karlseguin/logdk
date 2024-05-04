@@ -74,12 +74,12 @@ pub const DataSet = struct {
 			columnLookup.putAssumeCapacity(c.name, {});
 		}
 
-		const next_id = blk: {
+		const current_max_id = blk: {
 			var buf: [logdk.MAX_IDENTIFIER_LEN + 50]u8 = undefined;
 			const sql = try std.fmt.bufPrint(&buf, "select max(ldk_id) from \"{s}\"", .{name});
-			const max_id_row = try conn.row(sql, .{}) orelse break :blk 1;
+			const max_id_row = try conn.row(sql, .{}) orelse break :blk 0;
 			defer max_id_row.deinit();
-			break :blk max_id_row.get(?u64, 0) orelse 1;
+			break :blk max_id_row.get(?u64, 0) orelse 0;
 		};
 
 		var logger = (try logz.newLogger()).string("name", name).multiuse();
@@ -91,9 +91,9 @@ pub const DataSet = struct {
 			.conn = conn,
 			.arena = arena,
 			.logger = logger,
-			.next_id = next_id,
 			.insert_one = insert_one,
 			.columnLookup = columnLookup,
+			.next_id = current_max_id + 1,
 			.columns = std.ArrayList(Column).fromOwnedSlice(aa, columns),
 			.buffer = zul.StringBuilder.fromOwnedSlice(aa, try aa.alloc(u8, logdk.MAX_IDENTIFIER_LEN * 2 + 512)), // more than enough for an alter table T alter column C ...
 		};

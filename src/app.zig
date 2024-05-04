@@ -49,7 +49,7 @@ pub const App = struct {
 	// same dataset (same name) from 2 concurrent requests.
 	create_lock: std.Thread.Mutex,
 
-	// Thread-safe pool of pre-generated []u8 for whatever we need.
+	// Thread-safe pool of pre-generated & growable []u8 for whatever we need.
 	buffers: *BufferPool,
 
 	validators: ValidatorPool(void),
@@ -88,7 +88,7 @@ pub const App = struct {
 		var validator_pool = try ValidatorPool(void).init(allocator, config.validator);
 		errdefer validator_pool.deinit();
 
-		var buffers = try BufferPool.init(allocator, 32, 8_192);
+		var buffers = try BufferPool.init(allocator, 32, 32_768);
 		errdefer buffers.deinit();
 
 		var dispatcher = try d.Dispatcher(Queues).init(allocator);
