@@ -41,7 +41,7 @@ pub fn bindValues(stmt: zuckdb.Stmt, values: []typed.Value) !void {
 
 fn validateAndBindValue(allocator: Allocator, stmt: zuckdb.Stmt, value: typed.Value, index: usize, validator: *logdk.Validate.Context) !typed.Value {
 	if (std.meta.activeTag(value) == typed.Value.null) {
-		try stmt.bindValue(index, null);
+		try stmt.bindValue(null, index);
 		return value;
 	}
 
@@ -91,32 +91,32 @@ fn validateAndBindValue(allocator: Allocator, stmt: zuckdb.Stmt, value: typed.Va
 
 fn bindValue(stmt: zuckdb.Stmt, value: typed.Value, index: usize) !void {
 	switch (value) {
-		.date => |v| return stmt.bindValue(index, zuckdb.Date{
+		.date => |v| return stmt.bindValue(zuckdb.Date{
 			.year = v.year,
 			.month = @intCast(v.month),
 			.day = @intCast(v.day),
-		}),
-		.time => |v| return stmt.bindValue(index, zuckdb.Time{
+		}, index),
+		.time => |v| return stmt.bindValue(zuckdb.Time{
 			.hour = @intCast(v.hour),
 			.min = @intCast(v.min),
 			.sec = @intCast(v.sec),
 			.micros = @intCast(v.micros),
-		}),
+		}, index),
 		.map => |v| {
 			switch (stmt.dataType(index)) {
 				.interval => {
-					return stmt.bindValue(index, zuckdb.Interval{
+					return stmt.bindValue(zuckdb.Interval{
 						.months = v.get("months").?.i32,
 						.days = v.get("days").?.i32,
 						.micros = v.get("micros").?.i32,
-					});
+					}, index);
 				},
 				else => unreachable,
 			}
 		},
-		.null => return stmt.bindValue(index, null),
+		.null => return stmt.bindValue(null, index),
 		.array, .timestamp, .datetime => unreachable,
-		inline else => |v| return stmt.bindValue(index, v),
+		inline else => |v| return stmt.bindValue(v, index),
 	}
 }
 

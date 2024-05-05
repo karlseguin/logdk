@@ -172,8 +172,8 @@ pub const DataSet = struct {
 			defer next_id += 1;
 
 			try insert.clearBindings();
-			try insert.bindValue(0, next_id);
-			try insert.bindValue(1, created);
+			try insert.bindValue(next_id, 0);
+			try insert.bindValue(created, 1);
 
 			// first_pass is an attempt to bind the event values to our prepared
 			// statement as-is. This is the optimized case where we don't need to
@@ -202,11 +202,11 @@ pub const DataSet = struct {
 								try self.alter(param_index - 2, value, event, used_fields);
 								break :first_pass;
 							}
-							try insert.bindValue(param_index, null);
+							try insert.bindValue(null, param_index);
 						},
 						.list => |list| {
 							if (column.data_type == .json) {
-								try insert.bindValue(param_index, list.json);
+								try insert.bindValue(list.json, param_index);
 								continue;
 							}
 
@@ -219,7 +219,7 @@ pub const DataSet = struct {
 								try self.alter(param_index - 2, value, event, used_fields);
 								break :first_pass;
 							}
-							try insert.bindValue(param_index, list.json);
+							try insert.bindValue(list.json, param_index);
 						},
 						inline else => |scalar| {
 							const target_type = compatibleDataType(column.data_type, value);
@@ -230,9 +230,9 @@ pub const DataSet = struct {
 							if (column.is_list) {
 								// the column is a list, but we were given a single value. This is
 								// a problem given DuckDB's lack of list binding support
-								try insert.bindValue(param_index, try scalarToList(event_list.arena.allocator(), scalar));
+								try insert.bindValue(try scalarToList(event_list.arena.allocator(), scalar), param_index);
 							} else {
-								try insert.bindValue(param_index, scalar);
+								try insert.bindValue(scalar, param_index);
 							}
 						},
 					}
@@ -260,28 +260,28 @@ pub const DataSet = struct {
 
 			insert = &self.insert_one;
 			try insert.clearBindings();
-			try insert.bindValue(0, next_id);
-			try insert.bindValue(1, created);
+			try insert.bindValue(next_id, 0);
+			try insert.bindValue(created, 1);
 
 			for (self.columns.items, 2..) |*column, param_index| {
 				const value = event.get(column.name) orelse Event.Value{.null = {}};
 				switch (value) {
 					.list => |list| {
 						std.debug.assert(column.is_list or column.data_type == .json);
-						try insert.bindValue(param_index, list.json);
+						try insert.bindValue(list.json, param_index);
 					},
 					.null => {
 						std.debug.assert(column.nullable);
-						try insert.bindValue(param_index, null);
+						try insert.bindValue(null, param_index);
 					},
 					inline else => |scalar| {
 						std.debug.assert(compatibleDataType(column.data_type, value) == column.data_type);
 						if (column.is_list) {
 							// the column is a list, but we were given a single value. This is
 							// a problem given DuckDB's lack of list binding support
-							try insert.bindValue(param_index, try scalarToList(event_list.arena.allocator(), scalar));
+							try insert.bindValue(try scalarToList(event_list.arena.allocator(), scalar), param_index);
 						} else {
-							try insert.bindValue(param_index, scalar);
+							try insert.bindValue(scalar, param_index);
 						}
 					},
 				}
