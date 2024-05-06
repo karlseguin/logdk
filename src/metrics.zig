@@ -24,8 +24,8 @@ pub fn addDataSet() void {
 	metrics.add_dataset.incr();
 }
 
-pub fn alterDataSet() void {
-	metrics.alter_dataset.incr();
+pub fn alterDataSet(c: usize) void {
+	metrics.alter_dataset.incrBy(c);
 }
 
 pub fn recordError() void {

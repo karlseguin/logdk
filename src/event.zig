@@ -43,7 +43,7 @@ pub const Event = struct {
 		double,
 		bool,
 		null,
-		text,
+		string,
 		json,
 		list,
 	};
@@ -60,11 +60,11 @@ pub const Event = struct {
 		double: f64,
 		bool: bool,
 		null: void,
-		text: []const u8,
+		string: []const u8,
 		json: []const u8,
 		list: Value.List,
 
-		const List = struct {
+		pub const List = struct {
 			values: []const Value,
 			json: []const u8,
 		};
@@ -192,7 +192,7 @@ const Parser = struct {
 
 	fn parseValue(allocator: Allocator, scanner: *json.Scanner, break_on_object: bool,  break_on_list: bool, token: json.Token) Error!ParseValueResult {
 		switch (token) {
-			.string, .allocated_string => |value| return .{.value = .{.text = value}},
+			.string, .allocated_string => |value| return .{.value = .{.string = value}},
 			.null => return .{.value = .{.null = {}}},
 			.true => return .{.value = .{.bool = true}},
 			.false => return .{.value = .{.bool = false}},
@@ -363,7 +363,7 @@ test "Event: parse simple" {
 
 	try assertEvent(.{
 		.key_1 = Event.Value{.bool = true}, .another_key = Event.Value{.bool = false},
-		.key_3 = Event.Value{.null = {}}, .key_4 = Event.Value{.text = "over 9000!!"},
+		.key_3 = Event.Value{.null = {}}, .key_4 = Event.Value{.string = "over 9000!!"},
 		.a = Event.Value{.utinyint = 0}, .b = Event.Value{.utinyint = 1}, .c = Event.Value{.ubigint = 6999384751}, .d = Event.Value{.tinyint = -1}, .e = Event.Value{.integer = -867211}, // ints
 		.f1 = Event.Value{.double = 0.0}, .f2 = Event.Value{.double = -0.0}, .f3 = Event.Value{.double = 99.33929191}, .f4 = Event.Value{.double = -1.49E10}
 	}, event_list.events[0]);
@@ -415,7 +415,7 @@ test "Event: parse array past initial size" {
 
 // 	try assertEvent(.{
 // 		.@"key_2.sub_1" = Event.Value{.bool = true},
-// 		.@"key_2.sub_2" = Event.Value{.text = "hello"},
+// 		.@"key_2.sub_2" = Event.Value{.string = "hello"},
 // 		.@"key_2.sub_3.other" = Event.Value{.usmallint = 12345},
 // 		.@"key_2.sub_3.too_deep" = Event.Value{.json =  "{  \"handle \":  1, \"x\": {\"even\": \"more\", \"ok\": true}}"},
 // 	}, event);

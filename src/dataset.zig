@@ -37,8 +37,8 @@ pub const DataSet = struct {
 	// statements easy to manage.
 	conn: *zuckdb.Conn,
 
-	// Our prepared statement for inserting 1 row.
-	insert_one: zuckdb.Stmt,
+	// Used to efficiently insert rows into a table
+	appender: zuckdb.Appender,
 
 	// The columns. In an ArrayList because we might have to add columns, and
 	// that makes everything easier.
@@ -66,7 +66,7 @@ pub const DataSet = struct {
 		const name = try aa.dupe(u8, row.get([]const u8, 0));
 
 		const columns = try std.json.parseFromSliceLeaky([]Column, aa, row.get([]const u8, 1), .{});
-		const insert_one = try generateInsertOnePrepared(allocator, conn, name, columns);
+		const appender = try conn.appender(null, name);
 
 		var columnLookup = std.StringHashMapUnmanaged(void){};
 		try columnLookup.ensureTotalCapacity(aa, @intCast(columns.len));
@@ -91,7 +91,7 @@ pub const DataSet = struct {
 			.conn = conn,
 			.arena = arena,
 			.logger = logger,
-			.insert_one = insert_one,
+			.appender = appender,
 			.columnLookup = columnLookup,
 			.next_id = current_max_id + 1,
 			.columns = std.ArrayList(Column).fromOwnedSlice(aa, columns),
@@ -100,7 +100,7 @@ pub const DataSet = struct {
 	}
 
 	pub fn deinit(self: *DataSet) void {
-		self.insert_one.deinit();
+		self.appender.deinit();
 		self.conn.deinit();
 		self.logger.deinit();
 
@@ -145,157 +145,174 @@ pub const DataSet = struct {
 		}
 	}
 
-	// This is part of the hot path. It should be optimized in the future to
-	// do bulk-inserts (via a multi-values prepared statement) and possibly using
-	// duckdb's appender if the C api ever solves a number of issues (no support for
-	// defaults or complex types).
+	// This is part of the hot path.
 	// What makes this code complicated is that we might need to alter the dataset
 	// and thus the underlying table. We might need to make a column nullable, or
 	// change its type, or add a column.
 	// But, because this is the hot path and because we expect most events not
 	// to require any alterations, it's written in a way that assumes that the
 	// event can be inserted as-is. We don't loop through the event first to
-	// detect if there's a alteration. Instead, we start to bind our prepared
-	// statement, and if, in doing so, we need to alter, things get a bit messy.
-	// One issue with altering is that we need to re-prepare our insert statement
-	// so it pretty much resets everything.
+	// detect if there's a alteration. Instead, we start to bind values to our appender
+	// and if, in doing so, we need to alter, things get a bit messy.
+	// We'll flush whatever rows we've appended up until this point, alter the table
+	// and re-create the appender (which will be based on the altered table)
+	// This works because if we call appender.flush() without first calling
+	// appender.endRow(), the current row is abandoned.
 	fn record(self: *DataSet, event_list: Event.List) !void {
 		defer event_list.deinit();
 
 		var next_id = self.next_id;
 		defer self.next_id = next_id;
 
+		var alter_count: usize = 0;
 		const created = event_list.created;
 
-		var insert = &self.insert_one;
 		for (event_list.events) |event| {
 			defer next_id += 1;
-
-			try insert.clearBindings();
-			try insert.bindValue(next_id, 0);
-			try insert.bindValue(created, 1);
-
-			// first_pass is an attempt to bind the event values to our prepared
-			// statement as-is. This is the optimized case where we don't need to
-			// alter the dataset and underlying table. If we succeed, we'll return
-			// at the end of first_pass and are done.
-			// If we do detect the need for an alteration, we switch to a slow-path.
-			// Specifically, we'll apply any alternation needed, then break out of
-			// first_pass, and execute our second pass (which should be guaranteed to
-			// work since all necessary alterations should have been applied)
-			first_pass: {
-				// Used to track if we've used up all of the events fields. If we haven't
-				// then we had new columns to add.
-				var used_fields: usize = 0;
-
-				for (self.columns.items, 2..) |*column, param_index| {
-					const value = if (event.get(column.name)) |value| blk: {
-						used_fields += 1;
-						break :blk value;
-					} else blk: {
-						break :blk Event.Value{.null = {}};
-					};
-
-					switch (value) {
-						.null => {
-							if (column.nullable == false) {
-								try self.alter(param_index - 2, value, event, used_fields);
-								break :first_pass;
-							}
-							try insert.bindValue(null, param_index);
-						},
-						.list => |list| {
-							if (column.data_type == .json) {
-								try insert.bindValue(list.json, param_index);
-								continue;
-							}
-
-							if (column.is_list == false) {
-								try self.alter(param_index - 2, value, event, used_fields);
-								break :first_pass;
-							}
-							const target_type = compatibleListDataType(column.data_type, columnTypeForEventList(list.values));
-							if (target_type != column.data_type) {
-								try self.alter(param_index - 2, value, event, used_fields);
-								break :first_pass;
-							}
-							try insert.bindValue(list.json, param_index);
-						},
-						inline else => |scalar| {
-							const target_type = compatibleDataType(column.data_type, value);
-							if (target_type != column.data_type) {
-								try self.alter(param_index - 2, value, event, used_fields);
-								break :first_pass;
-							}
-							if (column.is_list) {
-								// the column is a list, but we were given a single value. This is
-								// a problem given DuckDB's lack of list binding support
-								try insert.bindValue(try scalarToList(event_list.arena.allocator(), scalar), param_index);
-							} else {
-								try insert.bindValue(scalar, param_index);
-							}
-						},
-					}
-				}
-
-				if (used_fields < event.fieldCount()) {
-					try self.alter(self.columns.items.len, null, event, used_fields);
-					break: first_pass;
-				}
-
-				// If we made it all the way here, then the event fit into our dataset
-				// as-is (without any alternation) and thus we can finish our insert)
-				const inserted = insert.exec() catch |err| {
-					logdk.dbErr("Dataset.record", err, self.conn, self.logger.level(.Error)) catch {};
-					continue;
-				};
-				std.debug.assert(inserted == 1);
-				continue;
+			const a = self.recordEvent(next_id, created, event) catch |err| blk: {
+				// self.appender.err might be null, but that's ok
+				self.logger.level(.Error).ctx("DataSet.recordEvent").err(err).string("details", self.appender.err).log();
+				break :blk false;
+			};
+			if (a) {
+				alter_count += 1;
 			}
+		}
 
-			// We can only be here because first_pass made alterations to the dataset
-			// and underlying table. This also means our insert_one prepared statement
-			// was re-generated. At this point, it should be possible to insert our
-			// event as-is, using the new prepared statement.
+		if (alter_count > 0) {
+			try self.app.meta.datasetChanged(self);
+			logdk.metrics.alterDataSet(alter_count);
+		}
+	}
 
-			insert = &self.insert_one;
-			try insert.clearBindings();
-			try insert.bindValue(next_id, 0);
-			try insert.bindValue(created, 1);
+	fn recordEvent(self: *DataSet, next_id: u64, created: i64, event: Event) !bool {
+		var appender = &self.appender;
+		appender.beginRow();
+		try appender.appendValue(next_id, 0);
+		try appender.appendValue(created, 1);
+
+		// first_pass is an attempt to bind the event values to our appender as-is.
+		// This is the optimized case where we don't need to alter the dataset and
+		// underlying table. If we succeed, we'll return at the end of first_pass and are done.
+		// If we do detect the need for an alteration, we switch to a slow-path.
+		// Specifically, we'll apply any alternation needed, then break out of
+		// first_pass, and execute our second pass (which should be guaranteed to
+		// work since all necessary alterations should have been applied)
+		first_pass: {
+			// Used to track if we've used up all of the events fields. If we haven't
+			// then we had new columns to add.
+			var used_fields: usize = 0;
 
 			for (self.columns.items, 2..) |*column, param_index| {
-				const value = event.get(column.name) orelse Event.Value{.null = {}};
+				const value = if (event.get(column.name)) |value| blk: {
+					used_fields += 1;
+					break :blk value;
+				} else blk: {
+					break :blk Event.Value{.null = {}};
+				};
+
 				switch (value) {
-					.list => |list| {
-						std.debug.assert(column.is_list or column.data_type == .json);
-						try insert.bindValue(list.json, param_index);
-					},
 					.null => {
-						std.debug.assert(column.nullable);
-						try insert.bindValue(null, param_index);
+						if (column.nullable == false) {
+							try self.alter(param_index - 2, value, event, used_fields);
+							break :first_pass;
+						}
+						try appender.appendValue(null, param_index);
+					},
+					.list => |list| {
+						if (column.data_type == .json) {
+							try appender.appendValue(list.json, param_index);
+							continue;
+						}
+
+						if (column.is_list == false) {
+							try self.alter(param_index - 2, value, event, used_fields);
+							break :first_pass;
+						}
+
+						const target_type = compatibleListDataType(column.data_type, columnTypeForEventList(list.values));
+						if (target_type != column.data_type) {
+							try self.alter(param_index - 2, value, event, used_fields);
+							break :first_pass;
+						}
+
+						try appendList(target_type, appender, list, param_index);
 					},
 					inline else => |scalar| {
-						std.debug.assert(compatibleDataType(column.data_type, value) == column.data_type);
+						const target_type = compatibleDataType(column.data_type, value);
+						if (target_type != column.data_type) {
+							try self.alter(param_index - 2, value, event, used_fields);
+							break :first_pass;
+						}
 						if (column.is_list) {
 							// the column is a list, but we were given a single value. This is
-							// a problem given DuckDB's lack of list binding support
-							try insert.bindValue(try scalarToList(event_list.arena.allocator(), scalar), param_index);
+							// a problem given DuckDB's lack of list binding support.
+							// At this point, list.json should not be needed (fingers crossed);
+							const list = Event.Value.List{.values = &.{value}, .json = "[]"};
+							try appendList(target_type, appender, list, param_index);
 						} else {
-							try insert.bindValue(scalar, param_index);
+							try appender.appendValue(scalar, param_index);
 						}
 					},
 				}
 			}
 
-			const inserted = try insert.exec();
-			std.debug.assert(inserted == 1);
-			logdk.metrics.alterDataSet();
+			if (used_fields < event.fieldCount()) {
+				try self.alter(self.columns.items.len, null, event, used_fields);
+				break: first_pass;
+			}
+
+			// If we made it all the way here, then the event fit into our dataset
+			// as-is (without any alternation) and thus we can finish our insert)
+			try appender.endRow();
+			try appender.flush(); // TODO: batch!
+			return false;
 		}
 
-		try self.app.meta.datasetChanged(self);
+		// We can only be here because first_pass made alterations to the dataset
+		// and underlying table. This also means that self.appender is new.
+		// At this point, it should be possible to insert our event as-is,
+		// since our new appender exists based on the updated schema.
+
+		appender = &self.appender;
+		appender.beginRow();
+		try appender.appendValue(next_id, 0);
+		try appender.appendValue(created, 1);
+
+		for (self.columns.items, 2..) |*column, param_index| {
+			const value = event.get(column.name) orelse Event.Value{.null = {}};
+			switch (value) {
+				.list => |list| try appendList(column.data_type, appender, list, param_index),
+				.null => {
+					std.debug.assert(column.nullable);
+					try appender.appendValue(null, param_index);
+				},
+				inline else => |scalar| {
+					std.debug.assert(compatibleDataType(column.data_type, value) == column.data_type);
+					if (column.is_list) {
+						// the column is a list, but we were given a single value. This is
+						// a problem given DuckDB's lack of list binding support.
+						// At this point, list.json should not be needed (fingers crossed);
+						const list = Event.Value.List{.values = &.{value}, .json = "[]"};
+						try appendList(column.data_type, appender, list, param_index);
+					} else {
+						try appender.appendValue(scalar, param_index);
+					}
+				},
+			}
+		}
+
+		try appender.endRow();
+		try appender.flush(); // TODO batches
+		return true;
 	}
 
 	fn alter(self: *DataSet, start_index: usize, value_: ?Event.Value, event: Event, used_fields_: usize) !void {
+		// todo for batches
+		// Flush any pending rows we have, this is safe to do even if we've bound values
+		// for thie existing event since it'll flush only data up until the last endRow;
+		// try self.appender.flush();
+
 		_ = try self.exec("begin", .{});
 		errdefer _ = self.exec("rollback", .{}) catch {};
 
@@ -303,7 +320,7 @@ pub const DataSet = struct {
 
 		var columns_added = false;
 		errdefer if (columns_added) {
-			// We need to revere potential changes we made to our columns and columnsLookup
+			// We need to reverse potential changes we made to our columns and columnsLookup
 			self.columns.shrinkRetainingCapacity(original_column_count);
 			self.columnLookup.clearRetainingCapacity();
 			for (self.columns.items) |*c| {
@@ -382,8 +399,7 @@ pub const DataSet = struct {
 			}
 		}
 
-		// This is bad. This is our app.allocator GPA, but what an awful way to get it
-		const allocator = self.arena.child_allocator;
+		const allocator = self.app.allocator;
 		const serialized_columns = try std.json.stringifyAlloc(allocator, self.columns.items, .{});
 		defer allocator.free(serialized_columns);
 
@@ -392,10 +408,10 @@ pub const DataSet = struct {
 
 		_ = try self.exec("commit", .{});
 
-		const insert_one = try generateInsertOnePrepared(allocator, self.conn, self.name, self.columns.items);
+		const appender = try self.conn.appender(null, self.name);
 		// safe to delete our existing one now
-		self.insert_one.deinit();
-		self.insert_one = insert_one;
+		self.appender.deinit();
+		self.appender = appender;
 	}
 
 	fn alterColumn(self: *DataSet, column: *Column, value: Event.Value) !void {
@@ -406,7 +422,11 @@ pub const DataSet = struct {
 			},
 			.list => |list| {
 				const target_type = compatibleListDataType(column.data_type, columnTypeForEventList(list.values));
-				if (column.is_list == false) {
+				if (target_type == .json and column.data_type != .json) {
+					_ = try self.execFmt("alter table \"{s}\" alter column \"{s}\" set type json", .{self.name, column.name}, .{});
+					column.is_list = false;
+					column.data_type = .json;
+				} else if (column.is_list == false) {
 					_ = try self.execFmt("alter table \"{s}\" alter column \"{s}\" set type {s}[] using array[\"{s}\"]", .{self.name, column.name, @tagName(target_type), column.name}, .{});
 					column.is_list = true;
 					column.data_type = target_type;
@@ -461,7 +481,7 @@ const Column = struct {
 		try writer.writeAll("\" ");
 
 		switch (self.data_type) {
-			.unknown => try writer.writeAll("text"),
+			.unknown => try writer.writeAll("varchar"),
 			else => try writer.writeAll(@tagName(self.data_type)),
 		}
 
@@ -510,7 +530,7 @@ pub const DataType = enum {
 	ubigint,
 	double,
 	bool,
-	text,
+	varchar,
 	json,
 	unknown,
 };
@@ -527,25 +547,33 @@ fn columnTypeFromEventScalar(event_type: Event.DataType) DataType {
 		.ubigint => .ubigint,
 		.double => .double,
 		.bool => .bool,
-		.text => .text,
+		.string => .varchar,
 		.json => .json,
 		.null => .unknown,
 		.list => unreachable,
 	};
 }
 
+// Only very obvious expansions (like smallint[] -> bigint[]) are done. Otherwise,
+// when list types mismatch, say a column that's a varchar[], but an event that
+// has a tinyint[], we convert the column to JSON.
 fn columnTypeForEventList(list: []const Event.Value) DataType {
-	if (list.len == 0) return .text;
+	if (list.len == 0) return .varchar;
 	const first = list[0];
 	var candidate = columnTypeFromEventScalar(std.meta.activeTag(first));
 	for (list[1..]) |value| {
 		const maybe = compatibleDataType(candidate, value);
-		candidate = if ((maybe == .text and candidate != .text) or (maybe == .text and std.meta.activeTag(value) != .text)) .json else maybe;
+		if ((maybe == .varchar and candidate != .varchar) or (maybe == .varchar and std.meta.activeTag(value) != .string)) {
+			// A JSON column never converts to anything else. So once we have that as
+			// a candiadte, we don't need to look any further.
+			return .json;
+		}
+		candidate = maybe;
 	}
 	return candidate;
 }
 
-// This code can lead to unecesasrily widening a column. If a column is `tinyint`
+// This code can lead to unnecessarily widening a column. If a column is `tinyint`
 // and our value is `.{.utinyint = 10}`, then we know the column can stay `tinyint`.
 // However, if the inverse happens, and or column is utinyint and the value is
 // `.{.tinyint = -32}`, we have no way to know whether we can safely use a `tinyint`.
@@ -559,7 +587,7 @@ fn compatibleDataType(column_type: DataType, value: Event.Value) DataType {
 			.null, .bool => return .bool,
 			.json => return .json,
 			.list => unreachable,
-			else => return .text,
+			else => return .varchar,
 		},
 		.tinyint => switch (value) {
 			.null, .tinyint => return .tinyint,
@@ -570,8 +598,8 @@ fn compatibleDataType(column_type: DataType, value: Event.Value) DataType {
 			.utinyint => |v| return if (v <= 127) .tinyint else .smallint,
 			.usmallint => |v| return if (v <= 32767) .smallint else .integer,
 			.uinteger => |v| return if (v <= 2147483647) .integer else .bigint,
-			.ubigint => |v| return if (v <= 9223372036854775807) .bigint else .text,
-			.text, .bool => return .text,
+			.ubigint => |v| return if (v <= 9223372036854775807) .bigint else .varchar,
+			.string, .bool => return .varchar,
 			.json => return .json,
 			.list => unreachable,
 		},
@@ -584,7 +612,7 @@ fn compatibleDataType(column_type: DataType, value: Event.Value) DataType {
 			.tinyint, .smallint => return .smallint,
 			.integer => return .integer,
 			.bigint => return .bigint,
-			.text, .bool => return .text,
+			.string, .bool => return .varchar,
 			.json => return .json,
 			.list => unreachable,
 		},
@@ -595,8 +623,8 @@ fn compatibleDataType(column_type: DataType, value: Event.Value) DataType {
 			.double => return .double,
 			.usmallint => |v| return if (v <= 32767) .smallint else .integer,
 			.uinteger => |v| return if (v <= 2147483647) .integer else .bigint,
-			.ubigint => |v| return if (v <= 9223372036854775807) .bigint else .text,
-			.text, .bool => return .text,
+			.ubigint => |v| return if (v <= 9223372036854775807) .bigint else .varchar,
+			.string, .bool => return .varchar,
 			.json => return .json,
 			.list => unreachable,
 		},
@@ -607,7 +635,7 @@ fn compatibleDataType(column_type: DataType, value: Event.Value) DataType {
 			.double => return .double,
 			.tinyint, .smallint, .integer => return .integer,
 			.bigint => return .bigint,
-			.text, .bool => return .text,
+			.string, .bool => return .varchar,
 			.json => return .json,
 			.list => unreachable,
 		},
@@ -616,8 +644,8 @@ fn compatibleDataType(column_type: DataType, value: Event.Value) DataType {
 			.bigint => return .bigint,
 			.double => return .double,
 			.uinteger => |v| return if (v <= 2147483647) .integer else .bigint,
-			.ubigint => |v| return if (v <= 9223372036854775807) .bigint else .text,
-			.text, .bool => return .text,
+			.ubigint => |v| return if (v <= 9223372036854775807) .bigint else .varchar,
+			.string, .bool => return .varchar,
 			.json => return .json,
 			.list => unreachable,
 		},
@@ -626,15 +654,15 @@ fn compatibleDataType(column_type: DataType, value: Event.Value) DataType {
 			.ubigint => return .ubigint,
 			.double => return .double,
 			.tinyint, .smallint, .integer, .bigint => return .bigint,
-			.text, .bool => return .text,
+			.string, .bool => return .varchar,
 			.json => return .json,
 			.list => unreachable,
 		},
 		.bigint => switch (value) {
 			.null, .utinyint, .tinyint, .smallint, .usmallint, .integer, .uinteger, .bigint => return .bigint,
 			.double => return .double,
-			.ubigint => |v| return if (v <= 9223372036854775807) .bigint else .text,
-			.text, .bool => return .text,
+			.ubigint => |v| return if (v <= 9223372036854775807) .bigint else .varchar,
+			.string, .bool => return .varchar,
 			.json => return .json,
 			.list => unreachable,
 		},
@@ -642,20 +670,20 @@ fn compatibleDataType(column_type: DataType, value: Event.Value) DataType {
 			.null, .utinyint, .usmallint, .uinteger, .ubigint => return .ubigint,
 			.double => return .double,
 			.tinyint, .smallint, .integer, .bigint => return .bigint,
-			.text, .bool => return .text,
+			.string, .bool => return .varchar,
 			.json => return .json,
 			.list => unreachable,
 		},
 		.double => switch (value) {
 			.null, .tinyint, .utinyint, .smallint, .usmallint, .integer, .uinteger, .bigint, .ubigint, .double => return .double,
-			.text, .bool => return .text,
+			.string, .bool => return .varchar,
 			.json => return .json,
 			.list => unreachable,
 		},
-		.text => switch (value) {
-			.null => return .text,
+		.varchar => switch (value) {
+			.null => return .varchar,
 			.json => return .json,
-			else => return .text,
+			else => return .varchar,
 		},
 		.json => return .json,
 		.unknown => switch (value) {
@@ -669,7 +697,7 @@ fn compatibleDataType(column_type: DataType, value: Event.Value) DataType {
 			.bigint => return .bigint,
 			.ubigint => return .ubigint,
 			.double => return .double,
-			.text => return .text,
+			.string => return .varchar,
 			.bool => return .bool,
 			.json => return .json,
 			.list => unreachable,
@@ -692,8 +720,8 @@ fn compatibleListDataType(column_type: DataType, list_type: DataType) DataType {
 			.utinyint => return .smallint,
 			.usmallint => return .integer,
 			.uinteger => return .bigint,
-			.ubigint => return .text,
-			.text, .bool, .json => return .json,
+			.ubigint => return .varchar,
+			.varchar, .bool, .json => return .json,
 		},
 		.utinyint => switch (list_type) {
 			.utinyint, .unknown => return .utinyint,
@@ -704,7 +732,7 @@ fn compatibleListDataType(column_type: DataType, list_type: DataType) DataType {
 			.tinyint, .smallint => return .smallint,
 			.integer => return .integer,
 			.bigint => return .bigint,
-			.text, .bool, .json => return .json,
+			.varchar, .bool, .json => return .json,
 		},
 		.smallint => switch (list_type) {
 			.utinyint, .tinyint, .smallint, .unknown => return .smallint,
@@ -713,8 +741,8 @@ fn compatibleListDataType(column_type: DataType, list_type: DataType) DataType {
 			.double => return .double,
 			.usmallint => return .integer,
 			.uinteger => return .bigint,
-			.ubigint => return .text,
-			.text, .bool, .json => return .json,
+			.ubigint => return .varchar,
+			.varchar, .bool, .json => return .json,
 		},
 		.usmallint => switch (list_type) {
 			.utinyint, .usmallint, .unknown => return .usmallint,
@@ -723,95 +751,192 @@ fn compatibleListDataType(column_type: DataType, list_type: DataType) DataType {
 			.double => return .double,
 			.tinyint, .smallint, .integer => return .integer,
 			.bigint => return .bigint,
-			.text, .bool, .json => return .json,
+			.varchar, .bool, .json => return .json,
 		},
 		.integer => switch (list_type) {
 			.utinyint, .tinyint, .smallint, .usmallint, .integer, .unknown => return .integer,
 			.bigint => return .bigint,
 			.double => return .double,
 			.uinteger => return .bigint,
-			.ubigint => return .text,
-			.text, .bool, .json => return .json,
+			.ubigint => return .varchar,
+			.varchar, .bool, .json => return .json,
 		},
 		.uinteger => switch (list_type) {
 			.utinyint, .usmallint, .uinteger, .unknown => return .uinteger,
 			.ubigint => return .ubigint,
 			.double => return .double,
 			.tinyint, .smallint, .integer, .bigint => return .bigint,
-			.text, .json, .bool => return .json,
+			.varchar, .json, .bool => return .json,
 		},
 		.bigint => switch (list_type) {
 			.utinyint, .tinyint, .smallint, .usmallint, .integer, .uinteger, .bigint, .unknown => return .bigint,
 			.double => return .double,
-			.ubigint => return .text,
-			.text, .json, .bool => return .json,
+			.ubigint => return .varchar,
+			.varchar, .json, .bool => return .json,
 		},
 		.ubigint => switch (list_type) {
 			.utinyint, .usmallint, .uinteger, .ubigint, .unknown => return .ubigint,
 			.double => return .double,
 			.tinyint, .smallint, .integer, .bigint => return .bigint,
-			.text, .json, .bool => return .json,
+			.varchar, .json, .bool => return .json,
 		},
 		.double => switch (list_type) {
 			.tinyint, .utinyint, .smallint, .usmallint, .integer, .uinteger, .bigint, .ubigint, .double, .unknown => return .double,
-			.text, .bool, .json => return .json,
+			.varchar, .bool, .json => return .json,
 		},
-		.text => switch (list_type) {
-			.text => return .text,
+		.varchar => switch (list_type) {
+			.varchar => return .varchar,
 			else => return .json,
 		},
 		.json => return .json,
 		.unknown => return list_type,
 	}}
 
-fn generateInsertOnePrepared(allocator: Allocator, conn: *zuckdb.Conn, name: []const u8, columns: []Column) !zuckdb.Stmt {
-	var sb = zul.StringBuilder.init(allocator);
-	defer sb.deinit();
+// Appending a list is, sadly, complicated. The issue is that the DuckDB driver
+// reasonably expect a proper list, say an []i32 or a []?bool. But what we
+// have is an []Event.Value, i.e. a slice of custom union values.
+//
+// We _could_ change Event.Value.List to itself be a union of concrete types. So
+// instead of a slice of unions ([]Event.Value), it could be a union of slices
+// (e.g. Event.Value.List.i32 would be an []i32). But this wouldn't work in all
+// cases since the DuckDB driver expect an _exact_ match. If we try to bind an
+// []u16 into an integer[], it'll fail. And we very well might be trying to do that.
+//
+// The simplest approach is to take our []Event.Value and, using the target_type,
+// create an appropriate []T. We're aided by the fact that, for any great mismatch,
+// the column type is json and we can insert the raw list json as-is. So, for example,
+// we know that we won't have to covert an Event list of integers, bools or floats to
+// strings. We also know that, by the type appendList has been called, our values
+// are compatible with target_type. So if our target_type is `bigint`, we know that
+// ever value in our list can be converted to an ?i64.
+//
+// It's worth nothing that we could do this allocation-free. We could iterate our
+// []Event.Value and append them directly into the underlying DuckDB vectors.
 
-	try sb.write("insert into ");
-	try sb.write(name);
-	try sb.write(" (ldk_id, ldk_ts, ");
-	for (columns) |c| {
-		try sb.writeByte('"');
-		try sb.write(c.name);
-		try sb.write("\", ");
+fn appendList(target_type: DataType, appender: *zuckdb.Appender, list: Event.Value.List, param_index: usize) !void {
+	if (target_type == .json) {
+		// Our event thankfully stores the raw array json. For a json column
+		// we can just insert this as-is.
+		return appender.appendValue(list.json, param_index);
 	}
-	// strip out the trailing comma + space
-	sb.truncate(2);
 
-	try sb.write(")\nvalues ($1, $2, ");
-	const writer = sb.writer();
-	for (columns, 3..) |c, i| {
-		if (c.is_list) {
-			// This is a [temp??] hack. There's no great way to insert lists in
-			// DuckDB's C API (seriously), but if we pass it a JSON string and tell it
-			// it's json, it'll convert it for us
-			try std.fmt.format(writer, "${d}::json, ", .{i});
-		} else {
-			try std.fmt.format(writer, "${d}, ", .{i});
-		}
+	switch (target_type) {
+		.tinyint => return appender.appendListMap(Event.Value, i8, param_index, list.values, listItemMapTinyInt),
+		.smallint => return appender.appendListMap(Event.Value, i16, param_index, list.values, listItemMapSmallInt),
+		.integer => return appender.appendListMap(Event.Value, i32, param_index, list.values, listItemMapInteger),
+		.bigint => return appender.appendListMap(Event.Value, i64, param_index, list.values, listItemMapBigInt),
+		.utinyint => return appender.appendListMap(Event.Value, u8, param_index, list.values, listItemMapUTinyInt),
+		.usmallint => return appender.appendListMap(Event.Value, u16, param_index, list.values, listItemMapUSmallInt),
+		.uinteger => return appender.appendListMap(Event.Value, u32, param_index, list.values, listItemMapUInteger),
+		.ubigint => return appender.appendListMap(Event.Value, u64, param_index, list.values, listItemMapUBigInt),
+		.double => return appender.appendListMap(Event.Value, f64, param_index, list.values, listItemMapDouble),
+		.bool => return appender.appendListMap(Event.Value, bool, param_index, list.values, listItemMapBool),
+		.varchar => return appender.appendListMap(Event.Value, []const u8, param_index, list.values, listItemMapText),
+		.json, .unknown => unreachable,
 	}
-	// strip out the trailing comma + space
-	sb.truncate(2);
-	try sb.writeByte(')');
+}
 
-	return conn.prepare(sb.string(), .{.auto_release = false}) catch |err| {
-		return logdk.dbErr("dataSetFromRow", err, conn, logz.err().string("sql", sb.string()));
-	};
+// For all of these, the unsigned to signed cast, such as
+//   .utinyint => |v| return @intCast(v)
+// ought to be safe, because if we're asking for an i8, then we've already validated
+// that the value fits.
+fn listItemMapTinyInt(value: Event.Value) ?i8 {
+	switch (value) {
+		.null => return null,
+		.tinyint => |v| return v,
+		.utinyint => |v| return @intCast(v),
+		else => unreachable,
+	}
+}
+
+fn listItemMapSmallInt(value: Event.Value) ?i16 {
+	switch (value) {
+		.null => return null,
+		.tinyint, .utinyint, .smallint => |v| return v,
+		.usmallint => |v| return @intCast(v),
+		else => unreachable,
+	}
+}
+
+fn listItemMapInteger(value: Event.Value) ?i32 {
+	switch (value) {
+		.null => return null,
+		.tinyint, .utinyint, .smallint, .usmallint, .integer  => |v| return v,
+		.uinteger => |v| return @intCast(v),
+		else => unreachable,
+	}
+}
+
+fn listItemMapBigInt(value: Event.Value) ?i64 {
+	switch (value) {
+		.null => return null,
+		.tinyint, .utinyint, .smallint, .usmallint, .integer, .uinteger, .bigint  => |v| return v,
+		.ubigint => |v| return @intCast(v),
+		else => unreachable,
+	}
+}
+
+fn listItemMapUTinyInt(value: Event.Value) ?u8 {
+	switch (value) {
+		.null => return null,
+		.utinyint => |v| return v,
+		else => unreachable,
+	}
+}
+
+fn listItemMapUSmallInt(value: Event.Value) ?u16 {
+	switch (value) {
+		.null => return null,
+		.utinyint, .usmallint => |v| return v,
+		else => unreachable,
+	}
+}
+
+fn listItemMapUInteger(value: Event.Value) ?u32 {
+	switch (value) {
+		.null => return null,
+		.utinyint, .usmallint, .uinteger  => |v| return v,
+		else => unreachable,
+	}
+}
+
+fn listItemMapUBigInt(value: Event.Value) ?u64 {
+	switch (value) {
+		.null => return null,
+		.utinyint, .usmallint, .uinteger, .ubigint  => |v| return v,
+		else => unreachable,
+	}
+}
+
+fn listItemMapDouble(value: Event.Value) ?f64 {
+	switch (value) {
+		.null => return null,
+		.double => |v| return v,
+		.tinyint, .smallint, .integer, .bigint,
+		.utinyint, .usmallint, .uinteger => |v| return @floatFromInt(v),
+		.ubigint => |v| return @floatFromInt(v),
+		else => unreachable,
+	}
+}
+
+fn listItemMapBool(value: Event.Value) ?bool {
+	switch (value) {
+		.null => return null,
+		.bool => |v| return v,
+		else => unreachable,
+	}
+}
+
+fn listItemMapText(value: Event.Value) ?[]const u8 {
+	switch (value) {
+		.null => return null,
+		.string => |v| return v,
+		else => unreachable,
+	}
 }
 
 fn sortColumns(_: void, a: Column, b: Column) bool {
 	return std.ascii.lessThanIgnoreCase(a.name, b.name);
-}
-
-// The column is a list, but we only have a single value. Because DuckDB doesn't
-// have binding support for lists, dealing with lists is already weird, and is
-// weirder in this case. We "bind" a list by binding the JSON string and relying
-// on DuckDB's auto conversion.
-fn scalarToList(allocator: Allocator, value: anytype) ![]const u8 {
-	const T = @TypeOf(value);
-	const arr = [1]T{value};
-	return std.json.stringifyAlloc(allocator, &arr, .{});
 }
 
 const t = logdk.testing;
@@ -828,21 +953,21 @@ test "Column: writeDDL" {
 
 	{
 		buf.clearRetainingCapacity();
-		const c = Column{.name = "names", .nullable = true, .is_list = true, .data_type = .text};
+		const c = Column{.name = "names", .nullable = true, .is_list = true, .data_type = .varchar};
 		try c.writeDDL(buf.writer());
-		try t.expectEqual("\"names\" text[] null", buf.string());
+		try t.expectEqual("\"names\" varchar[] null", buf.string());
 	}
 
 	{
 		buf.clearRetainingCapacity();
 		const c = Column{.name = "details", .nullable = false, .is_list = false, .data_type = .unknown};
 		try c.writeDDL(buf.writer());
-		try t.expectEqual("\"details\" text not null", buf.string());
+		try t.expectEqual("\"details\" varchar not null", buf.string());
 	}
 }
 
 test "columnTypeForEventList" {
-	try t.expectEqual(.text, columnTypeForEventList(&.{}));
+	try t.expectEqual(.varchar, columnTypeForEventList(&.{}));
 	{
 		// tinyint
 		try t.expectEqual(.tinyint, testColumnTypeEventList("-1, -20, -128"));
@@ -960,8 +1085,8 @@ test "columnTypeForEventList" {
 	}
 
 	{
-		// text
-		try t.expectEqual(.text, testColumnTypeEventList("\"a\", \"abc\", \"213\""));
+		// varchar
+		try t.expectEqual(.varchar, testColumnTypeEventList("\"a\", \"abc\", \"213\""));
 		try t.expectEqual(.json, testColumnTypeEventList("\"a\", 0"));
 		try t.expectEqual(.json, testColumnTypeEventList("\"a\", 123.4, true"));
 	}
@@ -1001,7 +1126,7 @@ test "DataSet: columnsFromEvent" {
 	try t.expectEqual(.{.name = "id", .is_list = false, .nullable = false, .data_type = .uinteger}, columns[1]);
 	try t.expectEqual(.{.name = "l1", .is_list = true, .nullable = false, .data_type = .integer}, columns[2]);
 	try t.expectEqual(.{.name = "l2", .is_list = false, .nullable = false, .data_type = .json}, columns[3]);
-	try t.expectEqual(.{.name = "name", .is_list = false, .nullable = false, .data_type = .text}, columns[4]);
+	try t.expectEqual(.{.name = "name", .is_list = false, .nullable = false, .data_type = .varchar}, columns[4]);
 }
 
 test "DataSet: record simple" {
@@ -1107,35 +1232,63 @@ test "DataSet: record with list" {
 	}
 
 	{
-		// alter list type
-		const event_list = try Event.parse(t.allocator, "{\"id\": 2, \"tags\": [\"hello\"]}");
+		//expand int type (utinyint => integer)
+		const event_list = try Event.parse(t.allocator, "{\"id\": 2, \"tags\": [-99384823, 200000, 0]}");
 		try ds.record(event_list);
 
 		{
 			var row = (try ds.conn.row("select tags from dataset_list_test where id =  2", .{})).?;
 			defer row.deinit();
-			const list = row.list([]const u8, 0).?;
-			try t.expectEqual(1, list.len);
-			try t.expectEqual("\"hello\"", list.get(0));
+
+			const list = row.list(i32, 0).?;
+			try t.expectEqual(3, list.len);
+			try t.expectEqual(-99384823, list.get(0));
+			try t.expectEqual(200000, list.get(1));
+			try t.expectEqual(0, list.get(2));
 		}
 
 		{
-			// check the original row too
+			// check previous row
 			var row = (try ds.conn.row("select tags from dataset_list_test where id =  1", .{})).?;
 			defer row.deinit();
-			const list = row.list([]const u8, 0).?;
+
+			const list = row.list(i32, 0).?;
 			try t.expectEqual(2, list.len);
-			try t.expectEqual("1", list.get(0));
-			try t.expectEqual("9", list.get(1));
+			try t.expectEqual(1, list.get(0));
+			try t.expectEqual(9, list.get(1));
+		}
+	}
+
+	{
+		// alter list type to json
+		const event_list = try Event.parse(t.allocator, "{\"id\": 3, \"tags\": [\"hello\"]}");
+		try ds.record(event_list);
+
+		{
+			var row = (try ds.conn.row("select tags from dataset_list_test where id =  3", .{})).?;
+			defer row.deinit();
+			try t.expectEqual("[\"hello\"]", row.get([]u8, 0));
+		}
+
+		{
+			var row = (try ds.conn.row("select tags from dataset_list_test where id = 2", .{})).?;
+			defer row.deinit();
+			try t.expectEqual("[-99384823,200000,0]", row.get([]u8, 0));
+		}
+
+		{
+			var row = (try ds.conn.row("select tags from dataset_list_test where id = 1", .{})).?;
+			defer row.deinit();
+			try t.expectEqual("[1,9]", row.get([]u8, 0));
 		}
 	}
 
 	{
 		// add a new list
-		const event_list = try Event.parse(t.allocator, "{\"id\": 3, \"state\": [true, false]}");
+		const event_list = try Event.parse(t.allocator, "{\"id\": 4, \"state\": [true, false]}");
 		try ds.record(event_list);
 
-		var row = (try ds.conn.row("select state from dataset_list_test where id =  3", .{})).?;
+		var row = (try ds.conn.row("select state from dataset_list_test where id = 4", .{})).?;
 		defer row.deinit();
 		const list = row.list(bool, 0).?;
 		try t.expectEqual(2, list.len);
@@ -1145,11 +1298,11 @@ test "DataSet: record with list" {
 
 	{
 		// convert scalar to list
-		const event_list = try Event.parse(t.allocator, "{\"id\": 4, \"history\": [1.1, 0.9]}");
+		const event_list = try Event.parse(t.allocator, "{\"id\": 5, \"history\": [1.1, 0.9]}");
 		try ds.record(event_list);
 
 		{
-			var row = (try ds.conn.row("select history from dataset_list_test where id =  4", .{})).?;
+			var row = (try ds.conn.row("select history from dataset_list_test where id = 5", .{})).?;
 			defer row.deinit();
 			const list = row.list(f64, 0).?;
 			try t.expectEqual(2, list.len);
@@ -1159,7 +1312,7 @@ test "DataSet: record with list" {
 
 		{
 			// check the original row too
-			var row = (try ds.conn.row("select history from dataset_list_test where id =  1", .{})).?;
+			var row = (try ds.conn.row("select history from dataset_list_test where id = 1", .{})).?;
 			defer row.deinit();
 			const list = row.list(f64, 0).?;
 			try t.expectEqual(1, list.len);
@@ -1168,26 +1321,66 @@ test "DataSet: record with list" {
 	}
 
 	{
-		// insert scalar in list
-		const event_list = try Event.parse(t.allocator, "{\"id\": 5, \"tags\": \"ouch\"}");
+		// insert scalar in json (which came from list)
+		const event_list = try Event.parse(t.allocator, "{\"id\": 6, \"tags\": \"ouch\"}");
 		try ds.record(event_list);
 
 		{
-			var row = (try ds.conn.row("select tags from dataset_list_test where id =  5", .{})).?;
+			var row = (try ds.conn.row("select tags from dataset_list_test where id = 6", .{})).?;
 			defer row.deinit();
-			const list = row.list([]const u8, 0).?;
-			try t.expectEqual(1, list.len);
-			try t.expectEqual("\"ouch\"", list.get(0));
+			try t.expectEqual("ouch", row.get([]u8, 0));
 		}
 
 		{
-			// check the original row too
-			var row = (try ds.conn.row("select tags from dataset_list_test where id =  1", .{})).?;
+			var row = (try ds.conn.row("select tags from dataset_list_test where id = 1", .{})).?;
 			defer row.deinit();
-			const list = row.list([]const u8, 0).?;
+			try t.expectEqual("[1,9]", row.get([]u8, 0));
+		}
+	}
+
+	{
+		// insert scalar in list
+		const event_list = try Event.parse(t.allocator, "{\"id\": 8, \"history\": 9.998}");
+		try ds.record(event_list);
+
+		{
+			var row = (try ds.conn.row("select history from dataset_list_test where id = 8", .{})).?;
+			defer row.deinit();
+			const list = row.list(f64, 0).?;
+			try t.expectEqual(1, list.len);
+			try t.expectEqual(9.998, list.get(0));
+		}
+
+		{
+			var row = (try ds.conn.row("select history from dataset_list_test where id = 5", .{})).?;
+			defer row.deinit();
+			const list = row.list(f64, 0).?;
 			try t.expectEqual(2, list.len);
-			try t.expectEqual("1", list.get(0));
-			try t.expectEqual("9", list.get(1));
+			try t.expectEqual(1.1, list.get(0));
+			try t.expectEqual(0.9, list.get(1));
+		}
+	}
+
+	{
+		// insert narrower in list
+		const event_list = try Event.parse(t.allocator, "{\"id\": 9, \"history\": -331}");
+		try ds.record(event_list);
+
+		{
+			var row = (try ds.conn.row("select history from dataset_list_test where id = 9", .{})).?;
+			defer row.deinit();
+			const list = row.list(f64, 0).?;
+			try t.expectEqual(1, list.len);
+			try t.expectEqual(-331, list.get(0));
+		}
+
+		{
+			var row = (try ds.conn.row("select history from dataset_list_test where id = 5", .{})).?;
+			defer row.deinit();
+			const list = row.list(f64, 0).?;
+			try t.expectEqual(2, list.len);
+			try t.expectEqual(1.1, list.get(0));
+			try t.expectEqual(0.9, list.get(1));
 		}
 	}
 }
@@ -1222,6 +1415,7 @@ test "DataSet: record add column" {
 	}
 
 	{
+		tc.silenceLogs();
 		// no other difference, except for 2 new columns
 		const event_list = try Event.parse(t.allocator, \\ {
 		\\    "id": 6,
@@ -1254,7 +1448,7 @@ test "DataSet: record add column" {
 		try t.expectEqual("tag1", ds.columns.items[6].name);
 		try t.expectEqual(true, ds.columns.items[6].nullable);
 		try t.expectEqual(false, ds.columns.items[6].is_list);
-		try t.expectEqual(.text, ds.columns.items[6].data_type);
+		try t.expectEqual(.varchar, ds.columns.items[6].data_type);
 		try t.expectEqual(true, ds.columnLookup.contains("tag1"));
 
 		try t.expectEqual("tag2", ds.columns.items[7].name);

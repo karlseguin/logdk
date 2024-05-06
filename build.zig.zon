@@ -4,8 +4,8 @@
 	.version = "0.0.0",
 	.dependencies = .{
 		.httpz = .{
-			.url = "https://github.com/karlseguin/http.zig/archive/d05b9889382d240c826c7654a999e4da515bd20a.tar.gz",
-			.hash = "1220833d40f1767fa46b0efc4ae1af9bd5880a8e6fe7a66ee0215be916263f149e40"
+			.url = "https://github.com/karlseguin/http.zig/archive/a769bfd4d094465635b8fafd412e460154bb961e.tar.gz",
+			.hash = "1220ea8f59f44270d6b67aa89d9e0f0d028fd982543afb0750b1a6738f437e7c4a8b"
 		},
 		.logz = .{
 			.url = "https://github.com/karlseguin/log.zig/archive/2f17be4b6bbd32884df562a8d0501c15ec3bb928.tar.gz",
@@ -24,8 +24,8 @@
 			.hash = "12206ccc6e5ae35c3a261ed4b1ac675a68d8cf44d043de6dbb811f76b4ece21a343a"
 		},
 		.zuckdb = .{
-			.url = "https://github.com/karlseguin/zuckdb.zig/archive/d50d84a40de238f6300db39de297f47e2b732858.tar.gz",
-			.hash = "122032c066ad6b752fa2ac98747546b18d09d569813f003ad33d03523d512e235fdc"
+			.url = "https://github.com/karlseguin/zuckdb.zig/archive/31ba96529e0f3376dc9c1f6a0eb8751a21a7b65d.tar.gz",
+			.hash = "1220ab0367400e01989aa08fba6b7a1f939325c7bc267dd6b72599140695f697caf5"
 		},
 		.zul = .{
 			.url = "https://github.com/karlseguin/zul/archive/88b3a669a7de538c16e260d430316c91db829db1.tar.gz",

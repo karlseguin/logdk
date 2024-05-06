@@ -281,8 +281,8 @@ test "App: loadDataSets" {
 
 	const columns = \\ [
 		\\{"name": "id", "nullable": false, "is_list": false, "data_type": "integer"},
-		\\{"name": "tags", "nullable": false, "is_list": true, "data_type": "text"},
-		\\{"name": "type", "nullable": false, "is_list": false, "data_type": "text"},
+		\\{"name": "tags", "nullable": false, "is_list": true, "data_type": "varchar"},
+		\\{"name": "type", "nullable": false, "is_list": false, "data_type": "varchar"},
 		\\{"name": "value", "nullable": true, "is_list": false, "data_type": "double"}
 	\\]
 	;
@@ -296,8 +296,8 @@ test "App: loadDataSets" {
 	try t.expectEqual("system", ds.name);
 	try t.expectEqual(4, ds.columns.items.len);
 	try t.expectEqual(.{.name = "id", .nullable = false, .is_list = false, .data_type = .integer}, ds.columns.items[0]);
-	try t.expectEqual(.{.name = "tags", .nullable = false, .is_list = true, .data_type = .text}, ds.columns.items[1]);
-	try t.expectEqual(.{.name = "type", .nullable = false, .is_list = false, .data_type = .text}, ds.columns.items[2]);
+	try t.expectEqual(.{.name = "tags", .nullable = false, .is_list = true, .data_type = .varchar}, ds.columns.items[1]);
+	try t.expectEqual(.{.name = "type", .nullable = false, .is_list = false, .data_type = .varchar}, ds.columns.items[2]);
 	try t.expectEqual(.{.name = "value", .nullable = true, .is_list = false, .data_type = .double}, ds.columns.items[3]);
 }
 
@@ -320,7 +320,7 @@ test "App: createDataSet success" {
 		try t.expectEqual(4, ds.columns.items.len);
 
 		try t.expectEqual(.{.name = "flags", .nullable = false, .is_list = true, .data_type = .integer}, ds.columns.items[0]);
-		try t.expectEqual(.{.name = "id", .nullable = false, .is_list = false, .data_type = .text}, ds.columns.items[1]);
+		try t.expectEqual(.{.name = "id", .nullable = false, .is_list = false, .data_type = .varchar}, ds.columns.items[1]);
 		try t.expectEqual(.{.name = "monitor", .nullable = false, .is_list = false, .data_type = .bool}, ds.columns.items[2]);
 		try t.expectEqual(.{.name = "tags", .nullable = true, .is_list = false, .data_type = .unknown}, ds.columns.items[3]);
 	}

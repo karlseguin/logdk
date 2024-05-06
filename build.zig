@@ -22,15 +22,26 @@ pub fn build(b: *std.Build) !void {
 	try modules.put("logz", b.dependency("logz", dep_opts).module("logz"));
 	try modules.put("validate", b.dependency("validate", dep_opts).module("validate"));
 	try modules.put("zul", b.dependency("zul", dep_opts).module("zul"));
-
 	const zuckdb = b.dependency("zuckdb", dep_opts).module("zuckdb");
 	try modules.put("zuckdb",  zuckdb);
 
+	// try modules.put("zuckdb", b.addModule("zuckdb", .{
+	// 	.root_source_file = b.path("lib/zuckdb.zig/src/zuckdb.zig"),
+	// }));
+	// const zuckdb = modules.get("zuckdb").?;
+
 	// try modules.put("validate", b.addModule("validate", .{
-	// 	.root_source_file = .{.path = "lib/validate.zig/src/validate.zig"},
+	// 	.root_source_file = b.path("lib/validate.zig/src/validate.zig"),
 	// 	.imports = &.{
 	// 		.{.name = "typed", .module = modules.get("typed").?},
 	// 		// .{.name = "metrics", .module = b.addModule("metrics", .{.root_source_file = .{.path = "lib/metrics.zig/src/metrics.zig"}})},
+	// 	},
+	// }));
+	// try modules.put("httpz", b.addModule("httpz", .{
+	// 	.root_source_file = b.path("lib/http.zig/src/httpz.zig"),
+	// 	.imports = &.{
+	// 		.{.name = "metrics", .module = modules.get("metrics").?},
+	// 		.{.name = "websocket", .module = b.addModule("websocket", .{.root_source_file = .{.path = "lib/websocket.zig/src/websocket.zig"}})},
 	// 	},
 	// }));
 

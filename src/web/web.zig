@@ -27,15 +27,8 @@ pub fn init(builder: *logdk.Validate.Builder) !void {
 pub fn start(app: *App, config: *const logdk.Config) !void {
 	const allocator = app.allocator;
 
-	// The dispatcher's job is to execute the action, it's essentially how we inject
-	// app-specific data into actions.
-	const dispatcher = &Dispatcher{
-		.app = app,
-		.log_request = config.log_http,
-	};
-
 	const http_config = config.http;
-	var server = try httpz.ServerCtx(*const Dispatcher, *Env).init(allocator, http_config, dispatcher);
+	var server = try httpz.ServerCtx(*const Dispatcher, *Env).init(allocator, http_config, undefined);
 	defer server.deinit();
 
 	server.dispatcher(Dispatcher.dispatch);
@@ -46,26 +39,42 @@ pub fn start(app: *App, config: *const logdk.Config) !void {
 
 	{
 		var routes = router.group("/api/1", .{});
-		datasets.routes(&routes);
-		routes.get("/exec", exec.handler);
-		routes.get("/describe", info.describe);
+		routes.getC("/datasets/:name/events", datasets.events_index.handler, .{.ctx = &Dispatcher.init(app, "events_list", config)});
+		routes.postC("/datasets/:name/events", datasets.events_create.handler, .{.ctx = &Dispatcher.init(app, "events_create", config)});
+		routes.getC("/exec", exec.handler, .{.ctx = &Dispatcher.init(app, "exec_sql", config)});
+		routes.getC("/describe", info.describe, .{.ctx = &Dispatcher.init(app, "describe", config)});
 	}
 
 	router.getC("/metrics", info.metrics, .{.dispatcher = server.dispatchUndefined()});
 	router.getC("/*", ui.handler, .{.dispatcher = server.dispatchUndefined()});
-	logz.info().ctx("http.listen").fmt("address", "http://{s}:{d}", .{server.config.address.?, server.config.port.?}).boolean("log_http", config.log_http).log();
+	logz.info().ctx("http.listen").fmt("address", "http://{s}:{d}", .{server.config.address.?, server.config.port.?}).stringSafe("log_http", @tagName(config.log_http)).log();
+
 	// blocks
 	try server.listen();
 }
 
 const Dispatcher = struct {
 	app: *App,
+	route: []const u8,
 	log_request: bool = false,
+
+	fn init(app: *App, route: []const u8, config: *const logdk.Config) Dispatcher {
+		return .{
+			.app = app,
+			.route = route,
+			.log_request = switch (config.log_http) {
+				.all => true,
+				.none => false,
+				.smart => std.mem.eql(u8, route, "event_create") == false,
+			}
+		};
+	}
 
 	pub fn dispatch(self: *const Dispatcher, action: httpz.Action(*Env), req: *httpz.Request, res: *httpz.Response) !void {
 		const start_time = std.time.milliTimestamp();
 
 		res.content_type = .JSON;
+		res.header("route", self.route);
 
 		const request_id = @atomicRmw(u32, &request_counter, .Add, 1, .monotonic);
 		// every log message generated with env.logger will include this $rid
@@ -115,6 +124,7 @@ const Dispatcher = struct {
 			logger.
 				stringSafe("@l", "REQ").
 				stringSafe("method", @tagName(req.method)).
+				stringSafe("route", self.route).
 				string("path", req.url.path).
 				int("status", res.status).
 				int("code", code).

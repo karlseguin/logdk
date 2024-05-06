@@ -14,9 +14,15 @@ pub const Config = struct {
 		.address = "127.0.0.1",
 	},
 
-	log_http: bool = true,
+	log_http: LogHTTP = .smart,
 	logger: logz.Config = .{},
 	validator: validate.Config = .{},
+
+	pub const LogHTTP = enum {
+		none,
+		all,
+		smart,
+	};
 
 	const DB = struct {
 		path: []const u8,
