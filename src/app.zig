@@ -19,13 +19,13 @@ const BufferPool = @import("zul").StringBuilder.Pool;
 pub const Queues = struct {
 	// order sadly matters, we want to shutdown the dataset workers before the
 	// meta workers, since dataset workers send messages to meta workers. Ouch.
-	dataset: []d.Queue(DataSet),
-	meta: []d.Queue(Meta),
+	dataset: d.Queues(DataSet),
+	meta: d.Queues(Meta),
 
 	pub fn init(allocator: Allocator) !Queues {
 		return .{
-			.meta = try d.createQueue(allocator, Meta, 1),
-			.dataset = try d.createQueue(allocator, DataSet, 4),
+			.meta = try d.createQueues(allocator, Meta, 1),
+			.dataset = try d.createQueues(allocator, DataSet, 4),
 		};
 	}
 };

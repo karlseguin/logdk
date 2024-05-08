@@ -13,6 +13,7 @@ const logdk = @import("logdk.zig");
 // that is needed in more than one place, we put it here.
 
 pub fn writeRows(res: *httpz.Response, rows: *zuckdb.Rows, buf: *zul.StringBuilder, logger: logz.Logger) !void {
+	res.content_type = .JSON;
 	const writer = buf.writer();
 	const vectors = rows.vectors;
 	try buf.write("{\n \"cols\": [");

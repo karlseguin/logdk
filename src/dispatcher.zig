@@ -5,7 +5,7 @@ const Thread = std.Thread;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 
-pub fn createQueue(allocator: Allocator, comptime T: type, worker_count: usize) ![]Queue(T) {
+pub fn createQueues(allocator: Allocator, comptime T: type, worker_count: usize) !Queues(T) {
 	// we expect this to be the ArenaAllocator created in dispatcher.init and passed
 	// back here
 	const queues = try allocator.alloc(Queue(T), worker_count);
@@ -15,7 +15,7 @@ pub fn createQueue(allocator: Allocator, comptime T: type, worker_count: usize) 
 		q.* = try Queue(T).init(allocator, 100);
 	}
 
-	return queues;
+	return .{.list = queues};
 }
 
 pub fn Dispatcher(comptime Q: type) type {
@@ -46,7 +46,7 @@ pub fn Dispatcher(comptime Q: type) type {
 		fn startWorkers(allocator: Allocator, queues: Q) ![]Thread {
 			var queue_count: usize = 0;
 			inline for (@typeInfo(Q).Struct.fields) |field| {
-				queue_count += @field(queues, field.name).len;
+				queue_count += @field(queues, field.name).list.len;
 			}
 
 			var started: usize = 0;
@@ -54,7 +54,7 @@ pub fn Dispatcher(comptime Q: type) type {
 			errdefer blk: {
 				var j: usize = 0;
 				inline for (@typeInfo(Q).Struct.fields) |field| {
-					for (@field(queues, field.name)) |*tq| {
+					for (@field(queues, field.name).list) |*tq| {
 						tq.enqueue(.{.stop = {}});
 						threads[j].join();
 						j += 1;
@@ -64,7 +64,7 @@ pub fn Dispatcher(comptime Q: type) type {
 			}
 
 			inline for (@typeInfo(Q).Struct.fields) |field| {
-				for (@field(queues, field.name)) |*tq| {
+				for (@field(queues, field.name).list) |*tq| {
 					threads[started] = try Thread.spawn(.{}, @TypeOf(tq.*).run, .{tq});
 					started += 1;
 				}
@@ -88,7 +88,7 @@ pub fn Dispatcher(comptime Q: type) type {
 
 			var i: usize = 0;
 			inline for (@typeInfo(Q).Struct.fields) |field| {
-				for (@field(self.queues, field.name)) |*tq| {
+				for (@field(self.queues, field.name).list) |*tq| {
 					tq.enqueue(.{.stop = {}});
 					self.threads[i].join();
 					i += 1;
@@ -115,11 +115,13 @@ pub fn Dispatcher(comptime Q: type) type {
 			const actor = try allocator.create(Actor(T));
 			errdefer allocator.destroy(actor);
 
-			const queues = @field(self.queues, typeToFieldName(T));
+			const queues = &@field(self.queues, typeToFieldName(T));
+			const actor_count = @atomicRmw(usize, &queues.actor_count, .Add, 1, .monotonic);
+			const queue_index = @mod(actor_count, queues.list.len);
 
 			actor.* = .{
 				.value = undefined,
-				.queue = &queues[0],
+				.queue = &queues.list[queue_index],
 			};
 			return actor;
 		}
@@ -133,6 +135,13 @@ pub fn Dispatcher(comptime Q: type) type {
 			const actor: *Actor(T) = @ptrFromInt(actor_id);
 			actor.queue.enqueue(.{.dispatch = .{.message = message, .recipient = &actor.value}});
 		}
+	};
+}
+
+pub fn Queues(comptime T: type) type {
+	return struct {
+		list: []Queue(T),
+		actor_count: usize = 0,
 	};
 }
 

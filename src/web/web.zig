@@ -47,7 +47,11 @@ pub fn start(app: *App, config: *const logdk.Config) !void {
 
 	router.getC("/metrics", info.metrics, .{.dispatcher = server.dispatchUndefined()});
 	router.getC("/*", ui.handler, .{.dispatcher = server.dispatchUndefined()});
-	logz.info().ctx("http.listen").fmt("address", "http://{s}:{d}", .{server.config.address.?, server.config.port.?}).stringSafe("log_http", @tagName(config.log_http)).log();
+	logz.info().ctx("http.listen")
+		.fmt("address", "http://{s}:{d}", .{server.config.address.?, server.config.port.?})
+		.stringSafe("log_http", @tagName(config.log_http))
+		.boolean("blocking", httpz.blockingMode())
+		.log();
 
 	// blocks
 	try server.listen();
@@ -65,7 +69,7 @@ const Dispatcher = struct {
 			.log_request = switch (config.log_http) {
 				.all => true,
 				.none => false,
-				.smart => std.mem.eql(u8, route, "event_create") == false,
+				.smart => std.mem.eql(u8, route, "events_create") == false,
 			}
 		};
 	}
@@ -73,7 +77,6 @@ const Dispatcher = struct {
 	pub fn dispatch(self: *const Dispatcher, action: httpz.Action(*Env), req: *httpz.Request, res: *httpz.Response) !void {
 		const start_time = std.time.milliTimestamp();
 
-		res.content_type = .JSON;
 		res.header("route", self.route);
 
 		const request_id = @atomicRmw(u32, &request_counter, .Add, 1, .monotonic);
@@ -276,6 +279,7 @@ fn testDispatcher(tc: *t.Context) Dispatcher {
 	return .{
 		.app = tc.app,
 		.log_request = false,
+		.route = "test-disaptcher",
 	};
 }
 
