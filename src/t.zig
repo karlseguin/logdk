@@ -99,8 +99,14 @@ pub const Context = struct {
 
 	pub fn flushMessages(self: *Context) void {
 		// brute force, since we can't process any more messages after this
-		// but should be good enough for most cases.
-		self.app.dispatcher.stop();
+		// but should be good enough for most cases. We need to flush every dataset
+		// to make sure any pending appends are written.
+		const app = self.app;
+		var it = app._datasets.valueIterator();
+		while (it.next()) |ref_ptr| {
+			app.dispatcher.send(logdk.DataSet, ref_ptr.*, .{.flush = {}});
+		}
+		app.dispatcher.stop();
 	}
 
 	pub fn env(self: *Context) *Env {
@@ -168,6 +174,7 @@ pub const Context = struct {
 		if (insert_event) {
 			const dataset = self.app.dispatcher.unsafeInstance(logdk.DataSet, actor_id);
 			try dataset.handle(.{.record = event_list});
+			try dataset.handle(.{.flush = {} });
 		} else {
 			event_list.deinit();
 		}
@@ -175,9 +182,10 @@ pub const Context = struct {
 
 	pub fn recordEvent(self: *Context, dataset_name: []const u8, event_json: []const u8) !void {
 		const event = try logdk.Event.parse(allocator, event_json);
-		const actor_id = self.app.getDataSet(dataset_name).?;
+		const actor_id = self.app.getDataSetRef(dataset_name).?;
 		const dataset = self.app.dispatcher.unsafeInstance(logdk.DataSet, actor_id);
 		try dataset.handle(.{.record = event});
+		try dataset.handle(.{.flush = {} });
 	}
 
 	// pub fn event(self: *const Context, s: anytype) typed.Map {

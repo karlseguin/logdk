@@ -32,10 +32,10 @@ pub const DataSet = struct {
 	name: []const u8,
 
 	// The DataSet is a pseudo Actor. Its main methods always run on the same
-	// threads. This makes _everything_ so much easier. It also means all the
-	// datasets running on 1 thread can share a connection. This makes prepared
-	// statements easy to manage.
-	conn: *zuckdb.Conn,
+	// threads. Rather than interacting with the DB pool, we just create a
+	// connection for this dataset to use exclusively. This menas we can have
+	// a long-living appender, which simplifies our hot path (inserting new events)
+	conn: zuckdb.Conn,
 
 	// Used to efficiently insert rows into a table
 	appender: zuckdb.Appender,
@@ -48,6 +48,8 @@ pub const DataSet = struct {
 	// in the columns array.
 	columnLookup: std.StringHashMapUnmanaged(void),
 
+	unflushed: usize,
+
 	// row could be either a *zuckdb.Row or a *zuckdb.OwningRow
 	pub fn init(app: *App, row: anytype) !DataSet {
 		const allocator = app.allocator;
@@ -59,14 +61,13 @@ pub const DataSet = struct {
 
 		const aa = arena.allocator();
 
-		const conn = try aa.create(zuckdb.Conn);
-		conn.* = try app.db.newConn();
+		// const conn = try aa.create(zuckdb.Conn);
+		var conn = try app.db.newConn();
 		errdefer conn.deinit();
 
 		const name = try aa.dupe(u8, row.get([]const u8, 0));
 
 		const columns = try std.json.parseFromSliceLeaky([]Column, aa, row.get([]const u8, 1), .{});
-		const appender = try conn.appender(null, name);
 
 		var columnLookup = std.StringHashMapUnmanaged(void){};
 		try columnLookup.ensureTotalCapacity(aa, @intCast(columns.len));
@@ -85,11 +86,14 @@ pub const DataSet = struct {
 		var logger = (try logz.newLogger()).string("name", name).multiuse();
 		errdefer logger.deinit();
 
+		const appender = try conn.appender(null, name);
+
 		return .{
 			.app = app,
 			.name = name,
 			.conn = conn,
 			.arena = arena,
+			.unflushed = 0,
 			.logger = logger,
 			.appender = appender,
 			.columnLookup = columnLookup,
@@ -133,15 +137,14 @@ pub const DataSet = struct {
 	}
 
 	pub const Message = union(enum) {
+		flush: void,
 		record: Event.List,
 	};
 
 	pub fn handle(self: *DataSet, message: Message) !void {
 		switch (message) {
-			.record => |event_list| return self.record(event_list) catch |err| {
-				logdk.metrics.recordError();
-				return err;
-			},
+			.record => |event_list| return self.record(event_list),
+			.flush => self.flushAppender() catch {}, // already logged
 		}
 	}
 
@@ -158,20 +161,25 @@ pub const DataSet = struct {
 	// and re-create the appender (which will be based on the altered table)
 	// This works because if we call appender.flush() without first calling
 	// appender.endRow(), the current row is abandoned.
-	fn record(self: *DataSet, event_list: Event.List) !void {
+	fn record(self: *DataSet, event_list: Event.List) void {
 		defer event_list.deinit();
 
 		var next_id = self.next_id;
 		defer self.next_id = next_id;
 
 		var alter_count: usize = 0;
+		var error_count: usize = 0;
 		const created = event_list.created;
 
 		for (event_list.events) |event| {
 			defer next_id += 1;
 			const a = self.recordEvent(next_id, created, event) catch |err| blk: {
-				// self.appender.err might be null, but that's ok
-				self.logger.level(.Error).ctx("DataSet.recordEvent").err(err).string("details", self.appender.err).log();
+				if (error_count == 0) {
+					// Just log 1 of these per batch
+					// self.appender.err might be null, but that's ok
+					self.logger.level(.Error).ctx("DataSet.recordEvent").err(err).string("details", self.appender.err).log();
+				}
+				error_count += 1;
 				break :blk false;
 			};
 			if (a) {
@@ -179,8 +187,22 @@ pub const DataSet = struct {
 			}
 		}
 
+		const unflushed = self.unflushed + event_list.events.len;
+		if (unflushed >= 1000) {
+			// this will reset self.unflushed to 0
+			self.flushAppender() catch {}; // already logged, not much point in failing now
+		} else {
+			self.unflushed = unflushed;
+		}
+
+		if (error_count > 0) {
+			logdk.metrics.recordError(error_count);
+		}
+
 		if (alter_count > 0) {
-			try self.app.meta.datasetChanged(self);
+			self.app.meta.datasetChanged(self) catch |err| {
+				self.logger.level(.Error).ctx("Meta.datasetChanged").err(err).log();
+			};
 			logdk.metrics.alterDataSet(alter_count);
 		}
 	}
@@ -265,7 +287,6 @@ pub const DataSet = struct {
 			// If we made it all the way here, then the event fit into our dataset
 			// as-is (without any alternation) and thus we can finish our insert)
 			try appender.endRow();
-			try appender.flush(); // TODO: batch!
 			return false;
 		}
 
@@ -303,15 +324,13 @@ pub const DataSet = struct {
 		}
 
 		try appender.endRow();
-		try appender.flush(); // TODO batches
 		return true;
 	}
 
 	fn alter(self: *DataSet, start_index: usize, value_: ?Event.Value, event: Event, used_fields_: usize) !void {
-		// todo for batches
 		// Flush any pending rows we have, this is safe to do even if we've bound values
 		// for thie existing event since it'll flush only data up until the last endRow;
-		// try self.appender.flush();
+		try self.flushAppender();
 
 		_ = try self.exec("begin", .{});
 		errdefer _ = self.exec("rollback", .{}) catch {};
@@ -447,9 +466,17 @@ pub const DataSet = struct {
 		}
 	}
 
+	fn flushAppender(self: *DataSet) !void {
+		self.appender.flush() catch |err| {
+			self.logger.level(.Error).ctx("DataSet.flushAppender").err(err).string("details", self.appender.err).log();
+			return err;
+		};
+		self.unflushed = 0;
+	}
+
 	fn exec(self: *DataSet, sql: []const u8, args: anytype) !usize {
 		return self.conn.exec(sql, args) catch |err| {
-			return logdk.dbErr("DataSet.exec", err, self.conn, self.logger.level(.Error).string("sql", sql));
+			return logdk.dbErr("DataSet.exec", err, &self.conn, self.logger.level(.Error).string("sql", sql));
 		};
 	}
 
@@ -1137,7 +1164,8 @@ test "DataSet: record simple" {
 
 	{
 		const event_list = try Event.parse(t.allocator, "{\"id\": 1, \"system\": \"catalog\", \"active\": true, \"record\": 0.932, \"category\": null}");
-		try ds.record(event_list);
+		ds.record(event_list);
+		try ds.flushAppender();
 
 		var row = (try ds.conn.row("select ldk_id, ldk_ts, id, system, active, record, category from dataset_test where id =  1", .{})).?;
 		defer row.deinit();
@@ -1154,7 +1182,8 @@ test "DataSet: record simple" {
 	{
 		// infer null from missing event field
 		const event_list = try Event.parse(t.allocator, "{\"id\": 2, \"system\": \"other\", \"active\": false, \"record\": 4}");
-		try ds.record(event_list);
+		ds.record(event_list);
+		try ds.flushAppender();
 
 		var row = (try ds.conn.row("select ldk_id, ldk_ts, id, system, active, record, category from dataset_test where id =  2", .{})).?;
 		defer row.deinit();
@@ -1171,7 +1200,8 @@ test "DataSet: record simple" {
 	{
 		// makes a column nullable
 		const event_list = try Event.parse(t.allocator, "{\"id\": null, \"system\": null, \"active\": null, \"record\": null}");
-		try ds.record(event_list);
+		ds.record(event_list);
+		try ds.flushAppender();
 
 		var row = (try ds.conn.row("select ldk_id, ldk_ts, id, system, active, record, category from dataset_test where id is null", .{})).?;
 		defer row.deinit();
@@ -1192,7 +1222,8 @@ test "DataSet: record simple" {
 	{
 		// alter type
 		const event_list = try Event.parse(t.allocator, "{\"id\": -1003843293448, \"system\": 43, \"active\": \"maybe\", \"record\": 229, \"category\": -2}");
-		try ds.record(event_list);
+		ds.record(event_list);
+		try ds.flushAppender();
 
 		var row = (try ds.conn.row("select ldk_id, ldk_ts, id, system, active, record, category from dataset_test where id = -1003843293448", .{})).?;
 		defer row.deinit();
@@ -1216,7 +1247,8 @@ test "DataSet: record with list" {
 	{
 		// history is added for another part of this test later
 		const event_list = try Event.parse(t.allocator, "{\"id\": 1, \"tags\": [1, 9], \"history\": 9991}");
-		try ds.record(event_list);
+		ds.record(event_list);
+		try ds.flushAppender();
 
 		var row = (try ds.conn.row("select ldk_id, ldk_ts, id, tags from dataset_list_test where id =  1", .{})).?;
 		defer row.deinit();
@@ -1234,7 +1266,8 @@ test "DataSet: record with list" {
 	{
 		//expand int type (utinyint => integer)
 		const event_list = try Event.parse(t.allocator, "{\"id\": 2, \"tags\": [-99384823, 200000, 0]}");
-		try ds.record(event_list);
+		ds.record(event_list);
+		try ds.flushAppender();
 
 		{
 			var row = (try ds.conn.row("select tags from dataset_list_test where id =  2", .{})).?;
@@ -1262,7 +1295,8 @@ test "DataSet: record with list" {
 	{
 		// alter list type to json
 		const event_list = try Event.parse(t.allocator, "{\"id\": 3, \"tags\": [\"hello\"]}");
-		try ds.record(event_list);
+		ds.record(event_list);
+		try ds.flushAppender();
 
 		{
 			var row = (try ds.conn.row("select tags from dataset_list_test where id =  3", .{})).?;
@@ -1286,7 +1320,8 @@ test "DataSet: record with list" {
 	{
 		// add a new list
 		const event_list = try Event.parse(t.allocator, "{\"id\": 4, \"state\": [true, false]}");
-		try ds.record(event_list);
+		ds.record(event_list);
+		try ds.flushAppender();
 
 		var row = (try ds.conn.row("select state from dataset_list_test where id = 4", .{})).?;
 		defer row.deinit();
@@ -1299,7 +1334,8 @@ test "DataSet: record with list" {
 	{
 		// convert scalar to list
 		const event_list = try Event.parse(t.allocator, "{\"id\": 5, \"history\": [1.1, 0.9]}");
-		try ds.record(event_list);
+		ds.record(event_list);
+		try ds.flushAppender();
 
 		{
 			var row = (try ds.conn.row("select history from dataset_list_test where id = 5", .{})).?;
@@ -1323,7 +1359,8 @@ test "DataSet: record with list" {
 	{
 		// insert scalar in json (which came from list)
 		const event_list = try Event.parse(t.allocator, "{\"id\": 6, \"tags\": \"ouch\"}");
-		try ds.record(event_list);
+		ds.record(event_list);
+		try ds.flushAppender();
 
 		{
 			var row = (try ds.conn.row("select tags from dataset_list_test where id = 6", .{})).?;
@@ -1341,7 +1378,8 @@ test "DataSet: record with list" {
 	{
 		// insert scalar in list
 		const event_list = try Event.parse(t.allocator, "{\"id\": 8, \"history\": 9.998}");
-		try ds.record(event_list);
+		ds.record(event_list);
+		try ds.flushAppender();
 
 		{
 			var row = (try ds.conn.row("select history from dataset_list_test where id = 8", .{})).?;
@@ -1364,7 +1402,8 @@ test "DataSet: record with list" {
 	{
 		// insert narrower in list
 		const event_list = try Event.parse(t.allocator, "{\"id\": 9, \"history\": -331}");
-		try ds.record(event_list);
+		ds.record(event_list);
+		try ds.flushAppender();
 
 		{
 			var row = (try ds.conn.row("select history from dataset_list_test where id = 9", .{})).?;
@@ -1393,7 +1432,8 @@ test "DataSet: record add column" {
 
 	{
 		const event_list = try Event.parse(t.allocator, "{\"id\": 5, \"new\": true}");
-		try ds.record(event_list);
+		ds.record(event_list);
+		try ds.flushAppender();
 
 		var row = (try ds.conn.row("select ldk_id, ldk_ts, id, system, active, record, category, new from dataset_test where id =  5", .{})).?;
 		defer row.deinit();
@@ -1429,7 +1469,8 @@ test "DataSet: record add column" {
 		\\    "\"invalid\"": "will not get added"
 		\\ }
 		);
-		try ds.record(event_list);
+		ds.record(event_list);
+		try ds.flushAppender();
 
 		var row = (try ds.conn.row("select ldk_id, ldk_ts, id, system, active, record, category, new, tag1, tag2 from dataset_test where id =  6", .{})).?;
 		defer row.deinit();

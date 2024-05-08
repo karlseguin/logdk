@@ -205,7 +205,7 @@ pub fn Queue(comptime T: type) type {
 			self.enqueue(.{.dispatch = .{.recipient = recipient, .message = message}});
 		}
 
-		// This can be called by multiple threads, the "producers"
+		// This can be called from multiple threads, the "producers"
 		fn enqueue(self: *Self, message: Message) void {
 			self.sem.wait();
 			self.mutex.lock();
@@ -217,7 +217,7 @@ pub fn Queue(comptime T: type) type {
 			self.cond.signal();
 		}
 
-		// This is only ever called by a single thread (the same thread each time)
+		// This is only ever called from a single thread (the same thread each time)
 		// which is running our run loop. Essentially the "consumer"
 		fn next(self: *Self) []Message {
 			// pull is only ever written to from this thread

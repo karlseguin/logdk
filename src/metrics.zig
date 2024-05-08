@@ -28,6 +28,6 @@ pub fn alterDataSet(c: usize) void {
 	metrics.alter_dataset.incrBy(c);
 }
 
-pub fn recordError() void {
-	metrics.record_error.incr();
+pub fn recordError(c: usize) void {
+	metrics.record_error.incrBy(c);
 }

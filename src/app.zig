@@ -130,7 +130,7 @@ pub const App = struct {
 		self.validators.deinit();
 	}
 
-	pub fn getDataSet(self: *App, name: []const u8) ?usize {
+	pub fn getDataSetRef(self: *App, name: []const u8) ?usize {
 		self._dataset_lock.lockShared();
 		defer self._dataset_lock.unlockShared();
 		return self._datasets.get(name);
