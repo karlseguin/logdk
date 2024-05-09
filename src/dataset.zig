@@ -48,7 +48,20 @@ pub const DataSet = struct {
 	// in the columns array.
 	columnLookup: std.StringHashMapUnmanaged(void),
 
+	// The number of unflushed records we have.
 	unflushed: usize,
+
+	// This datasets own actor_id, used with the dispatcher. The dataset needs
+	// this in order to dispatch messages to itself (which sounds dumb, but
+	// it allows us to schedule messages for later processing)
+	actor_id: usize,
+
+	// force a flush every 5 seconds (todo: make configurable, per dataset)
+	max_unflushed_ms: i64 = 5000,
+
+	// force a flush every 10000 records (todo: make configurable, per dataset)
+	max_unflushed_count: usize = 10000,
+
 
 	// row could be either a *zuckdb.Row or a *zuckdb.OwningRow
 	pub fn init(app: *App, row: anytype) !DataSet {
@@ -86,13 +99,15 @@ pub const DataSet = struct {
 		var logger = (try logz.newLogger()).string("name", name).multiuse();
 		errdefer logger.deinit();
 
-		const appender = try conn.appender(null, name);
+		var appender = try conn.appender(null, name);
+		errdefer appender.deinit();
 
 		return .{
 			.app = app,
 			.name = name,
 			.conn = conn,
 			.arena = arena,
+			.actor_id = 0,
 			.unflushed = 0,
 			.logger = logger,
 			.appender = appender,
@@ -187,16 +202,28 @@ pub const DataSet = struct {
 			}
 		}
 
-		const unflushed = self.unflushed + event_list.events.len;
-		if (unflushed >= 1000) {
-			// this will reset self.unflushed to 0
-			self.flushAppender() catch {}; // already logged, not much point in failing now
-		} else {
-			self.unflushed = unflushed;
-		}
-
+		var appended = event_list.events.len;
 		if (error_count > 0) {
 			logdk.metrics.recordError(error_count);
+			appended -= error_count;
+		}
+
+		if (appended > 0) {
+			const pre_unflushed = self.unflushed;
+			const new_unflushed = pre_unflushed + appended;
+
+			if (new_unflushed >= self.max_unflushed_count) {
+				self.flushAppender() catch {}; // already logged, not much point in failing now
+			} else {
+				if (pre_unflushed == 0) {
+					// these are the first events (either since program start, or since
+					// the last flush), schedule a flush.
+					self.app.scheduler.scheduleIn(.{.flush_dataset = self.actor_id}, self.max_unflushed_ms) catch |err| {
+						self.logger.level(.Error).ctx("DataSet.schedule.flush").err(err).log();
+					};
+				}
+				self.unflushed = new_unflushed;
+			}
 		}
 
 		if (alter_count > 0) {
@@ -1502,6 +1529,49 @@ test "DataSet: record add column" {
 	}
 }
 
+test "DataSet: autoflush after configured time" {
+	var tc = t.context(.{});
+	defer tc.deinit();
+	tc.withScheduler();
+
+	const ds = try testDataSet(tc);
+	ds.max_unflushed_ms = 5;
+
+	{
+		const event_list = try Event.parse(t.allocator, "[{\"id\": 1}, {\"id\": 2}, {\"id\": 3}]");
+		ds.record(event_list);
+	}
+
+	try t.expectEqual(0, (try tc.scalar(i64, "select count(*) from dataset_test", .{})));
+	std.time.sleep(std.time.ns_per_ms * 100);
+	try t.expectEqual(3, (try tc.scalar(i64, "select count(*) from dataset_test", .{})));
+	try t.expectEqual(0, ds.unflushed);
+}
+
+test "DataSet: autoflush after configured size" {
+	var tc = t.context(.{});
+	defer tc.deinit();
+	tc.withScheduler();
+
+	const ds = try testDataSet(tc);
+	ds.max_unflushed_count = 5;
+
+	{
+		const event_list = try Event.parse(t.allocator, "[{\"id\": 1}, {\"id\": 2}, {\"id\": 3}]");
+		ds.record(event_list);
+		try t.expectEqual(0, (try tc.scalar(i64, "select count(*) from dataset_test", .{})));
+	}
+
+
+	{
+		const event_list = try Event.parse(t.allocator, "[{\"id\": 4}, {\"id\": 5}]");
+		ds.record(event_list);
+		try t.expectEqual(5, (try tc.scalar(i64, "select count(*) from dataset_test", .{})));
+	}
+
+	try t.expectEqual(0, ds.unflushed);
+}
+
 // This is one of those things. It's hard to create a DataSet since it requires
 // a lot of setup. It needs a real table, since it prepares a statement. Tempting
 // to think we can just fake create a dataset, ala, `return DataSet{....}`...but
@@ -1518,7 +1588,9 @@ fn testDataSet(tc: *t.Context) !*DataSet {
 	);
 	defer event_list.deinit();
 	const actor_id = try tc.app.createDataSet(tc.env(), "dataset_test", event_list.events[0]);
-	return tc.app.dispatcher.unsafeInstance(DataSet, actor_id);
+	var ds = tc.app.dispatcher.unsafeInstance(DataSet, actor_id);
+	ds.actor_id = actor_id;
+	return ds;
 }
 
 fn testDataSetWithList(tc: *t.Context) !*DataSet {

@@ -92,6 +92,10 @@ pub const Context = struct {
 		self.web = web.init(.{});
 	}
 
+	pub fn withScheduler(self: *Context) void {
+		self.app.scheduler.start(self.app) catch unreachable;
+	}
+
 	pub fn silenceLogs(self: *Context) void {
 		logz.setLevel(.None);
 		self.reset_log_level = true;

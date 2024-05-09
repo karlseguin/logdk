@@ -33,6 +33,8 @@ pub fn main() !void {
 
 	try app.loadDataSets();
 
+	try app.scheduler.start(&app);
+
 	try @import("init.zig").init(aa);
 	try logdk.web.start(&app, &config);
 }

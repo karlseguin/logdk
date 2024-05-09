@@ -143,22 +143,3 @@ pub const StaticFile = struct {
 	compressed: bool,
 	content: []const u8,
 };
-
-
-	// const httpz = b.addModule("httpz", .{
-	// 	.root_source_file = .{.path = "lib/http.zig/src/httpz.zig"},
-	// 	.imports = &.{
-	// 		.{.name = "metrics", .module = b.addModule("metrics", .{.root_source_file = .{.path = "lib/metrics.zig/src/metrics.zig"}})},
-	// 		.{.name = "websocket", .module = b.addModule("websocket", .{.root_source_file = .{.path = "lib/websocket.zig/src/websocket.zig"}})},
-	// 	},
-	// });
-	// try modules.put("httpz", httpz);
-
-	// const zuckdb = b.addModule("zuckdb", .{
-	// 	.root_source_file = .{.path = "lib/zuckdb.zig/src/zuckdb.zig"},
-	// 	.imports = &.{},
-	// });
-
-	// try modules.put("zul", b.addModule("zul", .{
-	// 	.root_source_file = .{.path = "lib/zul/src/zul.zig"},
-	// }));

@@ -9,6 +9,7 @@ pub const binder = @import("binder.zig");
 pub const App = @import("app.zig").App;
 pub const Env = @import("env.zig").Env;
 pub const Meta = @import("meta.zig").Meta;
+pub const Tasks = @import("tasks.zig").Tasks;
 pub const Event = @import("event.zig").Event;
 pub const Config = @import("config.zig").Config;
 pub const DataSet = @import("dataset.zig").DataSet;

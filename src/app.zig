@@ -1,4 +1,5 @@
 const std = @import("std");
+const zul = @import("zul");
 const logz = @import("logz");
 const zuckdb = @import("zuckdb");
 const logdk = @import("logdk.zig");
@@ -29,6 +30,8 @@ pub const Queues = struct {
 		};
 	}
 };
+
+const Scheduler = zul.Scheduler(logdk.Tasks, *App);
 
 pub const App = struct {
 	// Because of the actor-ish nature of DataSets, our meta holds a snapshot
@@ -67,6 +70,11 @@ pub const App = struct {
 	// to the dataset via the dispatcher.
 	_datasets: std.StringHashMap(usize),
 
+	// Ephemeral background task scheduler. All scheduled task for this scheduler
+	// run in the scheduler thread. Currently only used to periodically flush the
+	// dataset appender.
+	scheduler: zul.Scheduler(logdk.Tasks, *App),
+
 	pub fn init(allocator: Allocator, config: logdk.Config) !App{
 		var open_err: ?[]u8 = null;
 		const db = zuckdb.DB.initWithErr(allocator, config.db.path, .{.enable_external_access = false}, &open_err) catch |err| {
@@ -98,6 +106,9 @@ pub const App = struct {
 		meta_actor.value = try Meta.init(allocator, meta_actor.queue);
 		errdefer meta_actor.value.deinit();
 
+		var scheduler = Scheduler.init(allocator);
+		errdefer scheduler.deinit();
+
 		return .{
 			.create_lock = .{},
 			.allocator = allocator,
@@ -108,6 +119,7 @@ pub const App = struct {
 			},
 			.db = db_pool,
 			.buffers = buffers,
+			.scheduler = scheduler,
 			.dispatcher = dispatcher,
 			._dataset_lock = .{},
 			._datasets = std.StringHashMap(usize).init(allocator),
@@ -115,6 +127,8 @@ pub const App = struct {
 	}
 
 	pub fn deinit(self: *App) void {
+		self.scheduler.deinit();
+
 		self.dispatcher.stop();
 
 		var it = self._datasets.valueIterator();
@@ -220,6 +234,7 @@ pub const App = struct {
 		};
 		errdefer dataset.deinit();
 		const actor_id = try self.dispatcher.add(dataset);
+		dataset.actor_id = actor_id;
 
 		{
 			self._dataset_lock.lock();
@@ -253,6 +268,7 @@ pub const App = struct {
 
 			const actor_id = try self.dispatcher.add(dataset);
 			try self._datasets.put(dataset.name, actor_id);
+			dataset.actor_id = actor_id;
 
 			// this dataset is going to move (and be owned by our actor), but this
 			// is safe because meta.datasetChanged clones all the data it needs for its
