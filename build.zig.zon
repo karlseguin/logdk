@@ -24,8 +24,8 @@
 			.hash = "12206ccc6e5ae35c3a261ed4b1ac675a68d8cf44d043de6dbb811f76b4ece21a343a"
 		},
 		.zuckdb = .{
-			.url = "https://github.com/karlseguin/zuckdb.zig/archive/31ba96529e0f3376dc9c1f6a0eb8751a21a7b65d.tar.gz",
-			.hash = "1220ab0367400e01989aa08fba6b7a1f939325c7bc267dd6b72599140695f697caf5"
+			.url = "https://github.com/karlseguin/zuckdb.zig/archive/e7392d0522e7e4105dcb18e7f622c3377d1c3a3b.tar.gz",
+			.hash = "1220b567e9301de11e1a721c6d9a24c9e5cbe638afd632521e364255489b23038613"
 		},
 		.zul = .{
 			.url = "https://github.com/karlseguin/zul/archive/9c568749b415d0808897c937450d78013b7bb806.tar.gz",

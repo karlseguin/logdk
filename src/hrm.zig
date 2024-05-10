@@ -61,7 +61,7 @@ fn writeRow(row: *const zuckdb.Row, buf: *zul.StringBuilder, vectors: []zuckdb.V
 
 	for (vectors, 0..) |*vector, i| {
 		switch (vector.type) {
-			.list => |child_type| {
+			.list => |list_vector| {
 				const list = row.lazyList(i) orelse {
 					try buf.write("null,");
 					continue;
@@ -70,6 +70,8 @@ fn writeRow(row: *const zuckdb.Row, buf: *zul.StringBuilder, vectors: []zuckdb.V
 					try buf.write("[],");
 					continue;
 				}
+
+				const child_type = list_vector.child;
 				try buf.writeByte('[');
 				for (0..list.len) |list_index| {
 					try translateScalar(&list, child_type, list_index, writer, logger);

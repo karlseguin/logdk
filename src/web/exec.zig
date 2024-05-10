@@ -14,8 +14,6 @@ pub fn init(builder: *logdk.Validate.Builder) !void {
 pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void {
 	const input = try web.validateQuery(req, input_validator, env);
 
-	// we're going to wrap this in a CTE (to prevent update/delete/insert)
-	// so we need to strip any trailing comma
 	const sql = input.get("sql").?.string;
 
 	var app = env.app;

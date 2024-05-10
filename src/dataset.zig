@@ -79,8 +79,8 @@ pub const DataSet = struct {
 		errdefer conn.deinit();
 
 		const name = try aa.dupe(u8, row.get([]const u8, 0));
-
-		const columns = try std.json.parseFromSliceLeaky([]Column, aa, row.get([]const u8, 1), .{});
+		const column_data = try aa.dupe(u8, row.get([]const u8, 1));
+		const columns = try std.json.parseFromSliceLeaky([]Column, aa, column_data, .{.allocate = .alloc_if_needed});
 
 		var columnLookup = std.StringHashMapUnmanaged(void){};
 		try columnLookup.ensureTotalCapacity(aa, @intCast(columns.len));
@@ -356,7 +356,7 @@ pub const DataSet = struct {
 
 	fn alter(self: *DataSet, start_index: usize, value_: ?Event.Value, event: Event, used_fields_: usize) !void {
 		// Flush any pending rows we have, this is safe to do even if we've bound values
-		// for thie existing event since it'll flush only data up until the last endRow;
+		// for this existing event since it'll flush only data up until the last endRow;
 		try self.flushAppender();
 
 		_ = try self.exec("begin", .{});
@@ -412,11 +412,12 @@ pub const DataSet = struct {
 			const aa = self.arena.allocator();
 			var it = event.map.iterator();
 			while (it.next()) |kv| {
-				if (self.columnLookup.contains(kv.key_ptr.*)) {
+				const name = kv.key_ptr.*;
+				if (self.columnLookup.contains(name)) {
 					// we already know this field/column
 					continue;
 				}
-				const name = kv.key_ptr.*;
+
 				if (Column.isValidName(name) == false) {
 					self.logger.level(.Warn).ctx("DataSet.alter.invalid_name").string("name", name).log();
 					continue;
