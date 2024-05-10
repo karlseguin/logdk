@@ -107,7 +107,11 @@ pub fn Dispatcher(comptime Q: type) type {
 			const T = @TypeOf(instance);
 			var actor = try self.create(T);
 			actor.value = instance;
-			return @intFromPtr(actor);
+			const actor_id = @intFromPtr(actor);
+			if (@hasField(@TypeOf(instance), "actor_id")) {
+				actor.value.actor_id = actor_id;
+			}
+			return actor_id;
 		}
 
 		pub fn create(self: *Self, comptime T: type) !*Actor(T) {

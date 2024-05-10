@@ -234,7 +234,6 @@ pub const App = struct {
 		};
 		errdefer dataset.deinit();
 		const actor_id = try self.dispatcher.add(dataset);
-		dataset.actor_id = actor_id;
 
 		{
 			self._dataset_lock.lock();
@@ -268,7 +267,6 @@ pub const App = struct {
 
 			const actor_id = try self.dispatcher.add(dataset);
 			try self._datasets.put(dataset.name, actor_id);
-			dataset.actor_id = actor_id;
 
 			// this dataset is going to move (and be owned by our actor), but this
 			// is safe because meta.datasetChanged clones all the data it needs for its
