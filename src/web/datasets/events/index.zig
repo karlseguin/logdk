@@ -445,7 +445,8 @@ const QueryBuilder = struct {
 
 	fn paging(self: *QueryBuilder, page: u16, limit: u16) !void {
 		const adjusted_page = if (page == 0) page else page - 1;
-		try std.fmt.format(self.buf.writer(), " limit {d} offset {d}", .{limit, adjusted_page * limit});
+		const offset: u32 = @as(u32, adjusted_page) * limit;
+		try std.fmt.format(self.buf.writer(), " limit {d} offset {d}", .{limit, offset});
 	}
 
 	fn toCount(self: *QueryBuilder) []const u8 {
