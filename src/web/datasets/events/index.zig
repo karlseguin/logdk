@@ -351,7 +351,7 @@ const QueryBuilder = struct {
 					if (std.meta.activeTag(value) == .null) {
 						try buf.write(" is not null");
 					} else {
-						try buf.write(" != ");
+						try buf.write(" is distinct from ");
 						try self.writePlaceHolderFor(value);
 					}
 				},
