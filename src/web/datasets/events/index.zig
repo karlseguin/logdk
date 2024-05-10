@@ -338,12 +338,22 @@ const QueryBuilder = struct {
 			const operator: Operator = @enumFromInt(filter[1].i64);
 			switch (operator) {
 				.e => {
-					try buf.write(" = ");
-					try self.writePlaceHolderFor(filter[2]);
+					const value = filter[2];
+					if (std.meta.activeTag(value) == .null) {
+						try buf.write(" is null");
+					} else {
+						try buf.write(" = ");
+						try self.writePlaceHolderFor(value);
+					}
 				},
 				.n => {
-					try buf.write(" != ");
-					try self.writePlaceHolderFor(filter[2]);
+					const value = filter[2];
+					if (std.meta.activeTag(value) == .null) {
+						try buf.write(" is not null");
+					} else {
+						try buf.write(" != ");
+						try self.writePlaceHolderFor(value);
+					}
 				},
 				.l => {
 					try buf.write(" < ");
