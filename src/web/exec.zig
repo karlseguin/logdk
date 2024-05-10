@@ -14,13 +14,22 @@ pub fn init(builder: *logdk.Validate.Builder) !void {
 pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void {
 	const input = try web.validateQuery(req, input_validator, env);
 
-	const sql = input.get("sql").?.string;
-
 	var app = env.app;
+
+	const buf = try app.buffers.acquire();
+	defer buf.release();
+
+	const sql = input.get("sql").?.string;
+	buf.ensureTotalCapacity(sql.len + 50);
+	buf.writeAssumeCapacity("with ldk as(");
+	buf.writeAssumeCapacity(sql);
+	buf.writeAssumeCapacity(") select * from ldk");
+	buf.writeByte(0);
+
 	var conn = try app.db.acquire();
 	defer conn.release();
 
-	var stmt = conn.prepare(sql, .{}) catch |err| switch (err) {
+	var stmt = conn.prepare(buf.strnig(), .{}) catch |err| switch (err) {
 		error.DuckDBError => return web.invalidSQL(res, conn.err, sql),
 		else => return err,
 	};
@@ -40,8 +49,7 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 	};
 	defer rows.deinit();
 
-	const buf = try app.buffers.acquire();
-	defer buf.release();
+	buf.clearRetainingCapacity();
 	try logdk.hrm.writeRows(res, &rows, buf, env.logger);
 	try buf.write("\n]\n}");
 	try res.chunk(buf.string());
