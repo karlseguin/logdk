@@ -6,6 +6,7 @@ const files = @import("ui_files");
 
 const Response = struct {
 	body: []const u8,
+	cache: []const u8,
 	content_type: httpz.ContentType,
 };
 
@@ -28,12 +29,15 @@ fn loadFiles(comptime c: bool) []struct{[]const u8, Response} {
 		if (compressed != c) continue;
 
 		var content_type: httpz.ContentType = undefined;
+		var cache: []const u8 = "public, max-age=300";
 		if (std.mem.endsWith(u8, name, ".js")) {
 			content_type = .JS;
+			cache = "public, max-age=604800, immutable";
+		} else if (std.mem.endsWith(u8, name, ".png")) {
+			cache = "public, max-age=604800, immutable";
+			content_type = .PNG;
 		} else if (std.mem.endsWith(u8, name, ".html")) {
 			content_type = .HTML;
-		} else if (std.mem.endsWith(u8, name, ".png")) {
-			content_type = .PNG;
 		} else {
 			unreachable;
 		}
@@ -41,6 +45,7 @@ fn loadFiles(comptime c: bool) []struct{[]const u8, Response} {
 		const key = if (std.mem.eql(u8, name, "ui/index.html")) "/" else "/" ++ name[3..];
 		kv[i] = .{key, .{
 			.body = content,
+			.cache = cache,
 			.content_type = content_type,
 		}};
 		i += 1;
@@ -58,7 +63,7 @@ pub fn handler(_: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void {
 		return;
 	};
 
-	res.header("cache-control", "public, max-age=604800, immutable");
+	res.header("cache-control", response.cache);
 	if (compressed) {
 		res.header("Content-Encoding", "br");
 	}
