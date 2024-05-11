@@ -12,6 +12,12 @@ const logdk = @import("logdk.zig");
 // The code for that is sprinkled throughout, but for any piece of this mapping
 // that is needed in more than one place, we put it here.
 
+pub fn writePaging(writer: anytype, page: u16, limit: u16) !void {
+	const adjusted_page = if (page == 0) page else page - 1;
+	const offset: u32 = @as(u32, adjusted_page) * limit;
+	try std.fmt.format(writer, " limit {d} offset {d}", .{limit, offset});
+}
+
 pub fn writeRows(res: *httpz.Response, rows: *zuckdb.Rows, buf: *zul.StringBuilder, logger: logz.Logger) !void {
 	res.content_type = .JSON;
 	const writer = buf.writer();

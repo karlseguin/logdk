@@ -32,7 +32,7 @@ pub fn init(builder: *logdk.Validate.Builder) !void {
 	const filter_validator = builder.array(null, .{.function = validateFilter, .min = 2});
 	input_validator = builder.object(&.{
 		builder.field("page", builder.int(u16, .{.parse = true, .min = 1, .default = 1})),
-		builder.field("limit", builder.int(u16, .{.parse = true, .min = 1, .max = 5000, .default = 100})),
+		builder.field("limit", builder.int(u16, .{.parse = true, .min = 1, .max = 1000, .default = 100})),
 		builder.field("total", builder.boolean(.{.parse = true, .default = false})),
 		builder.field("order", builder.string(.{.min = 1, .max = logdk.MAX_IDENTIFIER_LEN, .function = validateOrder, .default = "ldk_id"})),
 		builder.field("filters", builder.array(filter_validator, .{.parse = true})),
@@ -124,7 +124,6 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 	_ = app.getDataSetRef(name) orelse return web.notFound(res, "dataset not found");
 
 	const input = try web.validateQuery(req, input_validator, env);
-	const include_total = input.get("total").?.bool;
 
 	var builder = try QueryBuilder.init(res.arena, env);
 	defer builder.deinit();
@@ -148,6 +147,7 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 
 	const page = input.get("page").?.u16;
 	const limit = input.get("limit").?.u16;
+	const include_total = input.get("total").?.bool;
 	try builder.paging(page, limit);
 
 	// we can't re-use the builder buf, because we might need it, intact, to get
@@ -182,9 +182,11 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 
 	if (include_total) {
 		const select_count_sql = builder.toCount();
-		var stmt = conn.prepare(select_count_sql, .{}) catch |err| switch (err) {
-			error.DuckDBError => return web.invalidSQL(res, conn.err, select_count_sql),
-			else => return err,
+		var stmt = conn.prepare(select_count_sql, .{}) catch |err| {
+			// don't use web.invalidSQL here for two reasons
+			// 1 - the response is already partially written
+			// 2 - this isn't a user/sql error, it shouldn't be possible for this to fail
+			return env.dbErr("Events.index.count", err, conn);
 		};
 		defer stmt.deinit();
 
@@ -444,9 +446,7 @@ const QueryBuilder = struct {
 	}
 
 	fn paging(self: *QueryBuilder, page: u16, limit: u16) !void {
-		const adjusted_page = if (page == 0) page else page - 1;
-		const offset: u32 = @as(u32, adjusted_page) * limit;
-		try std.fmt.format(self.buf.writer(), " limit {d} offset {d}", .{limit, offset});
+		return logdk.hrm.writePaging(self.buf.writer(), page, limit);
 	}
 
 	fn toCount(self: *QueryBuilder) []const u8 {
@@ -599,7 +599,7 @@ test "events.index: single row" {
 
 	try tc.web.expectJson(.{
 		.cols = &[_][]const u8{"ldk_id", "ldk_ts", "details", "false", "float_neg", "float_pos", "int", "list", "mixed_list", "null", "text", "true", "uint"},
-		.types = &[_][]const u8{"ubigint","timestamp","varchar","boolean","double","double","smallint","double[]","varchar","varchar","varchar","boolean","uinteger"},
+		.types = &[_][]const u8{"ubigint","timestamp","JSON","boolean","double","double","smallint","double[]","JSON","varchar","varchar","boolean","uinteger"},
 		.rows = &[_][]const std.json.Value{
 			&[_]std.json.Value{
 				.{.integer = 1},

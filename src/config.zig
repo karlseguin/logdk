@@ -14,6 +14,11 @@ pub const Config = struct {
 		.address = "127.0.0.1",
 	},
 
+	buffers: Buffer = .{
+		.count = 32,
+		.size = 32_768,
+	},
+
 	log_http: LogHTTP = .smart,
 	logger: logz.Config = .{},
 	validator: validate.Config = .{},
@@ -22,6 +27,11 @@ pub const Config = struct {
 		none,
 		all,
 		smart,
+	};
+
+	const Buffer = struct {
+		count: u16 = 32,
+		size: u32 = 32_768,
 	};
 
 	const DB = struct {

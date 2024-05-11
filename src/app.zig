@@ -96,7 +96,7 @@ pub const App = struct {
 		var validator_pool = try ValidatorPool(void).init(allocator, config.validator);
 		errdefer validator_pool.deinit();
 
-		var buffers = try BufferPool.init(allocator, 32, 32_768);
+		var buffers = try BufferPool.init(allocator, config.buffers.count, config.buffers.size);
 		errdefer buffers.deinit();
 
 		var dispatcher = try d.Dispatcher(Queues).init(allocator);
