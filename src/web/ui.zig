@@ -58,7 +58,15 @@ fn loadFiles(comptime c: bool) []struct{[]const u8, Response} {
 pub fn handler(_: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void {
 	const compressed = serveCompressed(req);
 	const lookup = if (compressed) &compressed_lookup else &uncompressed_lookup;
-	const response = lookup.get(req.url.path) orelse {
+
+	var path = req.url.path;
+	if (std.fs.path.extension(path).len == 0) {
+		// SPA. If we're not requesting an asset (png/js), serve up the index
+		// and let the spa's routing handle the rest
+		path = "/";
+	}
+
+	const response = lookup.get(path) orelse {
 		res.status = 404;
 		return;
 	};
