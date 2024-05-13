@@ -9,9 +9,23 @@ const App = logdk.App;
 const Config = logdk.Config;
 const Allocator = std.mem.Allocator;
 
+// global, only used for shutting down from signal
+var shutdown_app: ?*App = null;
+
 pub fn main() !void {
 	var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 	const allocator = if (builtin.mode == .Debug) gpa.allocator() else std.heap.c_allocator;
+
+	defer if (builtin.mode == .Debug) {
+		_ = gpa.detectLeaks();
+	};
+
+	try std.posix.sigaction(std.posix.SIG.INT, &.{
+		.handler = .{.handler = sigint},
+		.mask = std.posix.empty_sigset,
+		.flags = 0,
+	}, null);
+
 
 	// Some data exists for the entire lifetime of the project. We could just
 	// use the gpa allocator, but if we don't properly clean it up, it'll cause
@@ -29,6 +43,7 @@ pub fn main() !void {
 
 	var app = try App.init(allocator, config);
 	defer app.deinit();
+	shutdown_app = &app;
 
 	try app.loadDataSets();
 
@@ -36,6 +51,7 @@ pub fn main() !void {
 
 	try @import("init.zig").init(aa);
 	try logdk.web.start(&app, &config);
+	logz.info().ctx("shutdown").log();
 }
 
 fn parseArgs(allocator: Allocator) !zul.Managed(logdk.Config) {
@@ -48,6 +64,18 @@ fn parseArgs(allocator: Allocator) !zul.Managed(logdk.Config) {
 	}
 
 	return zul.fs.readJson(logdk.Config, allocator, args.get("config") orelse "config.json", .{});
+}
+
+fn sigint(_: c_int) callconv(.C) void {
+	if (shutdown_app) |app| {
+		if (app._webserver) |web| {
+			// this will unblock the main thread, which will clean everything up
+			logz.info().ctx("sigint").boolean("started", true).log();
+			web.stop();
+			return;
+		}
+	}
+	logz.info().ctx("sigint").boolean("started", false).log();
 }
 
 const t = logdk.testing;

@@ -75,6 +75,9 @@ pub const App = struct {
 	// dataset appender.
 	scheduler: zul.Scheduler(logdk.Tasks, *App),
 
+	// only used for shutting down
+	_webserver: ?*logdk.web.Server = null,
+
 	pub fn init(allocator: Allocator, config: logdk.Config) !App{
 		var open_err: ?[]u8 = null;
 		const db = zuckdb.DB.initWithErr(allocator, config.db.path, .{.enable_external_access = false}, &open_err) catch |err| {
@@ -129,13 +132,32 @@ pub const App = struct {
 	pub fn deinit(self: *App) void {
 		self.scheduler.deinit();
 
-		self.dispatcher.stop();
+		{
+			self._dataset_lock.lock();
+			defer self._dataset_lock.unlock();
 
-		var it = self._datasets.valueIterator();
-		while (it.next()) |value| {
-			self.dispatcher.unsafeInstance(DataSet, value.*).deinit();
+			{
+				// First, send a flush to each dataset
+				var it = self._datasets.valueIterator();
+				while (it.next()) |value| {
+					self.dispatcher.send(logdk.DataSet, value.*, .{.flush = {}});
+				}
+			}
+
+			// Next, stop the dispatcher, this waits until all message are processed
+			self.dispatcher.stop();
+
+			{
+				// Finally cleanup all the datsets
+				var it = self._datasets.valueIterator();
+				while (it.next()) |value| {
+					self.dispatcher.unsafeInstance(DataSet, value.*).deinit();
+				}
+			}
+
+			self._datasets.deinit();
 		}
-		self._datasets.deinit();
+
 		self.meta.deinit();
 		self.dispatcher.deinit();
 

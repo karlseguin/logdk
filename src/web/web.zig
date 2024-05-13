@@ -14,6 +14,7 @@ const ui = @import("ui.zig");
 const exec = @import("exec.zig");
 const info = @import("info/_info.zig");
 const datasets = @import("datasets/_datasets.zig");
+pub const Server = httpz.ServerCtx(*const Dispatcher, *Env);
 
 // every request gets a request_id, any log message created from a request-specific
 // logger will include this id
@@ -28,8 +29,10 @@ pub fn start(app: *App, config: *const logdk.Config) !void {
 	const allocator = app.allocator;
 
 	const http_config = config.http;
-	var server = try httpz.ServerCtx(*const Dispatcher, *Env).init(allocator, http_config, undefined);
+	var server = try Server.init(allocator, http_config, undefined);
 	defer server.deinit();
+
+	app._webserver = &server;
 
 	server.dispatcher(Dispatcher.dispatch);
 	server.notFound(routerNotFound);
