@@ -17,6 +17,7 @@ pub const DataSet = @import("dataset.zig").DataSet;
 pub const testing = @import("t.zig");
 
 pub const MAX_IDENTIFIER_LEN = 100;
+pub const version = @embedFile("version.txt");
 
 pub const codes = struct {
 	pub const CONNECTION_RESET = 0;

@@ -1,4 +1,7 @@
 const std = @import("std");
+const zul = @import("zul");
+const logz = @import("logz");
+const httpz = @import("httpz");
 const logdk = @import("logdk.zig");
 
 const d = logdk.dispatcher;
@@ -7,41 +10,57 @@ const RwLock = std.Thread.RwLock;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 
-// Describes the system. Used in the GET /describe endpoint. In the scale of
-// things, the system doesn't change often, so this data is pretty static. If
-// we were to get this on-demand, we'd have to deal with all types of thread-safety
-// issues. Instead, when a dataset changes, it sends a message to Meta (via
-// our actor-ish dispatcher).
+// Describes the system. Used in the GET /describe and GET /info endpoints.
 //
-// There's still some thread-safety issues. _payload might get rebuilt while
+// For Describe, in the scale of things, the system doesn't change often, so
+// this data is pretty static. If we were to get this on-demand, we'd have to
+// deal with all types of thread-safety issues. Instead, when a dataset changes,
+// it sends a message to Meta (via our actor-ish dispatcher).
+//
+// For Info, the data changes a bit more (e.g. size of the database), so we load
+// the info, track the timestamp, and if we try getInfo() again and the timestamp
+// is old, we refresh it. It's a bit like a cache, EXCEPT, the old info is always
+// available, so if updating info fails, we can always return the old one. B
+//
+// There's still some thread-safety issues. describe or info might get rebuilt while
 // we're writing the response to the socket. So we use thread-safe reference
-// counter. _payload is on the heap, and Meta holds 1 reference. Anyone who
-// calls meta.payload() also holds a reference. When no longer in use, Meta and
-// the callers need to call payload.release(). When the internal rc becomes 0
-// the payload is freed. This allows Meta to swap out its reference without
-// invalidating any other references out there.
+// counter. This is solved by keeping the values on the heap, behind an atomic
+// reference counter (arc). Only when the arc reaches 0 do we free the memory.
 pub const Meta = struct {
-	_lock: RwLock,
-	_payload: *Payload,
+	_describe: Payload,
+	_describe_lock: RwLock,
+	_info: Payload,
+	_info_lock: RwLock,
+	_info_expires: i64,
 	_allocator: Allocator,
 	_queue: *d.Queue(Meta),
 	_datasets: std.ArrayListUnmanaged(DataSet),
 
+	pub const Payload = *ArenaArc([]const u8);
+
 	pub fn init(allocator: Allocator, queue: *d.Queue(Meta)) !Meta {
-		const pl = try Payload.init(allocator, .{.datasets = &[_]DataSet{}});
-		errdefer pl.release();
+		const info = try ArenaArc([]const u8).init(allocator, 1);
+		info.value = "{}"; //load this later
+		errdefer info.release();
+
+		const describe = try loadDescribe(allocator, .{.datasets = &[_]DataSet{}});
+		errdefer describe.release();
 
 		return .{
-			._lock = .{},
-			._payload = pl,
 			._queue = queue,
+			._info = info,
+			._info_lock = .{},
+			._info_expires = 0,
+			._describe = describe,
+			._describe_lock = .{},
 			._allocator = allocator,
 			._datasets = std.ArrayListUnmanaged(DataSet){},
 		};
 	}
 
 	pub fn deinit(self: *Meta) void {
-		self._payload.release();
+		self._info.release();
+		self._describe.release();
 		for (self._datasets.items) |ds| {
 			ds.deinit();
 		}
@@ -49,20 +68,39 @@ pub const Meta = struct {
 	}
 
 	// The mix of lock + atomic seems weird, but I believe it's correct/necessary.
-	// The lock protects the self._payload reference, wheras the _rc protects the
-	// payload itself. `payload._rc` is mutated in payload.release() which isn't
+	// The lock protects the self._describe reference, wheras the _rc protects the
+	// describe itself. `arc._rc` is mutated in arc.release() which isn't
 	// lock-protected.
-	// So the lock here makes sure that get a payload instance, and increase its
+	// So the lock here makes sure that we can get an arc instance, and increase its
 	// rc, without another thread being able to swap out the version in between
-	// those two operations. The atomic keeps `payload._rc` consistent across
+	// those two operations. The atomic keeps `arc._rc` consistent across
 	// multiple-threads which aren't all under lock.
 	// I think.
-	pub fn payload(self: *Meta) *Payload {
-		self._lock.lockShared();
-		const p = self._payload;
-		_ = @atomicRmw(u16, &p._rc, .Add, 1, .monotonic);
-		self._lock.unlockShared();
-		return p;
+	pub fn getDescribe(self: *Meta) Payload {
+		self._describe_lock.lockShared();
+		defer self._describe_lock.unlockShared();
+		self._describe.acquire();
+		return self._describe;
+	}
+
+	pub fn getInfo(self: *Meta, app: *logdk.App) Payload {
+		const now = std.time.timestamp();
+		self._info_lock.lockShared();
+		defer self._info_lock.unlockShared();
+		if (self._info_expires < now) blk: {
+			const info = loadInfo(self._allocator, app) catch |err| {
+				// if this fails (unlikely), we can return the previous stored info
+				// we'll extend the expiry a little to avoid to avoid flooding the
+				// system with this error
+				self._info_expires = now + 5;
+				logz.err().err(err).ctx("Meta.loadInfo").log();
+				break :blk;
+			};
+			self._info.release();
+			self._info = info;
+		}
+		self._info.acquire();
+		return self._info;
 	}
 
 	// This is being called from the DataSet's worker thread, so we can
@@ -121,47 +159,101 @@ pub const Meta = struct {
 			try self._datasets.append(allocator, dataset);
 		}
 
-		const pl = try Payload.init(allocator, .{.datasets = self._datasets.items});
-		errdefer pl.release();
+		const describe = try loadDescribe(allocator, .{.datasets = self._datasets.items});
+		errdefer describe.release();
 
-
-		self._lock.lock();
-		defer self._lock.unlock();
-		self._payload.release();
-		self._payload = pl;
+		self._describe_lock.lock();
+		defer self._describe_lock.unlock();
+		self._describe.release();
+		self._describe = describe;
 	}
 
-	pub const Payload = struct {
+	fn loadDescribe(allocator: Allocator, data: anytype) !Payload {
+		const arc = try ArenaArc([]const u8).init(allocator, 1);
+		errdefer arc.release();
+
+		const json = try std.json.stringifyAlloc(arc._arena.allocator(), data, .{});
+		arc.value = json;
+		return arc;
+	}
+
+	fn loadInfo(allocator: Allocator, app: *logdk.App) !Payload {
+		var conn = try app.db.acquire();
+		defer conn.release();
+
+		const arc = try ArenaArc([]const u8).init(allocator, 1);
+		errdefer arc.release();
+
+		const aa = arc._arena.allocator();
+
+		const duckdb_version = blk: {
+			const row = conn.row("select to_json(t) from pragma_version() t", .{}) catch |err| {
+				return logdk.dbErr("Meta.info.version", err, conn, logz.err());
+			} orelse return error.PragmaNoRow;
+			defer row.deinit();
+			break :blk try aa.dupe(u8, row.get([]const u8, 0));
+		};
+
+		const duckdb_size = blk: {
+			const row = conn.row("select to_json(t) from pragma_database_size() t", .{}) catch |err| {
+				return logdk.dbErr("Meta.info.version", err, conn, logz.err());
+			} orelse return error.PragmaNoRow;
+			defer row.deinit();
+			break :blk try aa.dupe(u8, row.get([]const u8, 0));
+		};
+
+		const json = try std.json.stringifyAlloc(aa, .{
+			.logdk = .{
+				.version = logdk.version,
+				.httpz_blocking = httpz.blockingMode(),
+			},
+			.duckdb = .{
+				.size = zul.jsonString(duckdb_size),
+				.version = zul.jsonString(duckdb_version),
+			},
+		}, .{});
+
+		arc.value = json;
+		return arc;
+	}
+};
+
+fn ArenaArc(comptime T: type) type {
+	return struct {
+		value: T,
 		_rc: u16,
-		json: []const u8,
-		_allocator: Allocator,
+		_arena: ArenaAllocator,
 
-		fn init(allocator: Allocator, describe: anytype) !*Payload {
-			const json = try std.json.stringifyAlloc(allocator, describe, .{});
-			errdefer allocator.free(json);
+		const Self = @This();
 
-			const pl = try allocator.create(Payload);
-			errdefer allocator.destroy(pl);
+		pub fn init(allocator: Allocator, initial: u16) !*Self {
+			var arena = ArenaAllocator.init(allocator);
+			errdefer arena.deinit();
 
-			pl.* = .{
-				.json = json,
-				._rc = 1,  // Meta's reference always counts as 1
-				._allocator = allocator,
+			const arc = try arena.allocator().create(Self);
+
+			arc.* = .{
+				._rc = initial,
+				._arena = arena,
+				.value = undefined,
 			};
 
-			return pl;
+			return arc;
 		}
 
-		pub fn release(self: *Payload) void {
+		pub fn acquire(self: *Self) void {
+			_ = @atomicRmw(u16, &self._rc, .Add, 1, .monotonic);
+		}
+
+		pub fn release(self: *Self) void {
 			// returns the value before the sub, so if the value before the sub was 1,
-			// then we have no more references to this payload
+			// then we have no more references to object
 			if (@atomicRmw(u16, &self._rc, .Sub, 1, .monotonic) == 1) {
-				self._allocator.free(self.json);
-				self._allocator.destroy(self);
+				self._arena.deinit();
 			}
 		}
 	};
-};
+}
 
 // a "meta" representation of a DataSet. This owns all its fields, since
 // references to the real dataset are not thread-safe

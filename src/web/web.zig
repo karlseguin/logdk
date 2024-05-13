@@ -42,6 +42,7 @@ pub fn start(app: *App, config: *const logdk.Config) !void {
 		routes.getC("/datasets/:name/events", datasets.events_index.handler, .{.ctx = &Dispatcher.init(app, "events_list", config)});
 		routes.postC("/datasets/:name/events", datasets.events_create.handler, .{.ctx = &Dispatcher.init(app, "events_create", config)});
 		routes.getC("/exec", exec.handler, .{.ctx = &Dispatcher.init(app, "exec_sql", config)});
+		routes.getC("/info", info.info, .{.ctx = &Dispatcher.init(app, "info", config)});
 		routes.getC("/describe", info.describe, .{.ctx = &Dispatcher.init(app, "describe", config)});
 	}
 
@@ -156,7 +157,6 @@ pub fn validateQuery(req: *httpz.Request, v: *logdk.Validate.Object, env: *Env) 
 	}
 	return input orelse typed.Map.readonlyEmpty();
 }
-
 
 pub fn metrics(_: *Env, _: *httpz.Request, res: *httpz.Response) !void {
 	const writer = res.writer();

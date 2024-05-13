@@ -4,14 +4,13 @@ const logz = @import("logz");
 const builtin = @import("builtin");
 
 const logdk = @import("logdk.zig");
-const version = @embedFile("version.txt");
 
 const App = logdk.App;
 const Config = logdk.Config;
 const Allocator = std.mem.Allocator;
 
 pub fn main() !void {
-  var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+	var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 	const allocator = if (builtin.mode == .Debug) gpa.allocator() else std.heap.c_allocator;
 
 	// Some data exists for the entire lifetime of the project. We could just
@@ -44,7 +43,7 @@ fn parseArgs(allocator: Allocator) !zul.Managed(logdk.Config) {
 	defer args.deinit();
 
 	if (args.contains("version")) {
-		try std.io.getStdOut().writer().print("{s}", .{version});
+		try std.io.getStdOut().writer().print("{s}", .{logdk.version});
 		std.posix.exit(0);
 	}
 

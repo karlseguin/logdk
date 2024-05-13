@@ -2,13 +2,13 @@ const httpz = @import("httpz");
 const logdk = @import("../../logdk.zig");
 
 pub fn handler(env: *logdk.Env, _: *httpz.Request, res: *httpz.Response) !void {
-	const describe = env.app.meta.getDescribe();
-	res.callback(releasePayload, @ptrCast(describe));
+	const info = env.app.meta.getInfo(env.app);
+	res.callback(releasePayload, @ptrCast(info));
 	res.content_type = .JSON;
-	res.body = describe.value;
+	res.body = info.value;
 }
 
 fn releasePayload(state: *anyopaque) void {
-	const describe: logdk.Meta.Payload = @alignCast(@ptrCast(state));
-	describe.release();
+	const info: logdk.Meta.Payload = @alignCast(@ptrCast(state));
+	info.release();
 }
