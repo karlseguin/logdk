@@ -22,7 +22,12 @@ pub fn main() !void {
 
 	if (comptime builtin.os.tag != .windows) {
 		try std.posix.sigaction(std.posix.SIG.INT, &.{
-			.handler = .{.handler = sigint},
+			.handler = .{.handler = shutdown},
+			.mask = std.posix.empty_sigset,
+			.flags = 0,
+		}, null);
+		try std.posix.sigaction(std.posix.SIG.TERM, &.{
+			.handler = .{.handler = shutdown},
 			.mask = std.posix.empty_sigset,
 			.flags = 0,
 		}, null);
@@ -95,16 +100,16 @@ fn loadConfig(allocator: Allocator) !logdk.Config {
 	return managed.value;
 }
 
-fn sigint(_: c_int) callconv(.C) void {
+fn shutdown(_: c_int) callconv(.C) void {
 	if (shutdown_app) |app| {
 		if (app._webserver) |web| {
 			// this will unblock the main thread, which will clean everything up
-			logz.info().ctx("sigint").boolean("started", true).log();
+			logz.info().ctx("shutdown").boolean("started", true).log();
 			web.stop();
 			return;
 		}
 	}
-	logz.info().ctx("sigint").boolean("started", false).log();
+	logz.info().ctx("shutdown").boolean("started", false).log();
 }
 
 const t = logdk.testing;
