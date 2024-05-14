@@ -84,7 +84,7 @@ jobs:
 
           mkdir -p release/logdk-x86_64-windows/
           zig build -Dtarget=x86_64-windows -Doptimize=ReleaseFast
-          mv duckdb.dll zig-out/bin/logdk release/logdk-x86_64-windows/
+          mv duckdb.dll zig-out/bin/logdk.exe release/logdk-x86_64-windows/
 
           cd release
           tar -cJf logdk-x86_64-windows-gnu.tar.xz logdk-x86_64-windows
