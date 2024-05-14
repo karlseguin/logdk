@@ -62,7 +62,6 @@ pub const DataSet = struct {
 	// force a flush every 10000 records (todo: make configurable, per dataset)
 	max_unflushed_count: usize = 10000,
 
-
 	// row could be either a *zuckdb.Row or a *zuckdb.OwningRow
 	pub fn init(app: *App, row: anytype) !DataSet {
 		const allocator = app.allocator;

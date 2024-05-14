@@ -1,10 +1,17 @@
 .DS_Store
 zig-out/
 zig-cache/
-*.so
-*.dylib
 ui/
 lib/
-duckdb.h
 db.duckdb*
 
+duckdb.h
+duckdb.hpp
+libduckdb.so
+libduckdb_static.a
+duckdb.dll
+duckdb.lib
+libduckdb.dylib
+libduckdb-linux-amd64.zip
+libduckdb-windows-amd64.zip
+libduckdb-osx-universal.zip
