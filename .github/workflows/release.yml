@@ -26,12 +26,9 @@ jobs:
       - name: logdk-ui
         run: |
           git clone --depth 1 https://github.com/karlseguin/logdk-ui.git
-          cd logdk-ui
-          echo "ui: $(git rev-parse HEAD | tr -d '\n')" >> ../src/version.txt
-          npm install
-          make d
-
-          cd ..
+          pushd logdk-ui
+            npm install && make d
+          popd
           cp -R logdk-ui/dist ui/
           find ui -type f -not -name "*.png" -exec brotli -Z --keep {} \;
 
@@ -43,7 +40,9 @@ jobs:
         run: |
           echo "commit: $(git rev-parse HEAD | tr -d '\n')" > src/version.txt
           echo "zig: $(zig version)" >> src/version.txt
-          echo "ui: $(cd logdk-ui && git rev-parse HEAD | tr -d '\n')" > src/version.txt
+          pushd logdk-ui
+            echo "ui: $(git rev-parse HEAD | tr -d '\n')" >> ../src/version.txt
+          popd
 
       - name: x86_64-linux-gnu
         run: |
@@ -51,8 +50,8 @@ jobs:
           unzip -n *.zip && rm *.zip
 
           mkdir -p release/logdk-x86_64-linux-gnu/
-          zig build -Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2 -Doptimize=ReleaseFast -p release/logdk-x86_64-linux-gnu/
-          mv libduckdb.so release/logdk-x86_64-linux-gnu/
+          zig build -Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2 -Doptimize=ReleaseFast
+          mv libduckdb.so zig-out/bin/logdk release/logdk-x86_64-linux-gnu/
 
           cd release
           tar -cJf logdk-x86_64-linux-gnu.tar.xz logdk-x86_64-linux-gnu
@@ -63,8 +62,8 @@ jobs:
           unzip -n *.zip && rm *.zip
 
           mkdir -p release/logdk-aarch64-macos/
-          zig build -Dtarget=aarch64-macos -Doptimize=ReleaseFast -p release/logdk-aarch64-macos/
-          cp libduckdb.dylib release/logdk-aarch64-macos/
+          zig build -Dtarget=aarch64-macos -Doptimize=ReleaseFast
+          cp libduckdb.dylib zig-out/bin/logdk release/logdk-aarch64-macos/
 
           cd release
           tar -cJf logdk-aarch64-macos.tar.xz logdk-aarch64-macos
@@ -72,8 +71,8 @@ jobs:
       - name: x86_64-macos
         run: |
           mkdir -p release/logdk-x86_64-macos/
-          zig build -Dtarget=x86_64-macos -Doptimize=ReleaseFast -p release/logdk-x86_64-macos/
-          mv libduckdb.dylib release/logdk-x86_64-macos/
+          zig build -Dtarget=x86_64-macos -Doptimize=ReleaseFast
+          mv libduckdb.dylib zig-out/bin/logdk release/logdk-x86_64-macos/
 
           cd release
           tar -cJf logdk-x86_64-macos.tar.xz logdk-x86_64-macos
@@ -84,11 +83,11 @@ jobs:
           unzip -n *.zip && rm *.zip
 
           mkdir -p release/logdk-x86_64-windows/
-          zig build -Dtarget=x86_64-windows -Doptimize=ReleaseFast -p release/logdk-x86_64-windows/
-          mv duckdb.dll release/logdk-x86_64-windows/
+          zig build -Dtarget=x86_64-windows -Doptimize=ReleaseFast
+          mv duckdb.dll zig-out/bin/logdk release/logdk-x86_64-windows/
 
           cd release
-          tar -cJf logdk-x86_64-windows.tar.xz logdk-x86_64-windows
+          tar -cJf logdk-x86_64-windows-gnu.tar.xz logdk-x86_64-windows
 
       - name: release
         uses: softprops/action-gh-release@v1

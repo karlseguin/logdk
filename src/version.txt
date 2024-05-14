@@ -1,1 +1,3 @@
-local-dev
+commit: local-dev
+zig: local-dev
+ui: local-dev
