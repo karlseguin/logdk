@@ -14,8 +14,6 @@ pub fn build(b: *std.Build) !void {
 	defer modules.deinit();
 
 	const dep_opts = .{.target = target, .optimize = optimize};
-	const static_link = b.option(bool, "static", "static link duckdb") orelse false;
-
 	try modules.put("httpz", b.dependency("httpz", dep_opts).module("httpz"));
 	try modules.put("typed", b.dependency("typed", dep_opts).module("typed"));
 	try modules.put("metrics", b.dependency("metrics", dep_opts).module("metrics"));
@@ -25,27 +23,9 @@ pub fn build(b: *std.Build) !void {
 	const zuckdb = b.dependency("zuckdb", dep_opts).module("zuckdb");
 	try modules.put("zuckdb",  zuckdb);
 
-	// try modules.put("zuckdb", b.addModule("zuckdb", .{
-	// 	.root_source_file = b.path("lib/zuckdb.zig/src/zuckdb.zig"),
-	// }));
-	// const zuckdb = modules.get("zuckdb").?;
-
-	// try modules.put("validate", b.addModule("validate", .{
-	// 	.root_source_file = b.path("lib/validate.zig/src/validate.zig"),
-	// 	.imports = &.{
-	// 		.{.name = "typed", .module = modules.get("typed").?},
-	// 		// .{.name = "metrics", .module = b.addModule("metrics", .{.root_source_file = .{.path = "lib/metrics.zig/src/metrics.zig"}})},
-	// 	},
-	// }));
-	// try modules.put("httpz", b.addModule("httpz", .{
-	// 	.root_source_file = b.path("lib/http.zig/src/httpz.zig"),
-	// 	.imports = &.{
-	// 		.{.name = "metrics", .module = modules.get("metrics").?},
-	// 		.{.name = "websocket", .module = b.addModule("websocket", .{.root_source_file = .{.path = "lib/websocket.zig/src/websocket.zig"}})},
-	// 	},
-	// }));
-
-	zuckdb.addIncludePath(b.path("lib"));
+	zuckdb.addRPathSpecial(".");
+	zuckdb.addIncludePath(b.path("."));
+	zuckdb.addLibraryPath(b.path("."));
 
 	// setup executable
 	const exe = b.addExecutable(.{
@@ -54,7 +34,7 @@ pub fn build(b: *std.Build) !void {
 		.target = target,
 		.optimize = optimize,
 	});
-	try addLibs(exe, modules, static_link);
+	try addLibs(exe, modules);
 	try addUIFiles(allocator, b, exe);
 	b.installArtifact(exe);
 
@@ -75,7 +55,7 @@ pub fn build(b: *std.Build) !void {
 		.test_runner = b.path("test_runner.zig"),
 	});
 
-	try addLibs(tests, modules, static_link);
+	try addLibs(tests, modules);
 	try addUIFiles(allocator, b, tests);
 	const run_test = b.addRunArtifact(tests);
 	run_test.has_side_effects = true;
@@ -84,20 +64,14 @@ pub fn build(b: *std.Build) !void {
 	test_step.dependOn(&run_test.step);
 }
 
-fn addLibs(c: *std.Build.Step.Compile, modules: ModuleMap, static_link: bool) !void {
+fn addLibs(c: *std.Build.Step.Compile, modules: ModuleMap) !void {
 	var it = modules.iterator();
 	while (it.next()) |m| {
 		c.root_module.addImport(m.key_ptr.*, m.value_ptr.*);
 	}
 
 	c.linkLibC();
-	if (static_link) {
-		c.linkSystemLibrary("stdc++");
-	} else {
-		c.addRPath(c.step.owner.path("lib"));
-	}
 	c.linkSystemLibrary("duckdb");
-	c.addLibraryPath(c.step.owner.path("lib"));
 }
 
 fn addUIFiles(allocator: Allocator, b: *std.Build, c: *std.Build.Step.Compile) !void {
@@ -131,7 +105,6 @@ fn addUIFilesFrom(allocator: Allocator, c: *std.Build.Step.Compile, root: []cons
 					.compressed = compressed,
 					.content = try dir.readFileAlloc(allocator, file.name, 1_048_576),
 				});
-				// c.root_module.addAnonymousImport(name, .{.root_source_file = c.step.owner.path(name)});
 			},
 			else => unreachable,
 		}
@@ -143,3 +116,24 @@ pub const StaticFile = struct {
 	compressed: bool,
 	content: []const u8,
 };
+
+
+	// try modules.put("zuckdb", b.addModule("zuckdb", .{
+	// 	.root_source_file = b.path("lib/zuckdb.zig/src/zuckdb.zig"),
+	// }));
+	// const zuckdb = modules.get("zuckdb").?;
+
+	// try modules.put("validate", b.addModule("validate", .{
+	// 	.root_source_file = b.path("lib/validate.zig/src/validate.zig"),
+	// 	.imports = &.{
+	// 		.{.name = "typed", .module = modules.get("typed").?},
+	// 		// .{.name = "metrics", .module = b.addModule("metrics", .{.root_source_file = .{.path = "lib/metrics.zig/src/metrics.zig"}})},
+	// 	},
+	// }));
+	// try modules.put("httpz", b.addModule("httpz", .{
+	// 	.root_source_file = b.path("lib/http.zig/src/httpz.zig"),
+	// 	.imports = &.{
+	// 		.{.name = "metrics", .module = modules.get("metrics").?},
+	// 		.{.name = "websocket", .module = b.addModule("websocket", .{.root_source_file = .{.path = "lib/websocket.zig/src/websocket.zig"}})},
+	// 	},
+	// }));

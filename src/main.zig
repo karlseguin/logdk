@@ -20,12 +20,13 @@ pub fn main() !void {
 		_ = gpa.detectLeaks();
 	};
 
-	try std.posix.sigaction(std.posix.SIG.INT, &.{
-		.handler = .{.handler = sigint},
-		.mask = std.posix.empty_sigset,
-		.flags = 0,
-	}, null);
-
+	if (comptime builtin.os.tag != .windows) {
+		try std.posix.sigaction(std.posix.SIG.INT, &.{
+			.handler = .{.handler = sigint},
+			.mask = std.posix.empty_sigset,
+			.flags = 0,
+		}, null);
+	}
 
 	// Some data exists for the entire lifetime of the project. We could just
 	// use the gpa allocator, but if we don't properly clean it up, it'll cause
