@@ -35,8 +35,11 @@ pub fn main() !void {
 	defer arena.deinit();
 	const aa = arena.allocator();
 
-	// can discard the managed value since it was created with our ArenaAllocator
-	const config = (try parseArgs(aa)).value;
+	const config = loadConfig(aa) catch |err| {
+		std.log.err("Failed to read config file: {}", .{err});
+		std.process.exit(1);
+	};
+
 	try logz.setup(allocator, config.logger);
 	defer logz.deinit();
 
@@ -55,7 +58,7 @@ pub fn main() !void {
 	logz.info().ctx("shutdown").log();
 }
 
-fn parseArgs(allocator: Allocator) !zul.Managed(logdk.Config) {
+fn loadConfig(allocator: Allocator) !logdk.Config {
 	var args = try zul.CommandLineArgs.parse(allocator);
 	defer args.deinit();
 
@@ -64,7 +67,32 @@ fn parseArgs(allocator: Allocator) !zul.Managed(logdk.Config) {
 		std.posix.exit(0);
 	}
 
-	return zul.fs.readJson(logdk.Config, allocator, args.get("config") orelse "config.json", .{});
+	var config_file: []const u8 = undefined;
+	var explicit_config_file: bool = undefined;
+
+	if (args.get("config")) |cf| {
+		config_file = cf;
+		explicit_config_file = true;
+	} else {
+		config_file = "config.json";
+		explicit_config_file = false;
+	}
+
+	const managed = zul.fs.readJson(logdk.Config, allocator, config_file, .{}) catch |err| switch (err) {
+		error.FileNotFound => {
+			if (explicit_config_file == true) {
+				return err;
+			}
+			// this means no config file was specified and we just tried config.json
+			// let's start up with sane defaults.
+			return Config{};
+		},
+		else => return err,
+	};
+
+	// it's ok to discard the managed value, because we know Allocator comes
+	// from an Arena which main will cleanup.
+	return managed.value;
 }
 
 fn sigint(_: c_int) callconv(.C) void {
