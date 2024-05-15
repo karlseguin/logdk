@@ -18,7 +18,7 @@ pub fn writePaging(writer: anytype, page: u16, limit: u16) !void {
 	try std.fmt.format(writer, " limit {d} offset {d}", .{limit, offset});
 }
 
-pub fn writeRows(res: *httpz.Response, rows: *zuckdb.Rows, buf: *zul.StringBuilder, logger: logz.Logger) !void {
+pub fn writeRows(res: *httpz.Response, rows: *zuckdb.Rows, buf: *zul.StringBuilder, logger: logz.Logger) !usize {
 	res.content_type = .JSON;
 	const writer = buf.writer();
 	const vectors = rows.vectors;
@@ -38,28 +38,24 @@ pub fn writeRows(res: *httpz.Response, rows: *zuckdb.Rows, buf: *zul.StringBuild
 	}
 	buf.truncate(1);
 
-	if (try rows.next()) |first_row| {
-		try buf.write("],\n \"rows\": [");
+	try buf.write("],\n \"rows\": [");
+	const first_row = (try rows.next()) orelse return 0;
 
-		try buf.write("\n  [");
-		try writeRow(&first_row, buf, vectors, logger);
+	try buf.write("\n  [");
+	try writeRow(&first_row, buf, vectors, logger);
 
-		var row_count: usize = 1;
-		while (try rows.next()) |row| {
-			buf.writeAssumeCapacity("],\n  [");
-			try writeRow(&row, buf, vectors, logger);
-			if (row_count == 19) {
-				try res.chunk(buf.string());
-				buf.clearRetainingCapacity();
-				row_count = 0;
-			} else {
-				row_count += 1;
-			}
+	var row_count: usize = 1;
+	while (try rows.next()) |row| {
+		buf.writeAssumeCapacity("],\n  [");
+		try writeRow(&row, buf, vectors, logger);
+		if (@mod(row_count, 50) == 0) {
+			try res.chunk(buf.string());
+			buf.clearRetainingCapacity();
 		}
-		try buf.writeByte(']');
-	} else {
-		try buf.write("],\"rows\":[");
+		row_count += 1;
 	}
+	try buf.writeByte(']');
+	return row_count;
 }
 
 fn writeRow(row: *const zuckdb.Row, buf: *zul.StringBuilder, vectors: []zuckdb.Vector, logger: logz.Logger) !void {

@@ -22,38 +22,21 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 	const include_total = input.get("total").?.bool;
 
 	// we're going to wrap this in a CTE, so need to strip out any trailing comma
-	const sql = stripTrailingSemicolon(input.get("sql").?.string);
+	// and we might as well strip out whitespace too
+	const sql = normalize(input.get("sql").?.string);
 
 	var app = env.app;
-	const query = try app.buffers.acquire();
-	defer query.release();
-
-	// + 100 because we wrap the SQL in a CTE and add paging
-	try query.ensureTotalCapacity(sql.len + 100);
-	query.writeAssumeCapacity("with ldk as(");
-	query.writeAssumeCapacity(sql);
-	query.writeAssumeCapacity(") select ");
-
-	// This position marks the spot where we can change the nature of the query.
-	// Initially we'll finish the query off with:
-	//   * from ldk limit X offset Y
-	// But, if "total=true" in the querystring, we'll issue another query, that'll
-	// finish with:
-	//    count(*) from ldk"
-	// So by marking this spot where the two queries will diverge, we're able
-	// to re-use the chunk of buf we've written up until this point
-	const magic_buf_pos = query.len();
-
-	query.writeAssumeCapacity("* from ldk");
-	try logdk.hrm.writePaging(query.writer(), page, limit);
-
-	// we can't re-use the query buf, because we might need it, intact, to get
-	// total count
-	const buf = try app.buffers.acquire();
-	defer buf.release();
 
 	var conn = try app.db.acquire();
 	defer conn.release();
+
+	// selects get wrapped in a CTE, so we can enforce paging, but we might have
+	// to skip the CTE in some cases, since DuckDB is pretty limited in what
+	// it allows in a CTE.
+	var escape_cte = false;
+
+	// see where this is set for a description
+	var magic_buf_pos: usize = 0;
 
 	{
 		// Check if (a) the provided SQL is valid and (b) is a read-onl statement.
@@ -84,7 +67,8 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 		};
 		defer stmt.deinit();
 		switch (stmt.statementType()) {
-			.select, .explain => {},
+			.select => escape_cte = escapeCTE(sql),
+			.explain => escape_cte = true,
 			else => {
 				_ = web.errors.IllegalDBWrite.write(res);
 				return;
@@ -92,7 +76,38 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 		}
 	}
 
-	{
+	const query = try app.buffers.acquire();
+	defer query.release();
+
+	// + 100 because we wrap the SQL in a CTE and add paging
+	try query.ensureTotalCapacity(sql.len + 100);
+	if (escape_cte == true) {
+		query.writeAssumeCapacity(sql);
+	} else {
+		query.writeAssumeCapacity("with ldk as(");
+		query.writeAssumeCapacity(sql);
+		query.writeAssumeCapacity(") select ");
+
+		// This position marks the spot where we can change the nature of the query.
+		// Initially we'll finish the query off with:
+		//   * from ldk limit X offset Y
+		// But, if "total=true" in the querystring, we'll issue another query, that'll
+		// finish with:
+		//    count(*) from ldk"
+		// So by marking this spot where the two queries will diverge, we're able
+		// to re-use the chunk of buf we've written up until this point
+		magic_buf_pos = query.len();
+
+		query.writeAssumeCapacity("* from ldk");
+		try logdk.hrm.writePaging(query.writer(), page, limit);
+	}
+
+	// we can't re-use the query buf, because we might need it, intact, to get
+	// total count
+	const buf = try app.buffers.acquire();
+	defer buf.release();
+
+	var row_count = blk: {
 		var stmt = conn.prepare(try query.stringZ(), .{}) catch |err| {
 			// This should not be possible, since we already prepared the query above
 			// All we've done is wrapped it in a CTE, which should not fail.
@@ -106,22 +121,27 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 		};
 		defer rows.deinit();
 
-		try logdk.hrm.writeRows(res, &rows, buf, env.logger);
-	}
+		break :blk try logdk.hrm.writeRows(res, &rows, buf, env.logger);
+	};
 
 	if (include_total) {
-		query.pos = magic_buf_pos;
-		query.writeAssumeCapacity("count(*) from ldk");
-		var row = conn.row(try query.stringZ(), .{}) catch |err| {
-			// don't use web.invalidSQL here for two reasons
-			// 1 - the response is already partially written
-			// 2 - this isn't a user/sql error, it shouldn't be possible for this to fail
-			return env.dbErr("exec.count", err, conn);
-		} orelse unreachable;
-		defer row.deinit();
-
+		if (escape_cte == false) {
+			// The row_count we have so far, is only the # of rows we sent in the
+			// response. But if we used a CTE, which we do in most cases, we need
+			// to do a select count(*) to get the real row count
+			query.pos = magic_buf_pos;
+			query.writeAssumeCapacity("count(*) from ldk");
+			var row = conn.row(try query.stringZ(), .{}) catch |err| {
+				// don't use web.invalidSQL here for two reasons
+				// 1 - the response is already partially written
+				// 2 - this isn't a user/sql error, it shouldn't be possible for this to fail
+				return env.dbErr("exec.count", err, conn);
+			} orelse unreachable;
+			defer row.deinit();
+			row_count = @intCast(row.get(i64, 0));
+		}
 		try buf.write("\n ],\n \"total\": ");
-		try std.fmt.formatInt(row.get(i64, 0), 10, .lower, .{}, buf.writer());
+		try std.fmt.formatInt(row_count, 10, .lower, .{}, buf.writer());
 		try buf.write("\n}");
 	} else {
 		try buf.write("\n]\n}");
@@ -130,19 +150,54 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 	try res.chunk(buf.string());
 }
 
-fn stripTrailingSemicolon(sql: []const u8) []const u8 {
-	var i : usize = sql.len-1;
-	while (i >= 0) : (i -= 1) {
-		if (!std.ascii.isWhitespace(sql[i])) break;
+fn normalize(sql: []const u8) []const u8 {
+	var start: usize = 0;
+	while (start < sql.len) : (start += 1) {
+		if (std.ascii.isWhitespace(sql[start]) == false) {
+			break;
+		}
 	}
 
-	while (i >= 0) : (i -= 1) {
-		if (sql[i] != ';') break;
+	var end: usize = sql.len - 1;
+	while (end >= 0) : (end -= 1) {
+		const c = sql[end];
+		if (std.ascii.isWhitespace(c) == false and c != ';') {
+			break;
+		}
 	}
-	return sql[0..i+1];
+
+	return sql[start..end+1];
+}
+
+// https://github.com/duckdb/duckdb/issues/12060
+fn escapeCTE(sql: []const u8) bool {
+	// DuckDB defines some statements as a "select", even though it can't
+	// be used in a CTE. That seems a bit inconsistent to me. I hate this
+	// code, because it provides a potential way to escape our CTE, but...I want
+	// to allow these statements.
+
+	// leading whitespace was already removed by normalize
+
+	var end: usize = 0;
+	while (end < sql.len) : (end += 1) {
+		if (std.ascii.isWhitespace(sql[end]) == true) {
+			break;
+		}
+	}
+
+	const token = sql[0..end];
+	const eql = std.ascii.eqlIgnoreCase;
+	return (eql(token, "describe") or eql(token, "show"));
 }
 
 const t = logdk.testing;
+test "exec: normalize" {
+	try t.expectEqual("abc", normalize("abc"));
+	try t.expectEqual("abc", normalize(" abc "));
+	try t.expectEqual("abc", normalize("\t \n abc\n\n\t "));
+	try t.expectEqual("abc", normalize("\t \n abc;\n\n;\t "));
+
+}
 test "exec: validation" {
 	var tc = t.context(.{});
 	defer tc.deinit();
@@ -164,10 +219,45 @@ test "exec: invalid SQL" {
 	var tc = t.context(.{});
 	defer tc.deinit();
 
-	tc.web.query("sql", "a" ** 5000);
-	try handler(tc.env(), tc.web.req, tc.web.res);
-	try tc.web.expectStatus(400);
-	try tc.web.expectJson(.{.code = logdk.codes.INVALID_SQL});
+	{
+		tc.web.query("sql", "a" ** 5000);
+		try handler(tc.env(), tc.web.req, tc.web.res);
+		try tc.web.expectStatus(400);
+		try tc.web.expectJson(.{.code = logdk.codes.INVALID_SQL});
+	}
+
+	{
+		// multi-statement
+		tc.reset();
+		tc.web.query("sql", "select 1; delete from logdk.datasets");
+		try handler(tc.env(), tc.web.req, tc.web.res);
+		try tc.web.expectStatus(400);
+		try tc.web.expectJson(.{.code = logdk.codes.INVALID_SQL});
+	}
+}
+
+test "exec: non-select readonly" {
+	var tc = t.context(.{});
+	defer tc.deinit();
+
+	try tc.exec("create table data (id integer, name text)", .{});
+
+	{
+		tc.web.query("sql", "describe");
+		try handler(tc.env(), tc.web.req, tc.web.res);
+		try tc.web.expectJson(.{
+			.cols = &[_][]const u8{"database","schema","name","column_names","column_types","temporary"},
+		});
+	}
+
+	{
+		tc.reset();
+		tc.web.query("sql", "show data");
+		try handler(tc.env(), tc.web.req, tc.web.res);
+		try tc.web.expectJson(.{
+			.cols = &[_][]const u8{"column_name","column_type","null","key","default","extra"},
+		});
+	}
 }
 
 test "exec: can't mutate" {

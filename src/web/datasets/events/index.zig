@@ -187,7 +187,7 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 		};
 		defer rows.deinit();
 
-		try logdk.hrm.writeRows(res, &rows, buf, env.logger);
+		_ = try logdk.hrm.writeRows(res, &rows, buf, env.logger);
 	}
 
 	if (include_total) {
