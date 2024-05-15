@@ -9,6 +9,6 @@ pub fn handler(env: *logdk.Env, _: *httpz.Request, res: *httpz.Response) !void {
 }
 
 fn releasePayload(state: *anyopaque) void {
-	const describe: logdk.Meta.Payload = @alignCast(@ptrCast(state));
+	const describe: logdk.Meta.DescribeValue = @alignCast(@ptrCast(state));
 	describe.release();
 }
