@@ -74,20 +74,30 @@ fn validateFilter(opt_value: ?typed.Array, context: *logdk.Validate.Context) !?t
 		}
 	};
 
-	const expected_value_count = switch (op) {
-		.e, .n, .l, .le, .g, .ge, .rel => 1,
-	};
+	// 1st array item is the column
+	// 2nd array item is the operator
+	// everything after that are values
+	const number_of_values = items.len - 2;
 
-	// +1 for the column name, +1 for the operator
-	const expected_filter_length = 2 + expected_value_count;
+	const min_value_count: usize = 1;
+	var max_value_count: usize = 1;
+	switch (op) {
+		.e, .n, .l, .le, .g, .ge, .rel, => {},
+		.in => max_value_count = number_of_values,
+	}
 
 	context.arrayIndex(2);
-	if (items.len != expected_filter_length) {
-		const plural = if (expected_filter_length == 1) "" else "s";
+
+	if (number_of_values < min_value_count or number_of_values > max_value_count ) {
 		try context.add(.{
 			.code = logdk.Validate.INVALID_FILTER_VALUE_COUNT,
-			.data = try context.dataBuilder().put("length", expected_value_count).done(),
-			.err = try std.fmt.allocPrint(context.allocator, "must have {d} value{s}", .{expected_value_count, plural}),
+			.data = try context.dataBuilder().put("min", min_value_count).put("max", max_value_count).done(),
+			.err = if (min_value_count == max_value_count) blk: {
+				const plural = if (min_value_count == 1) "" else "s";
+				break :blk try std.fmt.allocPrint(context.allocator, "must have {d} value{s}", .{min_value_count, plural});
+			} else blk: {
+				break :blk try std.fmt.allocPrint(context.allocator, "must have between {d} and {d} values", .{min_value_count, max_value_count});
+			},
 		});
 		return null;
 	}
@@ -248,6 +258,7 @@ const QueryBuilder = struct {
 		g,
 		ge,
 		rel,
+		in,
 	};
 
 	const RelativeTime = enum {
@@ -372,6 +383,15 @@ const QueryBuilder = struct {
 				.ge => {
 					try buf.write(" >= ");
 					try self.writePlaceHolderFor(filter[2]);
+				},
+				.in => {
+					try buf.write(" in (");
+					for (filter[2..]) |v| {
+						try self.writePlaceHolderFor(v);
+						try buf.writeByte(',');
+					}
+					buf.truncate(1);
+					try buf.writeByte(')');
 				},
 				.rel => {
 					switch (filter[2]) {
@@ -810,6 +830,33 @@ test "events.index: filter simple" {
 		try t.expectEqual(2, rows[0].array.items[2].i64);
 		try t.expectEqual(3, rows[1].array.items[2].i64);
 		try t.expectEqual(5, rows[2].array.items[2].i64);
+	}
+
+	{
+		// single-value in
+		tc.reset();
+		tc.web.param("name", "events");
+		tc.web.query("filters", "[[\"x\", \"in\", 4]]");
+		tc.web.query("order", "x");
+		try handler(tc.env(), tc.web.req, tc.web.res);
+		const res = try typed.fromJson(tc.arena, try tc.web.getJson());
+		const rows = res.map.get("rows").?.array.items;
+		try t.expectEqual(1, rows.len);
+		try t.expectEqual(4, rows[0].array.items[2].i64);
+	}
+
+	{
+		// in
+		tc.reset();
+		tc.web.param("name", "events");
+		tc.web.query("filters", "[[\"x\", \"in\", 2, 3]]");
+		tc.web.query("order", "x");
+		try handler(tc.env(), tc.web.req, tc.web.res);
+		const res = try typed.fromJson(tc.arena, try tc.web.getJson());
+		const rows = res.map.get("rows").?.array.items;
+		try t.expectEqual(2, rows.len);
+		try t.expectEqual(2, rows[0].array.items[2].i64);
+		try t.expectEqual(3, rows[1].array.items[2].i64);
 	}
 }
 
