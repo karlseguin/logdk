@@ -106,33 +106,31 @@ fn translateScalar(src: anytype, column_type: zuckdb.Vector.Type.Scalar, i: usiz
 			zuckdb.c.DUCKDB_TYPE_VARCHAR => try std.json.encodeJsonString(src.get([]const u8, i), .{}, writer),
 			zuckdb.c.DUCKDB_TYPE_BOOLEAN => try writer.writeAll(if (src.get(bool, i)) "true" else "false"),
 			zuckdb.c.DUCKDB_TYPE_TINYINT => try std.fmt.formatInt(src.get(i8, i), 10, .lower, .{}, writer),
-			zuckdb.c.DUCKDB_TYPE_SMALLINT  => try std.fmt.formatInt(src.get(i16, i), 10, .lower, .{}, writer),
-			zuckdb.c.DUCKDB_TYPE_INTEGER  => try std.fmt.formatInt(src.get(i32, i), 10, .lower, .{}, writer),
-			zuckdb.c.DUCKDB_TYPE_BIGINT  => try std.fmt.formatInt(src.get(i64, i), 10, .lower, .{}, writer),
-			zuckdb.c.DUCKDB_TYPE_HUGEINT  => try std.fmt.formatInt(src.get(i128, i), 10, .lower, .{}, writer),
-			zuckdb.c.DUCKDB_TYPE_UTINYINT  => try std.fmt.formatInt(src.get(u8, i), 10, .lower, .{}, writer),
-			zuckdb.c.DUCKDB_TYPE_USMALLINT  => try std.fmt.formatInt(src.get(u16, i), 10, .lower, .{}, writer),
-			zuckdb.c.DUCKDB_TYPE_UINTEGER  => try std.fmt.formatInt(src.get(u32, i), 10, .lower, .{}, writer),
-			zuckdb.c.DUCKDB_TYPE_UBIGINT  => try std.fmt.formatInt(src.get(u64, i), 10, .lower, .{}, writer),
-			zuckdb.c.DUCKDB_TYPE_UHUGEINT  => try std.fmt.formatInt(src.get(u128, i), 10, .lower, .{}, writer),
-			zuckdb.c.DUCKDB_TYPE_FLOAT  => try std.fmt.format(writer, "{d}", .{src.get(f32, i)}),
-			zuckdb.c.DUCKDB_TYPE_DOUBLE  => try std.fmt.format(writer, "{d}", .{src.get(f64, i)}),
-			zuckdb.c.DUCKDB_TYPE_UUID  => try std.json.encodeJsonString(&src.get(zuckdb.UUID, i), .{}, writer),
-			zuckdb.c.DUCKDB_TYPE_DATE  => {
+			zuckdb.c.DUCKDB_TYPE_SMALLINT => try std.fmt.formatInt(src.get(i16, i), 10, .lower, .{}, writer),
+			zuckdb.c.DUCKDB_TYPE_INTEGER => try std.fmt.formatInt(src.get(i32, i), 10, .lower, .{}, writer),
+			zuckdb.c.DUCKDB_TYPE_BIGINT => try std.fmt.formatInt(src.get(i64, i), 10, .lower, .{}, writer),
+			zuckdb.c.DUCKDB_TYPE_HUGEINT => try std.fmt.formatInt(src.get(i128, i), 10, .lower, .{}, writer),
+			zuckdb.c.DUCKDB_TYPE_UTINYINT => try std.fmt.formatInt(src.get(u8, i), 10, .lower, .{}, writer),
+			zuckdb.c.DUCKDB_TYPE_USMALLINT => try std.fmt.formatInt(src.get(u16, i), 10, .lower, .{}, writer),
+			zuckdb.c.DUCKDB_TYPE_UINTEGER => try std.fmt.formatInt(src.get(u32, i), 10, .lower, .{}, writer),
+			zuckdb.c.DUCKDB_TYPE_UBIGINT => try std.fmt.formatInt(src.get(u64, i), 10, .lower, .{}, writer),
+			zuckdb.c.DUCKDB_TYPE_UHUGEINT => try std.fmt.formatInt(src.get(u128, i), 10, .lower, .{}, writer),
+			zuckdb.c.DUCKDB_TYPE_FLOAT => try std.fmt.format(writer, "{d}", .{src.get(f32, i)}),
+			zuckdb.c.DUCKDB_TYPE_DOUBLE => try std.fmt.format(writer, "{d}", .{src.get(f64, i)}),
+			zuckdb.c.DUCKDB_TYPE_UUID => try std.json.encodeJsonString(&src.get(zuckdb.UUID, i), .{}, writer),
+			zuckdb.c.DUCKDB_TYPE_DATE => {
+				// std.fmt's integer formatting isn't great. If we specify a padding, it
+				// always inserts the sign. Until that's fixed, we do this hack
+				// https://github.com/ziglang/zig/issues/19488
 				const date = src.get(zuckdb.Date, i);
-				try std.json.stringify(.{
-					.year = date.year,
-					.month = date.month,
-					.day = date.day,
-				}, .{}, writer);
+				try std.fmt.format(writer, "\"{d}-{s}-{s}\"", .{date.year, paddingTwoDigits(date.month), paddingTwoDigits(date.day)});
 			},
-			zuckdb.c.DUCKDB_TYPE_TIME, zuckdb.c.DUCKDB_TYPE_TIME_TZ => {
+			zuckdb.c.DUCKDB_TYPE_TIME => {
+				// std.fmt's integer formatting isn't great. If we specify a padding, it
+				// always inserts the sign. Until that's fixed, we do this hack
+				// https://github.com/ziglang/zig/issues/19488
 				const time = src.get(zuckdb.Time, i);
-				try std.json.stringify(.{
-					.hour = time.hour,
-					.min = time.min,
-					.sec = time.sec,
-				}, .{}, writer);
+				try std.fmt.format(writer, "\"{s}:{s}:{s}\"", .{paddingTwoDigits(time.hour), paddingTwoDigits(time.min), paddingTwoDigits(time.sec)});
 			},
 			zuckdb.c.DUCKDB_TYPE_TIMESTAMP, zuckdb.c.DUCKDB_TYPE_TIMESTAMP_TZ  => try std.fmt.formatInt(src.get(i64, i), 10, .lower, .{}, writer),
 			else => |duckdb_type| {
@@ -152,4 +150,14 @@ fn writeVarcharType(result: *zuckdb.c.duckdb_result, column_index: usize, buf: *
 	}
 	defer zuckdb.c.duckdb_free(alias);
 	return buf.write(std.mem.span(alias));
+}
+
+fn paddingTwoDigits(value: i8) [2]u8 {
+	std.debug.assert(value < 61 and value > 0);
+	const digits = "0001020304050607080910111213141516171819" ++
+		"2021222324252627282930313233343536373839" ++
+		"4041424344454647484950515253545556575859" ++
+		"60";
+	const index: usize = @intCast(value);
+	return digits[index * 2 ..][0..2].*;
 }

@@ -51,6 +51,7 @@ pub const Event = struct {
 		date,
 		time,
 		timestamp,
+		uuid,
 	};
 
 	pub const Value = union(DataType) {
@@ -75,6 +76,12 @@ pub const Event = struct {
 		date: zuckdb.Date,
 		time: zuckdb.Time,
 		timestamp: i64,
+
+		// we store this direclty as an i128 (which is what we insert into the appender)
+		// because we parse this from a string using `zuckdb.encodeUUID` and that's
+		// what it gives us. We could store the []const u8, but then we'd end up
+		// parsing it twice: once to see if it IS a uuid and then once to store it.
+		uuid: i128,
 
 		pub const List = struct {
 			json: []const u8,
@@ -379,6 +386,12 @@ fn tryParseValue(s: []const u8) ?Event.Value {
 	if (s.len == 0) return null;
 
 	if (s.len >= 20) {
+		// this does its own length check, but we put it in the >= 20 since it'll
+		// avoid the function call for common short strings
+		if (zuckdb.encodeUUID(s)) |v| {
+			return .{.uuid = v};
+		} else |_| {}
+
 		if (zul.DateTime.parse(s, .rfc3339)) |v| {
 			return .{.timestamp = v.unix(.microseconds)};
 		} else |_| {}
@@ -635,7 +648,11 @@ test "Event: tryParse string" {
 	try t.expectEqual(.{.hour = 10, .min = 22, .sec = 0, .micros = 0}, testTryParseString("10:22").?.time);
 	try t.expectEqual(.{.hour = 15, .min = 3, .sec = 59, .micros = 123456}, testTryParseString("15:03:59.123456").?.time);
 	try t.expectEqual(1737385439123456, testTryParseString("2025-01-20T15:03:59.123456Z").?.timestamp);
+
+	try t.expectEqual(-119391408245701198339858421598325797365, testTryParseString("262e0d19-d9d8-4892-8fe1-e421fe188e0b").?.uuid);
+	try t.expectEqual(-119391408245701198339858421598325797365, testTryParseString("262E0D19-D9D8-4892-8FE1-E421FE188E0B").?.uuid);
 }
+
 
 test "Event: tryParse list" {
 	{

@@ -624,6 +624,7 @@ pub const DataType = enum {
 	date,
 	time,
 	timestamptz,
+	uuid,
 	unknown,
 };
 
@@ -644,6 +645,7 @@ fn columnTypeFromEventScalar(event_type: Event.DataType) DataType {
 		.date => .date,
 		.time => .time,
 		.timestamp => .timestamptz,
+		.uuid => .uuid,
 		.null => .unknown,
 		.list => unreachable,
 	};
@@ -694,7 +696,7 @@ fn compatibleDataType(column_type: DataType, value: Event.Value) DataType {
 			.usmallint => |v| return if (v <= 32767) .smallint else .integer,
 			.uinteger => |v| return if (v <= 2147483647) .integer else .bigint,
 			.ubigint => |v| return if (v <= 9223372036854775807) .bigint else .varchar,
-			.string, .bool, .date, .time, .timestamp => return .varchar,
+			.string, .bool, .date, .time, .timestamp, .uuid => return .varchar,
 			.json => return .json,
 			.list => unreachable,
 		},
@@ -707,7 +709,7 @@ fn compatibleDataType(column_type: DataType, value: Event.Value) DataType {
 			.tinyint, .smallint => return .smallint,
 			.integer => return .integer,
 			.bigint => return .bigint,
-			.string, .bool, .date, .time, .timestamp => return .varchar,
+			.string, .bool, .date, .time, .timestamp, .uuid => return .varchar,
 			.json => return .json,
 			.list => unreachable,
 		},
@@ -719,7 +721,7 @@ fn compatibleDataType(column_type: DataType, value: Event.Value) DataType {
 			.usmallint => |v| return if (v <= 32767) .smallint else .integer,
 			.uinteger => |v| return if (v <= 2147483647) .integer else .bigint,
 			.ubigint => |v| return if (v <= 9223372036854775807) .bigint else .varchar,
-			.string, .bool, .date, .time, .timestamp => return .varchar,
+			.string, .bool, .date, .time, .timestamp, .uuid => return .varchar,
 			.json => return .json,
 			.list => unreachable,
 		},
@@ -730,7 +732,7 @@ fn compatibleDataType(column_type: DataType, value: Event.Value) DataType {
 			.double => return .double,
 			.tinyint, .smallint, .integer => return .integer,
 			.bigint => return .bigint,
-			.string, .bool, .date, .time, .timestamp => return .varchar,
+			.string, .bool, .date, .time, .timestamp, .uuid => return .varchar,
 			.json => return .json,
 			.list => unreachable,
 		},
@@ -740,7 +742,7 @@ fn compatibleDataType(column_type: DataType, value: Event.Value) DataType {
 			.double => return .double,
 			.uinteger => |v| return if (v <= 2147483647) .integer else .bigint,
 			.ubigint => |v| return if (v <= 9223372036854775807) .bigint else .varchar,
-			.string, .bool, .date, .time, .timestamp => return .varchar,
+			.string, .bool, .date, .time, .timestamp, .uuid => return .varchar,
 			.json => return .json,
 			.list => unreachable,
 		},
@@ -749,7 +751,7 @@ fn compatibleDataType(column_type: DataType, value: Event.Value) DataType {
 			.ubigint => return .ubigint,
 			.double => return .double,
 			.tinyint, .smallint, .integer, .bigint => return .bigint,
-			.string, .bool, .date, .time, .timestamp => return .varchar,
+			.string, .bool, .date, .time, .timestamp, .uuid => return .varchar,
 			.json => return .json,
 			.list => unreachable,
 		},
@@ -757,7 +759,7 @@ fn compatibleDataType(column_type: DataType, value: Event.Value) DataType {
 			.null, .utinyint, .tinyint, .smallint, .usmallint, .integer, .uinteger, .bigint => return .bigint,
 			.double => return .double,
 			.ubigint => |v| return if (v <= 9223372036854775807) .bigint else .varchar,
-			.string, .bool, .date, .time, .timestamp => return .varchar,
+			.string, .bool, .date, .time, .timestamp, .uuid => return .varchar,
 			.json => return .json,
 			.list => unreachable,
 		},
@@ -765,13 +767,13 @@ fn compatibleDataType(column_type: DataType, value: Event.Value) DataType {
 			.null, .utinyint, .usmallint, .uinteger, .ubigint => return .ubigint,
 			.double => return .double,
 			.tinyint, .smallint, .integer, .bigint => return .bigint,
-			.string, .bool, .date, .time, .timestamp => return .varchar,
+			.string, .bool, .date, .time, .timestamp, .uuid => return .varchar,
 			.json => return .json,
 			.list => unreachable,
 		},
 		.double => switch (value) {
 			.null, .tinyint, .utinyint, .smallint, .usmallint, .integer, .uinteger, .bigint, .ubigint, .double => return .double,
-			.string, .bool, .date, .time, .timestamp => return .varchar,
+			.string, .bool, .date, .time, .timestamp, .uuid => return .varchar,
 			.json => return .json,
 			.list => unreachable,
 		},
@@ -795,6 +797,11 @@ fn compatibleDataType(column_type: DataType, value: Event.Value) DataType {
 			.json => return .json,
 			else => return .varchar,
 		},
+		.uuid => switch (value) {
+			.null, .uuid => return .uuid,
+			.json => return .json,
+			else => return .varchar,
+		},
 		.json => return .json,
 		.unknown => switch (value) {
 			.null => return .unknown,
@@ -813,6 +820,7 @@ fn compatibleDataType(column_type: DataType, value: Event.Value) DataType {
 			.time => return .time,
 			.date => return .date,
 			.timestamp => return .timestamptz,
+			.uuid => return .uuid,
 			.list => unreachable,
 		}
 	}
@@ -834,7 +842,7 @@ fn compatibleListDataType(column_type: DataType, list_type: DataType) DataType {
 			.usmallint => return .integer,
 			.uinteger => return .bigint,
 			.ubigint => return .varchar,
-			.varchar, .bool, .json, .date, .time, .timestamptz => return .json,
+			.varchar, .bool, .json, .date, .time, .timestamptz, .uuid => return .json,
 		},
 		.utinyint => switch (list_type) {
 			.utinyint, .unknown => return .utinyint,
@@ -845,7 +853,7 @@ fn compatibleListDataType(column_type: DataType, list_type: DataType) DataType {
 			.tinyint, .smallint => return .smallint,
 			.integer => return .integer,
 			.bigint => return .bigint,
-			.varchar, .bool, .json, .date, .time, .timestamptz => return .json,
+			.varchar, .bool, .json, .date, .time, .timestamptz, .uuid => return .json,
 		},
 		.smallint => switch (list_type) {
 			.utinyint, .tinyint, .smallint, .unknown => return .smallint,
@@ -855,7 +863,7 @@ fn compatibleListDataType(column_type: DataType, list_type: DataType) DataType {
 			.usmallint => return .integer,
 			.uinteger => return .bigint,
 			.ubigint => return .varchar,
-			.varchar, .bool, .json, .date, .time, .timestamptz => return .json,
+			.varchar, .bool, .json, .date, .time, .timestamptz, .uuid => return .json,
 		},
 		.usmallint => switch (list_type) {
 			.utinyint, .usmallint, .unknown => return .usmallint,
@@ -864,7 +872,7 @@ fn compatibleListDataType(column_type: DataType, list_type: DataType) DataType {
 			.double => return .double,
 			.tinyint, .smallint, .integer => return .integer,
 			.bigint => return .bigint,
-			.varchar, .bool, .json, .date, .time, .timestamptz => return .json,
+			.varchar, .bool, .json, .date, .time, .timestamptz, .uuid => return .json,
 		},
 		.integer => switch (list_type) {
 			.utinyint, .tinyint, .smallint, .usmallint, .integer, .unknown => return .integer,
@@ -872,33 +880,33 @@ fn compatibleListDataType(column_type: DataType, list_type: DataType) DataType {
 			.double => return .double,
 			.uinteger => return .bigint,
 			.ubigint => return .varchar,
-			.varchar, .bool, .json, .date, .time, .timestamptz => return .json,
+			.varchar, .bool, .json, .date, .time, .timestamptz, .uuid => return .json,
 		},
 		.uinteger => switch (list_type) {
 			.utinyint, .usmallint, .uinteger, .unknown => return .uinteger,
 			.ubigint => return .ubigint,
 			.double => return .double,
 			.tinyint, .smallint, .integer, .bigint => return .bigint,
-			.varchar, .json, .bool, .date, .time, .timestamptz => return .json,
+			.varchar, .json, .bool, .date, .time, .timestamptz, .uuid => return .json,
 		},
 		.bigint => switch (list_type) {
 			.utinyint, .tinyint, .smallint, .usmallint, .integer, .uinteger, .bigint, .unknown => return .bigint,
 			.double => return .double,
 			.ubigint => return .varchar,
-			.varchar, .json, .bool, .date, .time, .timestamptz => return .json,
+			.varchar, .json, .bool, .date, .time, .timestamptz, .uuid => return .json,
 		},
 		.ubigint => switch (list_type) {
 			.utinyint, .usmallint, .uinteger, .ubigint, .unknown => return .ubigint,
 			.double => return .double,
 			.tinyint, .smallint, .integer, .bigint => return .bigint,
-			.varchar, .json, .bool, .date, .time, .timestamptz => return .json,
+			.varchar, .json, .bool, .date, .time, .timestamptz, .uuid => return .json,
 		},
 		.double => switch (list_type) {
 			.tinyint, .utinyint, .smallint, .usmallint, .integer, .uinteger, .bigint, .ubigint, .double, .unknown => return .double,
-			.varchar, .bool, .json, .date, .time, .timestamptz => return .json,
+			.varchar, .bool, .json, .date, .time, .timestamptz, .uuid => return .json,
 		},
 		.varchar => switch (list_type) {
-			.varchar, .date, .time, .timestamptz => return .varchar,
+			.varchar, .date, .time, .timestamptz, .uuid => return .varchar,
 			else => return .json,
 		},
 		.date => switch (list_type) {
@@ -911,6 +919,10 @@ fn compatibleListDataType(column_type: DataType, list_type: DataType) DataType {
 		},
 		.timestamptz => switch (list_type) {
 			.timestamptz => return .timestamptz,
+			else => return .varchar,
+		},
+		.uuid => switch (list_type) {
+			.uuid => return .uuid,
 			else => return .varchar,
 		},
 		.json => return .json,
@@ -956,6 +968,7 @@ fn appendList(target_type: DataType, appender: *zuckdb.Appender, list: Event.Val
 		.date => return appender.appendListMap(Event.Value, zuckdb.Date, param_index, list.values, listItemMapDate),
 		.time => return appender.appendListMap(Event.Value, zuckdb.Time, param_index, list.values, listItemMapTime),
 		.timestamptz => return appender.appendListMap(Event.Value, i64, param_index, list.values, listItemMapTimestamptz),
+		.uuid => return appender.appendListMap(Event.Value, i128, param_index, list.values, listItemMapUUID),
 		.json, .unknown => unreachable,
 	}
 }
@@ -1080,6 +1093,14 @@ fn listItemMapTimestamptz(value: Event.Value) ?i64 {
 		.null => return null,
 		.timestamp => |v| return v,
 		else => unreachable
+	}
+}
+
+fn listItemMapUUID(value: Event.Value) ?i128 {
+	switch (value) {
+		.null => return null,
+		.uuid  => |v| return v,
+		else => unreachable,
 	}
 }
 
@@ -1561,18 +1582,26 @@ test "DataSet: record with list" {
 	}
 }
 
-test "DataSet: record with date/time list" {
+test "DataSet: record with date/time/uuid list" {
 	var tc = t.context(.{});
 	defer tc.deinit();
 
 	const ds = try testDataSetWithList(tc);
 
 	{
-		const event_list = try Event.parse(t.allocator, "{\"id\": 1, \"d\": [\"2020-10-23\", null], \"t\": [null, \"10:20:33\"], \"ts\": [\"1999-12-31T12:01:02.33Z\", null]}");
+		const event_list = try Event.parse(t.allocator,
+			\\ {
+			\\    "id": 1,
+			\\    "d": ["2020-10-23", null],
+			\\    "t": [null, "10:20:33"],
+			\\    "ts": ["1999-12-31T12:01:02.33Z", null],
+			\\    "uuid": [null, "89b16aa5-ba78-4eec-924d-ab49474584af"]
+			\\ }
+		);
 		ds.record(event_list);
 		try ds.flushAppender();
 
-		var row = (try ds.conn.row("select d, t, ts from dataset_list_test where id =  1", .{})).?;
+		var row = (try ds.conn.row("select d, t, ts, uuid from dataset_list_test where id =  1", .{})).?;
 		defer row.deinit();
 
 		{
@@ -1594,6 +1623,13 @@ test "DataSet: record with date/time list" {
 			try t.expectEqual(2, list.len);
 			try t.expectEqual(946641662330000, list.get(0).?);
 			try t.expectEqual(null, list.get(1));
+		}
+
+		{
+			const list = row.list(?zuckdb.UUID, 3).?;
+			try t.expectEqual(2, list.len);
+			try t.expectEqual(null, list.get(0));
+			try t.expectEqual("89b16aa5-ba78-4eec-924d-ab49474584af", &(list.get(1).?));
 		}
 	}
 }
