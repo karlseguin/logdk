@@ -317,10 +317,10 @@ pub const DataSet = struct {
 							break :first_pass;
 						}
 						if (column.is_list) {
-							// the column is a list, but we were given a single value. This is
-							// a problem given DuckDB's lack of list binding support.
+							// the column is a list, but we were given a single value.
 							// At this point, list.json should not be needed (fingers crossed);
-							const list = Event.Value.List{.values = &.{value}, .json = "[]"};
+							var values = [_]Event.Value{value};
+							const list = Event.Value.List{.values = values[0..], .json = "[]"};
 							try appendList(target_type, appender, list, param_index);
 						} else {
 							try appender.appendValue(scalar, param_index);
@@ -361,10 +361,10 @@ pub const DataSet = struct {
 				inline else => |scalar| {
 					std.debug.assert(compatibleDataType(column.data_type, value) == column.data_type);
 					if (column.is_list) {
-						// the column is a list, but we were given a single value. This is
-						// a problem given DuckDB's lack of list binding support.
+						// the column is a list, but we were given a single value.
 						// At this point, list.json should not be needed (fingers crossed);
-						const list = Event.Value.List{.values = &.{value}, .json = "[]"};
+						var values = [1]Event.Value{value};
+						const list = Event.Value.List{.values = values[0..], .json = "[]"};
 						try appendList(column.data_type, appender, list, param_index);
 					} else {
 						try appender.appendValue(scalar, param_index);
@@ -783,7 +783,6 @@ fn compatibleDataType(column_type: DataType, value: Event.Value) DataType {
 		.date => switch (value) {
 			.null, .date => return .date,
 			.json => return .json,
-			.timestamp => return .timestamptz,
 			else => return .varchar,
 		},
 		.time => switch (value) {
@@ -954,7 +953,9 @@ fn appendList(target_type: DataType, appender: *zuckdb.Appender, list: Event.Val
 		.double => return appender.appendListMap(Event.Value, f64, param_index, list.values, listItemMapDouble),
 		.bool => return appender.appendListMap(Event.Value, bool, param_index, list.values, listItemMapBool),
 		.varchar => return appender.appendListMap(Event.Value, []const u8, param_index, list.values, listItemMapText),
-		.date, .time, .timestamptz => unreachable, // TODO: support these list types
+		.date => return appender.appendListMap(Event.Value, zuckdb.Date, param_index, list.values, listItemMapDate),
+		.time => return appender.appendListMap(Event.Value, zuckdb.Time, param_index, list.values, listItemMapTime),
+		.timestamptz => return appender.appendListMap(Event.Value, i64, param_index, list.values, listItemMapTimestamptz),
 		.json, .unknown => unreachable,
 	}
 }
@@ -1055,6 +1056,30 @@ fn listItemMapText(value: Event.Value) ?[]const u8 {
 		.null => return null,
 		.string => |v| return v,
 		else => unreachable,
+	}
+}
+
+fn listItemMapDate(value: Event.Value) ?zuckdb.Date {
+	switch (value) {
+		.null => return null,
+		.date => |v| return v,
+		else => unreachable
+	}
+}
+
+fn listItemMapTime(value: Event.Value) ?zuckdb.Time {
+	switch (value) {
+		.null => return null,
+		.time => |v| return v,
+		else => unreachable
+	}
+}
+
+fn listItemMapTimestamptz(value: Event.Value) ?i64 {
+	switch (value) {
+		.null => return null,
+		.timestamp => |v| return v,
+		else => unreachable
 	}
 }
 
@@ -1532,6 +1557,43 @@ test "DataSet: record with list" {
 			try t.expectEqual(2, list.len);
 			try t.expectEqual(1.1, list.get(0));
 			try t.expectEqual(0.9, list.get(1));
+		}
+	}
+}
+
+test "DataSet: record with date/time list" {
+	var tc = t.context(.{});
+	defer tc.deinit();
+
+	const ds = try testDataSetWithList(tc);
+
+	{
+		const event_list = try Event.parse(t.allocator, "{\"id\": 1, \"d\": [\"2020-10-23\", null], \"t\": [null, \"10:20:33\"], \"ts\": [\"1999-12-31T12:01:02.33Z\", null]}");
+		ds.record(event_list);
+		try ds.flushAppender();
+
+		var row = (try ds.conn.row("select d, t, ts from dataset_list_test where id =  1", .{})).?;
+		defer row.deinit();
+
+		{
+			const list = row.list(?zuckdb.Date, 0).?;
+			try t.expectEqual(2, list.len);
+			try t.expectEqual(.{.year = 2020, .month = 10, .day = 23}, list.get(0).?);
+			try t.expectEqual(null, list.get(1));
+		}
+
+		{
+			const list = row.list(?zuckdb.Time, 1).?;
+			try t.expectEqual(2, list.len);
+			try t.expectEqual(null, list.get(0));
+			try t.expectEqual(.{.hour = 10, .min = 20, .sec = 33, .micros = 0}, list.get(1).?);
+		}
+
+		{
+			const list = row.list(?i64, 2).?;
+			try t.expectEqual(2, list.len);
+			try t.expectEqual(946641662330000, list.get(0).?);
+			try t.expectEqual(null, list.get(1));
 		}
 	}
 }

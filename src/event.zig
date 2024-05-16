@@ -77,13 +77,28 @@ pub const Event = struct {
 		timestamp: i64,
 
 		pub const List = struct {
-			values: []const Value,
 			json: []const u8,
+			values: []Value,
 		};
 
-		pub fn tryParse(self: *const Value) ?Value {
+		pub fn tryParse(self: *Value) ?Value {
 			switch (self.*) {
 				.string => |s| return tryParseValue(s),
+				.list => |l| {
+					// Wish we didn't have to do this, but without it, it would be impossible
+					// to insert a date[], time[] or timestamptz[].
+					for (l.values, 0..) |v, i| {
+						switch (v) {
+							.string => |s| if (tryParseValue(s)) |new| {
+								l.values[i] = new;
+							},
+							else => {},
+						}
+					}
+					// This is a bit hackish. Even if we parsed members of the list,
+					// we still return null, because we internally mutated the list.
+					return null;
+				},
 				else => return null,
 			}
 		}
@@ -520,12 +535,12 @@ test "Event: parse list" {
 	try assertEvent(.{
 		.a = Event.Value{.list = .{
 			.json = "[1, -9000]",
-			.values = &[_]Event.Value{.{.utinyint = 1}, .{.smallint = -9000}}}
-		},
+			.values = @constCast(&[_]Event.Value{.{.utinyint = 1}, .{.smallint = -9000}})
+		}},
 		.b = Event.Value{.list = .{
 			.json = "[true, 56.78912, null, {\"abc\": \"123\"}]",
-			.values = &[_]Event.Value{.{.bool = true}, .{.double = 56.78912}, .{.null = {}}, .{.json = "{\"abc\": \"123\"}"}}}
-		},
+			.values = @constCast(&[_]Event.Value{.{.bool = true}, .{.double = 56.78912}, .{.null = {}}, .{.json = "{\"abc\": \"123\"}"}})
+		}},
 	}, event_list.events[0]);
 }
 
@@ -540,7 +555,7 @@ test "Event: parse list simple" {
 	defer event_list.deinit();
 	try assertEvent(.{.a = Event.Value{.list = .{
 		.json = "[9999, -128]",
-		.values = &[_]Event.Value{.{.usmallint = 9999}, .{.tinyint = -128}}
+		.values = @constCast(&[_]Event.Value{.{.usmallint = 9999}, .{.tinyint = -128}})
 	}}}, event_list.events[0]);
 }
 
@@ -550,12 +565,12 @@ test "Event: parse positive integer" {
 	try assertEvent(.{
 		.pos = Event.Value{.list = .{
 			.json = "[0, 1, 255, 256, 65535, 65536, 4294967295, 4294967296, 18446744073709551615]",
-			.values = &[_]Event.Value{
+			.values = @constCast(&[_]Event.Value{
 				.{.utinyint = 0}, .{.utinyint = 1}, .{.utinyint = 255},
 				.{.usmallint = 256}, .{.usmallint = 65535},
 				.{.uinteger = 65536}, .{.uinteger = 4294967295},
 				.{.ubigint = 4294967296}, .{.ubigint = 18446744073709551615}
-			}
+			})
 		}}
 	}, event_list.events[0]);
 }
@@ -566,12 +581,12 @@ test "Event: parse negative integer" {
 	try assertEvent(.{
 		.neg = Event.Value{.list = .{
 			.json = "[-0, -1, -128, -129, -32768 , -32769, -2147483648, -2147483649, -9223372036854775807, -9223372036854775808]",
-			.values = &[_]Event.Value{
+			.values = @constCast(&[_]Event.Value{
 				.{.double = -0.0}, .{.tinyint = -1}, .{.tinyint = -128},
 				.{.smallint = -129}, .{.smallint = -32768},
 				.{.integer = -32769}, .{.integer = -2147483648},
 				.{.bigint = -2147483649}, .{.bigint = -9223372036854775807}, .{.bigint = -9223372036854775808}
-			}
+			})
 		}}
 	}, event_list.events[0]);
 }
@@ -580,48 +595,63 @@ test "Event: parse integer overflow" {
 	try t.expectError(error.InvalidNumber, Event.parse(t.allocator, "{\"overflow\": 18446744073709551616}"));
 }
 
-test "Event: tryParseValue" {
-	try t.expectEqual(null, (Event.Value{.bool = true}).tryParse());
+test "Event: tryParse string" {
+	// just sneak this in here
+	var non_string = Event.Value{.bool = true};
+	try t.expectEqual(null, non_string.tryParse());
 
-	try t.expectEqual(null, testTryParseValue(""));
-	try t.expectEqual(null, testTryParseValue("over 9000!"));
-	try t.expectEqual(null, testTryParseValue("9000!"));
-	try t.expectEqual(null, testTryParseValue("t"));
-	try t.expectEqual(null, testTryParseValue("falsey"));
-	try t.expectEqual(null, testTryParseValue("2005-1-1"));
-	try t.expectEqual(null, testTryParseValue("2025-13-01"));
-	try t.expectEqual(null, testTryParseValue("2025-11-31"));
-	try t.expectEqual(null, testTryParseValue("2025-11-31T00:00:00Z"));
-	try t.expectEqual(null, testTryParseValue("2025-12-31T00:00:00+12:30"));
+	try t.expectEqual(null, testTryParseString(""));
+	try t.expectEqual(null, testTryParseString("over 9000!"));
+	try t.expectEqual(null, testTryParseString("9000!"));
+	try t.expectEqual(null, testTryParseString("t"));
+	try t.expectEqual(null, testTryParseString("falsey"));
+	try t.expectEqual(null, testTryParseString("2005-1-1"));
+	try t.expectEqual(null, testTryParseString("2025-13-01"));
+	try t.expectEqual(null, testTryParseString("2025-11-31"));
+	try t.expectEqual(null, testTryParseString("2025-11-31T00:00:00Z"));
+	try t.expectEqual(null, testTryParseString("2025-12-31T00:00:00+12:30"));
 
-	try t.expectEqual(true, testTryParseValue("true").?.bool);
-	try t.expectEqual(true, testTryParseValue("TRUE").?.bool);
-	try t.expectEqual(true, testTryParseValue("True").?.bool);
-	try t.expectEqual(true, testTryParseValue("TrUe").?.bool);
+	try t.expectEqual(true, testTryParseString("true").?.bool);
+	try t.expectEqual(true, testTryParseString("TRUE").?.bool);
+	try t.expectEqual(true, testTryParseString("True").?.bool);
+	try t.expectEqual(true, testTryParseString("TrUe").?.bool);
 
-	try t.expectEqual(false, testTryParseValue("false").?.bool);
-	try t.expectEqual(false, testTryParseValue("FALSE").?.bool);
-	try t.expectEqual(false, testTryParseValue("False").?.bool);
-	try t.expectEqual(false, testTryParseValue("FaLsE").?.bool);
+	try t.expectEqual(false, testTryParseString("false").?.bool);
+	try t.expectEqual(false, testTryParseString("FALSE").?.bool);
+	try t.expectEqual(false, testTryParseString("False").?.bool);
+	try t.expectEqual(false, testTryParseString("FaLsE").?.bool);
 
-	try t.expectEqual(0, testTryParseValue("0").?.utinyint);
-	try t.expectEqual(-128, testTryParseValue("-128").?.tinyint);
-	try t.expectEqual(10000, testTryParseValue("10000").?.usmallint);
-	try t.expectEqual(-1234, testTryParseValue("-1234").?.smallint);
-	try t.expectEqual(394918485, testTryParseValue("394918485").?.uinteger);
-	try t.expectEqual(-999999912, testTryParseValue("-999999912").?.integer);
-	try t.expectEqual(7891235891098352, testTryParseValue("7891235891098352").?.ubigint);
-	try t.expectEqual(-111123456698832, testTryParseValue("-111123456698832").?.bigint);
-	try t.expectEqual(-323993.3231332, testTryParseValue("-323993.3231332").?.double);
+	try t.expectEqual(0, testTryParseString("0").?.utinyint);
+	try t.expectEqual(-128, testTryParseString("-128").?.tinyint);
+	try t.expectEqual(10000, testTryParseString("10000").?.usmallint);
+	try t.expectEqual(-1234, testTryParseString("-1234").?.smallint);
+	try t.expectEqual(394918485, testTryParseString("394918485").?.uinteger);
+	try t.expectEqual(-999999912, testTryParseString("-999999912").?.integer);
+	try t.expectEqual(7891235891098352, testTryParseString("7891235891098352").?.ubigint);
+	try t.expectEqual(-111123456698832, testTryParseString("-111123456698832").?.bigint);
+	try t.expectEqual(-323993.3231332, testTryParseString("-323993.3231332").?.double);
 
-	try t.expectEqual(.{.year = 2025, .month = 1, .day = 2}, testTryParseValue("2025-01-02").?.date);
-	try t.expectEqual(.{.hour = 10, .min = 22, .sec = 0, .micros = 0}, testTryParseValue("10:22").?.time);
-	try t.expectEqual(.{.hour = 15, .min = 3, .sec = 59, .micros = 123456}, testTryParseValue("15:03:59.123456").?.time);
-	try t.expectEqual(1737385439123456, testTryParseValue("2025-01-20T15:03:59.123456Z").?.timestamp);
+	try t.expectEqual(.{.year = 2025, .month = 1, .day = 2}, testTryParseString("2025-01-02").?.date);
+	try t.expectEqual(.{.hour = 10, .min = 22, .sec = 0, .micros = 0}, testTryParseString("10:22").?.time);
+	try t.expectEqual(.{.hour = 15, .min = 3, .sec = 59, .micros = 123456}, testTryParseString("15:03:59.123456").?.time);
+	try t.expectEqual(1737385439123456, testTryParseString("2025-01-20T15:03:59.123456Z").?.timestamp);
 }
 
-fn testTryParseValue(str: []const u8) ?Event.Value {
-	const v = Event.Value{.string = str};
+test "Event: tryParse list" {
+	{
+		var l = Event.Value{.list = .{
+			.json = "",
+			.values = @constCast(&[_]Event.Value{.{.string = "200"}, .{.bool = true}, .{.string = "9000!"}})
+		}};
+		try t.expectEqual(null, l.tryParse());
+		try t.expectEqual(200, l.list.values[0].utinyint);
+		try t.expectEqual(true, l.list.values[1].bool);
+		try t.expectEqual("9000!", l.list.values[2].string);
+	}
+}
+
+fn testTryParseString(str: []const u8) ?Event.Value {
+	var v = Event.Value{.string = str};
 	return v.tryParse();
 }
 
