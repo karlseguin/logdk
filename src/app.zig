@@ -182,79 +182,84 @@ pub const App = struct {
 		// building our columns, turning them into json, and writing our SQL strings.
 		// But this lock is under very low contention, and if there IS contention,
 		// it very well could be multiple threads trying to create the same dataset
-		// so a long lock seems fine.
+		// so a coarse lock seems fine.
 		self.create_lock.lock();
 		defer self.create_lock.unlock();
 
-		{
-			// under our create_lock, this check is definitive.
-			if (self._datasets.get(name)) |q| {
-				return q;
-			}
-
-			const columns = try DataSet.columnsFromEvent(aa, event, env.logger);
-			const serialized_columns = try std.json.stringifyAlloc(aa, columns, .{});
-
-			if (columns.len < event.fieldCount()) {
-				// columnsFromEvent added the invalid column names to this logger already, without
-				// actually logging it
-				env.logger.level(.Warn).ctx("validation.column.name").string("dataset", name).log();
-			}
-
-			var create = try self.buffers.acquire();
-			defer create.release();
-
-			{
-				try std.fmt.format(create.writer(),
-					\\ create table {s} (
-					\\  "ldk_id" ubigint not null primary key,
-					\\  "ldk_ts" timestamp not null
-				, .{name});
-
-				const writer = create.writer();
-				for (columns) |c| {
-					try create.write(",\n  ");
-					try c.writeDDL(writer);
-				}
-			}
-			try create.write("\n)");
-
-			{
-				var conn = try self.db.acquire();
-				defer conn.release();
-
-				const insert_sql = "insert into logdk.datasets (name, columns, created) values ($1, $2, now())";
-				try conn.begin();
-				errdefer conn.rollback() catch {};
-				_ = conn.exec(create.string(), .{}) catch |err| return env.dbErr("App.createDataSet.create", err, conn);
-				_ = conn.exec(insert_sql, .{name, serialized_columns}) catch |err| return env.dbErr("App.createDataSet.insert", err, conn);
-				conn.commit() catch |err| return env.dbErr("App.createDataSet.commit", err, conn);
-			}
+		// under our create_lock, this check is definitive.
+		if (self._datasets.get(name)) |q| {
+			return q;
 		}
 
-		logdk.metrics.addDataSet();
+		const columns = try DataSet.columnsFromEvent(aa, event, env.logger);
+		const serialized_columns = try std.json.stringifyAlloc(aa, columns, .{});
 
-		// This has to happen under our create_lock, else another thread can come in
-		// and create the same dataset.
-		// This could easily be done without hitting the DB. We have everything we need
-		// right here to build the dataset. But, this should happen rarely, and
-		// having a single path to load a dataset is more than worth it.
-		return try self.loadDataSet(env, name);
+		if (columns.len < event.fieldCount()) {
+			// columnsFromEvent added the invalid column names to this logger already, without
+			// actually logging it
+			env.logger.level(.Warn).ctx("validation.column.name").string("dataset", name).log();
+		}
+
+		var create = try self.buffers.acquire();
+		defer create.release();
+		const writer = create.writer();
+
+		try std.fmt.format(writer,
+			\\ create table {s} (
+			\\  ldk_id ubigint not null primary key,
+			\\  ldk_ts timestamp not null
+		, .{name});
+
+		for (columns) |c| {
+			try create.write(",\n  ");
+			try c.writeDDL(writer);
+		}
+		try create.write("\n)");
+
+		const insert_sql =
+			\\ insert into logdk.datasets (name, columns, created)
+			\\ values ($1, $2, now())
+			\\ returning name, columns
+		;
+
+		var conn = try self.db.acquire();
+		defer conn.release();
+
+		try conn.begin();
+		errdefer conn.rollback() catch {};
+
+		_ = conn.exec(create.string(), .{}) catch |err| return env.dbErr("App.createDataSet.create", err, conn);
+		var row = conn.row(insert_sql, .{name, serialized_columns}) catch |err| return env.dbErr("App.createDataSet.insert", err, conn);
+		defer row.?.deinit();
+
+		conn.commit() catch |err| return env.dbErr("App.createDataSet.commit", err, conn);
+
+		logdk.metrics.addDataSet();
+		return self.loadDataSet(row.?);
 	}
 
-	fn loadDataSet(self: *App, env: *Env, name: []const u8) !usize {
-		var dataset = blk: {
-			var conn = try self.db.acquire();
-			defer conn.release();
+	pub fn loadDataSets(self: *App) !void {
+		var conn = try self.db.acquire();
+		defer conn.release();
 
-			var row = conn.row("select name, columns from logdk.datasets where name = $1", .{name}) catch |err| {
-				return env.dbErr("app.loadDataSet", err, conn);
-			} orelse return error.DataSetNotFound;
-			defer row.deinit();
-
-			break :blk try DataSet.init(self, row);
+		var rows = conn.query("select name, columns from logdk.datasets", .{}) catch |err| {
+			return logdk.dbErr("App.loadDataSets", err, conn, logz.err());
 		};
+		defer rows.deinit();
+
+		var count: usize = 0;
+		while (try rows.next()) |row| {
+			_ = try self.loadDataSet(row);
+			count += 1;
+		}
+		logz.info().ctx("App.loadDataSets").int("count", count).log();
+	}
+
+	// row could be an zuckdb.Row or a zuckdb.OwningRow
+	fn loadDataSet(self: *App, row: anytype) !usize {
+		var dataset = try DataSet.init(self, row);
 		errdefer dataset.deinit();
+
 		const actor_id = try self.dispatcher.add(dataset);
 
 		{
@@ -267,36 +272,7 @@ pub const App = struct {
 		// is safe because meta.datasetChanged clones all the data it needs for its
 		// own meta copy
 		try self.meta.datasetChanged(&dataset);
-
 		return actor_id;
-	}
-
-	pub fn loadDataSets(self: *App) !void {
-		var conn = try self.db.acquire();
-		defer conn.release();
-
-		var rows = conn.query("select name, columns from logdk.datasets", .{}) catch |err| {
-			return logdk.dbErr("App.loadDataSets", err, conn, logz.err());
-		};
-		defer rows.deinit();
-
-		self._dataset_lock.lock();
-		defer self._dataset_lock.unlock();
-
-		while (try rows.next()) |row| {
-			var dataset = try DataSet.init(self, row);
-			errdefer dataset.deinit();
-
-			const actor_id = try self.dispatcher.add(dataset);
-			try self._datasets.put(dataset.name, actor_id);
-
-			// this dataset is going to move (and be owned by our actor), but this
-			// is safe because meta.datasetChanged clones all the data it needs for its
-			// own meta copy
-			try self.meta.datasetChanged(&dataset);
-		}
-
-		logz.info().ctx("App.loadDataSets").int("count", self._datasets.count()).log();
 	}
 
 	// The app settings can be changed during runtime, so we need to encapsulate

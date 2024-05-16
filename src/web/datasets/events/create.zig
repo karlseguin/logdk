@@ -9,7 +9,7 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 	const app = env.app;
 	const name = req.params.get("name").?;
 
-	var dataset_id = app.getDataSetRef(name) orelse blk: {
+	var dataset_ref = app.getDataSetRef(name) orelse blk: {
 		if (app.settings.dynamicDataSetCreation() == false) {
 			return web.notFound(res, "dataset not found and dynamic creation is disabled");
 		}
@@ -23,19 +23,22 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 		return;
 	}
 
-	// once passed to the dispatcher, it because the datasets job to release this
+	// once passed to the dispatcher, it becomes the datasets job to release this
 	errdefer event_list.deinit();
 
-	if (dataset_id == null) {
+	if (dataset_ref == null) {
 		const validator = try env.validator();
 		logdk.Validate.validateIdentifier("dataset", name, validator) catch |err| {
+			// Even though this is (most likely) user-input error, we want to log it
+			// since creating datasets is fairly uncommon and intentional and the creator
+			// would probably be surprised to find out that it failed.
 			env.logger.level(.Warn).ctx("validation.dataset.name").string("name", name).log();
 			return err;
 		};
-		dataset_id = try app.createDataSet(env, name, event_list.events[0]);
+		dataset_ref = try app.createDataSet(env, name, event_list.events[0]);
 	}
 
-	app.dispatcher.send(logdk.DataSet, dataset_id.?, .{.record = event_list});
+	app.dispatcher.send(logdk.DataSet, dataset_ref.?, .{.record = event_list});
 	res.status = 204;
 }
 
