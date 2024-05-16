@@ -6,7 +6,6 @@ const logdk = @import("logdk.zig");
 
 const d = logdk.dispatcher;
 
-const RwLock = std.Thread.RwLock;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 

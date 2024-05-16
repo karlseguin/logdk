@@ -1,4 +1,6 @@
 const std = @import("std");
+const zul = @import("zul");
+const zuckdb = @import("zuckdb");
 const logdk = @import("logdk.zig");
 
 const json = std.json;
@@ -46,6 +48,9 @@ pub const Event = struct {
 		string,
 		json,
 		list,
+		date,
+		time,
+		timestamp,
 	};
 
 	pub const Value = union(DataType) {
@@ -63,11 +68,25 @@ pub const Event = struct {
 		string: []const u8,
 		json: []const u8,
 		list: Value.List,
+		// might be nice to have more abstract types here, like a zul.Date, zul.Time and zul.DateTime
+		// but in the scale of things, it's the same and having the duckdb type directly
+		// here makes inserting into the dataset easier (which is nice, because that code
+		// is already complicated)
+		date: zuckdb.Date,
+		time: zuckdb.Time,
+		timestamp: i64,
 
 		pub const List = struct {
 			values: []const Value,
 			json: []const u8,
 		};
+
+		pub fn tryParse(self: *const Value) ?Value {
+			switch (self.*) {
+				.string => |s| return tryParseValue(s),
+				else => return null,
+			}
+		}
 	};
 
 	pub fn parse(allocator: Allocator, input: []const u8) !Event.List {
@@ -198,26 +217,7 @@ const Parser = struct {
 			.false => return .{.value = .{.bool = false}},
 			.number, .allocated_number => |str| {
 				const result = try parseInteger(str);
-				if (result.rest.len == 0) {
-					const value = result.value;
-					if (result.negative) {
-						if (value == 0) return .{.value = .{.double = -0.0}};
-						if (value <= 128) return .{.value = .{.tinyint = @intCast(-@as(i64, @intCast(value)))}};
-						if (value <= 32768) return .{.value = .{.smallint = @intCast(-@as(i64, @intCast(value)))}};
-						if (value <= 2147483648) return .{.value = .{.integer = @intCast(-@as(i64, @intCast(value)))}};
-						if (value <= 9223372036854775807) return .{.value = .{.bigint = -@as(i64, @intCast(value))}};
-						// as far as I can tell, this is the only way to cast a 9223372036854775808 u64 into an i64 -9223372036854775808
-						if (value == 9223372036854775808) return .{.value = .{.bigint = @intCast(-@as(i128, @intCast(value)))}};
-						return error.InvalidNumber;
-					}
-					if (value <= 255) return .{.value = .{.utinyint = @intCast(value)}};
-					if (value <= 65535) return .{.value = .{.usmallint = @intCast(value)}};
-					if (value <= 4294967295) return .{.value = .{.uinteger = @intCast(value)}};
-					if (value <= 18446744073709551615) return .{.value = .{.ubigint = @intCast(value)}};
-					return error.InvalidNumber;
-				} else {
-					return .{.value = .{.double = std.fmt.parseFloat(f64, str) catch unreachable}};
-				}
+				return .{.value = try result.toNumericValue(str)};
 			},
 			.array_begin => {
 				if (break_on_list) {
@@ -281,51 +281,126 @@ const Parser = struct {
 			else => unreachable,
 		}
 	}
+};
 
-	const JsonIntegerResult = struct {
-		value: u64,
-		negative: bool,
-		rest: []const u8,
-	};
+// parseInteger is used both when parsing the JSON input as well as when trying to
+// parse a string value. When parsing the JSON input, we _know_ this has to be a number
+// but when parsing a string value, we're only trying to see if it works.
+// We don't use std.fmt.parseInt because we don't know the type of the integer.
+// If we use `u64`, we won't be able to represent negatives. If we use `i64` we
+// won't be able to fully represent `u64.
+const JsonIntegerResult = struct {
+	value: u64,
+	negative: bool,
+	rest: []const u8,
 
-	fn parseInteger(str: []const u8) error{InvalidNumber}!JsonIntegerResult {
-		std.debug.assert(str.len != 0);
-
-		var pos: usize = 0;
-		var negative = false;
-		if (str[0] == '-') {
-			pos = 1;
-			negative = true;
+	// Try to turn the JsonIntegerResult into a Event.Value.
+	fn toNumericValue(self: JsonIntegerResult, input: []const u8) !Event.Value {
+		if (self.rest.len > 0) {
+			// We had more data than just our integer.
+			// A bit of a waste to throw away self.value, but parsing floats is hard
+			// and I rather just use std at this point.
+			return .{.double = try std.fmt.parseFloat(f64, input)};
 		}
 
-		var n: u64 = 0;
-		for (str[pos..]) |b| {
-			if (b < '0' or b > '9') {
-				break;
-			}
-
-			pos += 1;
-			{
-				n, const overflowed = @mulWithOverflow(n, 10);
-				if (overflowed != 0) {
-					return error.InvalidNumber;
-				}
-			}
-			{
-				n, const overflowed = @addWithOverflow(n, @as(u64, @intCast(b - '0')));
-				if (overflowed != 0) {
-					return error.InvalidNumber;
-				}
-			}
+		const value = self.value;
+		if (self.negative) {
+			if (value == 0) return .{.double = -0.0};
+			if (value <= 128) return .{.tinyint = @intCast(-@as(i64, @intCast(value)))};
+			if (value <= 32768) return .{.smallint = @intCast(-@as(i64, @intCast(value)))};
+			if (value <= 2147483648) return .{.integer = @intCast(-@as(i64, @intCast(value)))};
+			if (value <= 9223372036854775807) return .{.bigint = -@as(i64, @intCast(value))};
+			// as far as I can tell, this is the only way to cast a 9223372036854775808 u64 into an i64 -9223372036854775808
+			if (value == 9223372036854775808) return .{.bigint = @intCast(-@as(i128, @intCast(value)))};
+			return error.InvalidNumber;
 		}
-
-		return .{
-			.value = n,
-			.negative = negative,
-			.rest = str[pos..],
-		};
+		if (value <= 255) return .{.utinyint = @intCast(value)};
+		if (value <= 65535) return .{.usmallint = @intCast(value)};
+		if (value <= 4294967295) return .{.uinteger = @intCast(value)};
+		if (value <= 18446744073709551615) return .{.ubigint = @intCast(value)};
+		return error.InvalidNumber;
 	}
 };
+
+fn parseInteger(str: []const u8) error{InvalidNumber}!JsonIntegerResult {
+	std.debug.assert(str.len != 0);
+
+	var pos: usize = 0;
+	var negative = false;
+	if (str[0] == '-') {
+		pos = 1;
+		negative = true;
+	}
+
+	var n: u64 = 0;
+	for (str[pos..]) |b| {
+		if (b < '0' or b > '9') {
+			break;
+		}
+
+		pos += 1;
+		{
+			n, const overflowed = @mulWithOverflow(n, 10);
+			if (overflowed != 0) {
+				return error.InvalidNumber;
+			}
+		}
+		{
+			n, const overflowed = @addWithOverflow(n, @as(u64, @intCast(b - '0')));
+			if (overflowed != 0) {
+				return error.InvalidNumber;
+			}
+		}
+	}
+
+	return .{
+		.value = n,
+		.negative = negative,
+		.rest = str[pos..],
+	};
+}
+
+fn tryParseValue(s: []const u8) ?Event.Value {
+	if (s.len == 0) return null;
+
+	if (s.len >= 20) {
+		if (zul.DateTime.parse(s, .rfc3339)) |v| {
+			return .{.timestamp = v.unix(.microseconds)};
+		} else |_| {}
+	}
+
+	if (s.len == 10) {
+		if (zul.Date.parse(s, .rfc3339)) |v| {
+			return .{.date = .{.year = v.year, .month = @intCast(v.month), .day = @intCast(v.day)}};
+		} else |_| {}
+	}
+
+	if (s.len >= 5) {
+		if (zul.Time.parse(s, .rfc3339)) |v| {
+			return .{.time = .{.hour = @intCast(v.hour), .min = @intCast(v.min), .sec = @intCast(v.sec), .micros = @intCast(v.micros)}};
+		} else |_| {}
+	}
+
+	if (parseInteger(s)) |result| {
+		// parseInteger can return a result that is NOT an integer/float.
+		// given "1234abc", it'll parse "1234" and set .rest to "abc". It's only
+		// the combination of parseInteger and toNumericValue that definitively
+		// detect an integer or float.
+		if (result.toNumericValue(s)) |value| {
+			return value;
+		} else |_| {}
+	} else |_| {}
+
+	if (std.ascii.eqlIgnoreCase(s, "true")) {
+		return .{.bool = true};
+	}
+
+	if (std.ascii.eqlIgnoreCase(s, "false")) {
+		return .{.bool = false};
+	}
+
+	return null;
+}
 
 const t = logdk.testing;
 test "Event: parse non-array or non-object" {
@@ -503,6 +578,51 @@ test "Event: parse negative integer" {
 
 test "Event: parse integer overflow" {
 	try t.expectError(error.InvalidNumber, Event.parse(t.allocator, "{\"overflow\": 18446744073709551616}"));
+}
+
+test "Event: tryParseValue" {
+	try t.expectEqual(null, (Event.Value{.bool = true}).tryParse());
+
+	try t.expectEqual(null, testTryParseValue(""));
+	try t.expectEqual(null, testTryParseValue("over 9000!"));
+	try t.expectEqual(null, testTryParseValue("9000!"));
+	try t.expectEqual(null, testTryParseValue("t"));
+	try t.expectEqual(null, testTryParseValue("falsey"));
+	try t.expectEqual(null, testTryParseValue("2005-1-1"));
+	try t.expectEqual(null, testTryParseValue("2025-13-01"));
+	try t.expectEqual(null, testTryParseValue("2025-11-31"));
+	try t.expectEqual(null, testTryParseValue("2025-11-31T00:00:00Z"));
+	try t.expectEqual(null, testTryParseValue("2025-12-31T00:00:00+12:30"));
+
+	try t.expectEqual(true, testTryParseValue("true").?.bool);
+	try t.expectEqual(true, testTryParseValue("TRUE").?.bool);
+	try t.expectEqual(true, testTryParseValue("True").?.bool);
+	try t.expectEqual(true, testTryParseValue("TrUe").?.bool);
+
+	try t.expectEqual(false, testTryParseValue("false").?.bool);
+	try t.expectEqual(false, testTryParseValue("FALSE").?.bool);
+	try t.expectEqual(false, testTryParseValue("False").?.bool);
+	try t.expectEqual(false, testTryParseValue("FaLsE").?.bool);
+
+	try t.expectEqual(0, testTryParseValue("0").?.utinyint);
+	try t.expectEqual(-128, testTryParseValue("-128").?.tinyint);
+	try t.expectEqual(10000, testTryParseValue("10000").?.usmallint);
+	try t.expectEqual(-1234, testTryParseValue("-1234").?.smallint);
+	try t.expectEqual(394918485, testTryParseValue("394918485").?.uinteger);
+	try t.expectEqual(-999999912, testTryParseValue("-999999912").?.integer);
+	try t.expectEqual(7891235891098352, testTryParseValue("7891235891098352").?.ubigint);
+	try t.expectEqual(-111123456698832, testTryParseValue("-111123456698832").?.bigint);
+	try t.expectEqual(-323993.3231332, testTryParseValue("-323993.3231332").?.double);
+
+	try t.expectEqual(.{.year = 2025, .month = 1, .day = 2}, testTryParseValue("2025-01-02").?.date);
+	try t.expectEqual(.{.hour = 10, .min = 22, .sec = 0, .micros = 0}, testTryParseValue("10:22").?.time);
+	try t.expectEqual(.{.hour = 15, .min = 3, .sec = 59, .micros = 123456}, testTryParseValue("15:03:59.123456").?.time);
+	try t.expectEqual(1737385439123456, testTryParseValue("2025-01-20T15:03:59.123456Z").?.timestamp);
+}
+
+fn testTryParseValue(str: []const u8) ?Event.Value {
+	const v = Event.Value{.string = str};
+	return v.tryParse();
 }
 
 fn assertEvent(expected: anytype, actual: Event) !void {

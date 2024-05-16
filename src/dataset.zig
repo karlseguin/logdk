@@ -128,6 +128,23 @@ pub const DataSet = struct {
 		allocator.destroy(arena);
 	}
 
+	// This is only called on DataSet creation. event is the first event for this
+	// dataset that we've gotten. Subsequently, the DataSet and its columns are
+	// in-memory or, on restart, loaded from the logdk.datasets table.
+
+	// We'll try to parse text values to give them a more accurate type. This isn't
+	// something we always want to do (it's relative expensive). We do it on the
+	// first event, and on subsequent events we'll only try to parse those fields
+	// we were successful in parsing here.
+	//
+	// If an initial event was:
+	//   {"power": "9000", "name": "teg"}
+	// Then "power" should be parsed into a u16 and name should remain a string.
+	// On subsequent events, even if name could be parsed into an int/bool/timestamp,
+	// it would still get coerced back into a json/varchar since the column has to
+	// accomodate the "teg" value. Thus constantly trying to parse a string field
+	// which we know has at least 1 legit string value, is a waste of time.
+	//
 	// allocator is the ArenaAllocator, so we can be a little sloppy
 	pub fn columnsFromEvent(allocator: Allocator, event: Event, logger: logz.Logger) ![]Column {
 		var columns = try allocator.alloc(Column, event.fieldCount());
@@ -141,7 +158,14 @@ pub const DataSet = struct {
 				_ = logger.string("name", name);
 				continue;
 			}
-			columns[i] = Column.fromEventValue(try allocator.dupe(u8, name), kv.value_ptr.*);
+
+			var parsed = false;
+			if (kv.value_ptr.tryParse()) |v| {
+				parsed = true;
+				kv.value_ptr.* = v;
+			}
+
+			columns[i] = Column.fromEventValue(try allocator.dupe(u8, name), kv.value_ptr.*, parsed);
 			i += 1;
 		}
 
@@ -422,7 +446,13 @@ pub const DataSet = struct {
 					continue;
 				}
 
-				var column = Column.fromEventValue(try aa.dupe(u8, name), kv.value_ptr.*);
+				var parsed = false;
+				if (kv.value_ptr.tryParse()) |v| {
+					parsed = true;
+					kv.value_ptr.* = v;
+				}
+
+				var column = Column.fromEventValue(try aa.dupe(u8, name), kv.value_ptr.*, parsed);
 
 				// a column added after initial creation is always nullable, since
 				// existing events won't have a value.
@@ -523,6 +553,11 @@ const Column = struct {
 	nullable: bool,
 	is_list: bool,
 	data_type: DataType,
+	// This indicates that the event value was a string, but that we were able
+	// to parse it into a a data_type. When the first event for a dataset is
+	// received, we try to parse every [text] field. And on subsequent events
+	// we only try to parse those fields which were successfully parsed.
+	parsed: bool = false,
 
 	pub fn isValidName(name: []const u8) bool {
 		return logdk.Validate.identifierIsValid(name);
@@ -550,7 +585,7 @@ const Column = struct {
 		}
 	}
 
-	pub fn fromEventValue(name: []const u8, value: Event.Value) Column {
+	pub fn fromEventValue(name: []const u8, value: Event.Value, parsed: bool) Column {
 		var event_type = std.meta.activeTag(value);
 		const column_type = switch (value) {
 			.list => |list| columnTypeForEventList(list.values),
@@ -563,9 +598,9 @@ const Column = struct {
 			event_type = .json;
 		}
 
-
 		return .{
 			.name = name,
+			.parsed = parsed,
 			.is_list = event_type == .list,
 			.nullable = event_type == .null,
 			.data_type = column_type,
@@ -586,6 +621,9 @@ pub const DataType = enum {
 	bool,
 	varchar,
 	json,
+	date,
+	time,
+	timestamptz,
 	unknown,
 };
 
@@ -603,6 +641,9 @@ fn columnTypeFromEventScalar(event_type: Event.DataType) DataType {
 		.bool => .bool,
 		.string => .varchar,
 		.json => .json,
+		.date => .date,
+		.time => .time,
+		.timestamp => .timestamptz,
 		.null => .unknown,
 		.list => unreachable,
 	};
@@ -653,7 +694,7 @@ fn compatibleDataType(column_type: DataType, value: Event.Value) DataType {
 			.usmallint => |v| return if (v <= 32767) .smallint else .integer,
 			.uinteger => |v| return if (v <= 2147483647) .integer else .bigint,
 			.ubigint => |v| return if (v <= 9223372036854775807) .bigint else .varchar,
-			.string, .bool => return .varchar,
+			.string, .bool, .date, .time, .timestamp => return .varchar,
 			.json => return .json,
 			.list => unreachable,
 		},
@@ -666,7 +707,7 @@ fn compatibleDataType(column_type: DataType, value: Event.Value) DataType {
 			.tinyint, .smallint => return .smallint,
 			.integer => return .integer,
 			.bigint => return .bigint,
-			.string, .bool => return .varchar,
+			.string, .bool, .date, .time, .timestamp => return .varchar,
 			.json => return .json,
 			.list => unreachable,
 		},
@@ -678,7 +719,7 @@ fn compatibleDataType(column_type: DataType, value: Event.Value) DataType {
 			.usmallint => |v| return if (v <= 32767) .smallint else .integer,
 			.uinteger => |v| return if (v <= 2147483647) .integer else .bigint,
 			.ubigint => |v| return if (v <= 9223372036854775807) .bigint else .varchar,
-			.string, .bool => return .varchar,
+			.string, .bool, .date, .time, .timestamp => return .varchar,
 			.json => return .json,
 			.list => unreachable,
 		},
@@ -689,7 +730,7 @@ fn compatibleDataType(column_type: DataType, value: Event.Value) DataType {
 			.double => return .double,
 			.tinyint, .smallint, .integer => return .integer,
 			.bigint => return .bigint,
-			.string, .bool => return .varchar,
+			.string, .bool, .date, .time, .timestamp => return .varchar,
 			.json => return .json,
 			.list => unreachable,
 		},
@@ -699,7 +740,7 @@ fn compatibleDataType(column_type: DataType, value: Event.Value) DataType {
 			.double => return .double,
 			.uinteger => |v| return if (v <= 2147483647) .integer else .bigint,
 			.ubigint => |v| return if (v <= 9223372036854775807) .bigint else .varchar,
-			.string, .bool => return .varchar,
+			.string, .bool, .date, .time, .timestamp => return .varchar,
 			.json => return .json,
 			.list => unreachable,
 		},
@@ -708,7 +749,7 @@ fn compatibleDataType(column_type: DataType, value: Event.Value) DataType {
 			.ubigint => return .ubigint,
 			.double => return .double,
 			.tinyint, .smallint, .integer, .bigint => return .bigint,
-			.string, .bool => return .varchar,
+			.string, .bool, .date, .time, .timestamp => return .varchar,
 			.json => return .json,
 			.list => unreachable,
 		},
@@ -716,7 +757,7 @@ fn compatibleDataType(column_type: DataType, value: Event.Value) DataType {
 			.null, .utinyint, .tinyint, .smallint, .usmallint, .integer, .uinteger, .bigint => return .bigint,
 			.double => return .double,
 			.ubigint => |v| return if (v <= 9223372036854775807) .bigint else .varchar,
-			.string, .bool => return .varchar,
+			.string, .bool, .date, .time, .timestamp => return .varchar,
 			.json => return .json,
 			.list => unreachable,
 		},
@@ -724,18 +765,34 @@ fn compatibleDataType(column_type: DataType, value: Event.Value) DataType {
 			.null, .utinyint, .usmallint, .uinteger, .ubigint => return .ubigint,
 			.double => return .double,
 			.tinyint, .smallint, .integer, .bigint => return .bigint,
-			.string, .bool => return .varchar,
+			.string, .bool, .date, .time, .timestamp => return .varchar,
 			.json => return .json,
 			.list => unreachable,
 		},
 		.double => switch (value) {
 			.null, .tinyint, .utinyint, .smallint, .usmallint, .integer, .uinteger, .bigint, .ubigint, .double => return .double,
-			.string, .bool => return .varchar,
+			.string, .bool, .date, .time, .timestamp => return .varchar,
 			.json => return .json,
 			.list => unreachable,
 		},
 		.varchar => switch (value) {
 			.null => return .varchar,
+			.json => return .json,
+			else => return .varchar,
+		},
+		.date => switch (value) {
+			.null, .date => return .date,
+			.json => return .json,
+			.timestamp => return .timestamptz,
+			else => return .varchar,
+		},
+		.time => switch (value) {
+			.null, .time => return .time,
+			.json => return .json,
+			else => return .varchar,
+		},
+		.timestamptz => switch (value) {
+			.null, .timestamp => return .timestamptz,
 			.json => return .json,
 			else => return .varchar,
 		},
@@ -754,6 +811,9 @@ fn compatibleDataType(column_type: DataType, value: Event.Value) DataType {
 			.string => return .varchar,
 			.bool => return .bool,
 			.json => return .json,
+			.time => return .time,
+			.date => return .date,
+			.timestamp => return .timestamptz,
 			.list => unreachable,
 		}
 	}
@@ -775,7 +835,7 @@ fn compatibleListDataType(column_type: DataType, list_type: DataType) DataType {
 			.usmallint => return .integer,
 			.uinteger => return .bigint,
 			.ubigint => return .varchar,
-			.varchar, .bool, .json => return .json,
+			.varchar, .bool, .json, .date, .time, .timestamptz => return .json,
 		},
 		.utinyint => switch (list_type) {
 			.utinyint, .unknown => return .utinyint,
@@ -786,7 +846,7 @@ fn compatibleListDataType(column_type: DataType, list_type: DataType) DataType {
 			.tinyint, .smallint => return .smallint,
 			.integer => return .integer,
 			.bigint => return .bigint,
-			.varchar, .bool, .json => return .json,
+			.varchar, .bool, .json, .date, .time, .timestamptz => return .json,
 		},
 		.smallint => switch (list_type) {
 			.utinyint, .tinyint, .smallint, .unknown => return .smallint,
@@ -796,7 +856,7 @@ fn compatibleListDataType(column_type: DataType, list_type: DataType) DataType {
 			.usmallint => return .integer,
 			.uinteger => return .bigint,
 			.ubigint => return .varchar,
-			.varchar, .bool, .json => return .json,
+			.varchar, .bool, .json, .date, .time, .timestamptz => return .json,
 		},
 		.usmallint => switch (list_type) {
 			.utinyint, .usmallint, .unknown => return .usmallint,
@@ -805,7 +865,7 @@ fn compatibleListDataType(column_type: DataType, list_type: DataType) DataType {
 			.double => return .double,
 			.tinyint, .smallint, .integer => return .integer,
 			.bigint => return .bigint,
-			.varchar, .bool, .json => return .json,
+			.varchar, .bool, .json, .date, .time, .timestamptz => return .json,
 		},
 		.integer => switch (list_type) {
 			.utinyint, .tinyint, .smallint, .usmallint, .integer, .unknown => return .integer,
@@ -813,34 +873,46 @@ fn compatibleListDataType(column_type: DataType, list_type: DataType) DataType {
 			.double => return .double,
 			.uinteger => return .bigint,
 			.ubigint => return .varchar,
-			.varchar, .bool, .json => return .json,
+			.varchar, .bool, .json, .date, .time, .timestamptz => return .json,
 		},
 		.uinteger => switch (list_type) {
 			.utinyint, .usmallint, .uinteger, .unknown => return .uinteger,
 			.ubigint => return .ubigint,
 			.double => return .double,
 			.tinyint, .smallint, .integer, .bigint => return .bigint,
-			.varchar, .json, .bool => return .json,
+			.varchar, .json, .bool, .date, .time, .timestamptz => return .json,
 		},
 		.bigint => switch (list_type) {
 			.utinyint, .tinyint, .smallint, .usmallint, .integer, .uinteger, .bigint, .unknown => return .bigint,
 			.double => return .double,
 			.ubigint => return .varchar,
-			.varchar, .json, .bool => return .json,
+			.varchar, .json, .bool, .date, .time, .timestamptz => return .json,
 		},
 		.ubigint => switch (list_type) {
 			.utinyint, .usmallint, .uinteger, .ubigint, .unknown => return .ubigint,
 			.double => return .double,
 			.tinyint, .smallint, .integer, .bigint => return .bigint,
-			.varchar, .json, .bool => return .json,
+			.varchar, .json, .bool, .date, .time, .timestamptz => return .json,
 		},
 		.double => switch (list_type) {
 			.tinyint, .utinyint, .smallint, .usmallint, .integer, .uinteger, .bigint, .ubigint, .double, .unknown => return .double,
-			.varchar, .bool, .json => return .json,
+			.varchar, .bool, .json, .date, .time, .timestamptz => return .json,
 		},
 		.varchar => switch (list_type) {
-			.varchar => return .varchar,
+			.varchar, .date, .time, .timestamptz => return .varchar,
 			else => return .json,
+		},
+		.date => switch (list_type) {
+			.date => return .date,
+			else => return .varchar,
+		},
+		.time => switch (list_type) {
+			.time => return .time,
+			else => return .varchar,
+		},
+		.timestamptz => switch (list_type) {
+			.timestamptz => return .timestamptz,
+			else => return .varchar,
 		},
 		.json => return .json,
 		.unknown => return list_type,
@@ -863,10 +935,6 @@ fn compatibleListDataType(column_type: DataType, list_type: DataType) DataType {
 // strings. We also know that, by the type appendList has been called, our values
 // are compatible with target_type. So if our target_type is `bigint`, we know that
 // ever value in our list can be converted to an ?i64.
-//
-// It's worth nothing that we could do this allocation-free. We could iterate our
-// []Event.Value and append them directly into the underlying DuckDB vectors.
-
 fn appendList(target_type: DataType, appender: *zuckdb.Appender, list: Event.Value.List, param_index: usize) !void {
 	if (target_type == .json) {
 		// Our event thankfully stores the raw array json. For a json column
@@ -886,6 +954,7 @@ fn appendList(target_type: DataType, appender: *zuckdb.Appender, list: Event.Val
 		.double => return appender.appendListMap(Event.Value, f64, param_index, list.values, listItemMapDouble),
 		.bool => return appender.appendListMap(Event.Value, bool, param_index, list.values, listItemMapBool),
 		.varchar => return appender.appendListMap(Event.Value, []const u8, param_index, list.values, listItemMapText),
+		.date, .time, .timestamptz => unreachable, // TODO: support these list types
 		.json, .unknown => unreachable,
 	}
 }
@@ -1161,7 +1230,10 @@ test "DataSet: columnsFromEvent" {
 	const event_list = try Event.parse(t.allocator,
 	  \\ {
 	  \\   "id": 99999, "name": "teg", "details": {"handle": 9001},
-	  \\   "l1": [1, -9000, 293000], "l2": [true, [123]]
+	  \\   "l1": [1, -9000, 293000], "l2": [true, [123]],
+	  \\   "p1": "true", "p2": "TrUe", "p3": "false", "p4": "FAlsE",
+	  \\   "p5": "1234567", "p6": "-43", "p7": "123.99842",
+	  \\   "p8": "2024-05-20", "p9": "08:12:34", "pa": "2026-07-21T09:13:45Z"
 	  \\ }
 	);
 	defer event_list.deinit();
@@ -1175,12 +1247,22 @@ test "DataSet: columnsFromEvent" {
 		t.allocator.free(columns);
 	}
 
-	try t.expectEqual(5, columns.len);
-	try t.expectEqual(.{.name = "details", .is_list = false, .nullable = false, .data_type = .json}, columns[0]);
-	try t.expectEqual(.{.name = "id", .is_list = false, .nullable = false, .data_type = .uinteger}, columns[1]);
-	try t.expectEqual(.{.name = "l1", .is_list = true, .nullable = false, .data_type = .integer}, columns[2]);
-	try t.expectEqual(.{.name = "l2", .is_list = false, .nullable = false, .data_type = .json}, columns[3]);
-	try t.expectEqual(.{.name = "name", .is_list = false, .nullable = false, .data_type = .varchar}, columns[4]);
+	try t.expectEqual(15, columns.len);
+	try t.expectEqual(.{.name = "details", .is_list = false, .nullable = false, .data_type = .json, .parsed = false}, columns[0]);
+	try t.expectEqual(.{.name = "id", .is_list = false, .nullable = false, .data_type = .uinteger, .parsed = false}, columns[1]);
+	try t.expectEqual(.{.name = "l1", .is_list = true, .nullable = false, .data_type = .integer, .parsed = false}, columns[2]);
+	try t.expectEqual(.{.name = "l2", .is_list = false, .nullable = false, .data_type = .json, .parsed = false}, columns[3]);
+	try t.expectEqual(.{.name = "name", .is_list = false, .nullable = false, .data_type = .varchar, .parsed = false}, columns[4]);
+	try t.expectEqual(.{.name = "p1", .is_list = false, .nullable = false, .data_type = .bool, .parsed = true}, columns[5]);
+	try t.expectEqual(.{.name = "p2", .is_list = false, .nullable = false, .data_type = .bool, .parsed = true}, columns[6]);
+	try t.expectEqual(.{.name = "p3", .is_list = false, .nullable = false, .data_type = .bool, .parsed = true}, columns[7]);
+	try t.expectEqual(.{.name = "p4", .is_list = false, .nullable = false, .data_type = .bool, .parsed = true}, columns[8]);
+	try t.expectEqual(.{.name = "p5", .is_list = false, .nullable = false, .data_type = .uinteger, .parsed = true}, columns[9]);
+	try t.expectEqual(.{.name = "p6", .is_list = false, .nullable = false, .data_type = .tinyint, .parsed = true}, columns[10]);
+	try t.expectEqual(.{.name = "p7", .is_list = false, .nullable = false, .data_type = .double, .parsed = true}, columns[11]);
+	try t.expectEqual(.{.name = "p8", .is_list = false, .nullable = false, .data_type = .date, .parsed = true}, columns[12]);
+	try t.expectEqual(.{.name = "p9", .is_list = false, .nullable = false, .data_type = .time, .parsed = true}, columns[13]);
+	try t.expectEqual(.{.name = "pa", .is_list = false, .nullable = false, .data_type = .timestamptz, .parsed = true}, columns[14]);
 }
 
 test "DataSet: record simple" {
@@ -1190,11 +1272,11 @@ test "DataSet: record simple" {
 	const ds = try testDataSet(tc);
 
 	{
-		const event_list = try Event.parse(t.allocator, "{\"id\": 1, \"system\": \"catalog\", \"active\": true, \"record\": 0.932, \"category\": null}");
+		const event_list = try Event.parse(t.allocator, "{\"id\": 1, \"system\": \"catalog\", \"active\": true, \"record\": 0.932, \"category\": null, \"date\": \"2025-11-20\", \"time\": \"17:45:08.842\", \"datetime\": \"2026-01-31T23:59:48.000112Z\"}");
 		ds.record(event_list);
 		try ds.flushAppender();
 
-		var row = (try ds.conn.row("select ldk_id, ldk_ts, id, system, active, record, category from dataset_test where id =  1", .{})).?;
+		var row = (try ds.conn.row("select ldk_id, ldk_ts, id, system, active, record, category, date, time, datetime from dataset_test where id =  1", .{})).?;
 		defer row.deinit();
 
 		try t.expectEqual(1, row.get(u64, 0));
@@ -1204,6 +1286,9 @@ test "DataSet: record simple" {
 		try t.expectEqual(true, row.get(bool, 4));
 		try t.expectEqual(0.932, row.get(f64, 5));
 		try t.expectEqual(null, row.get(?[]u8, 6));
+		try t.expectEqual(.{.year = 2025, .month = 11, .day = 20}, row.get(zuckdb.Date, 7));
+		try t.expectEqual(.{.hour = 17, .min = 45, .sec = 8, .micros = 842000}, row.get(zuckdb.Time, 8));
+		try t.expectEqual(1769903988000112, row.get(i64, 9));
 	}
 
 	{
@@ -1526,6 +1611,45 @@ test "DataSet: record add column" {
 		try t.expectEqual(true, ds.columnLookup.contains("tag2"));
 
 		try t.expectEqual(false, ds.columnLookup.contains("\"invalid\""));
+	}
+}
+
+test "DataSet: record add parsed column" {
+	var tc = t.context(.{});
+	defer tc.deinit();
+
+	const ds = try testDataSet(tc);
+
+	{
+		const event_list = try Event.parse(t.allocator, "{\"id\": 6, \"new\": \"False\"}");
+		ds.record(event_list);
+		try ds.flushAppender();
+
+		var row = (try ds.conn.row("select new from dataset_test where id = 6", .{})).?;
+		defer row.deinit();
+		try t.expectEqual(false, row.get(bool, 0));
+
+		try t.expectEqual("new", ds.columns.items[5].name);
+		try t.expectEqual(true, ds.columns.items[5].nullable);
+		try t.expectEqual(false, ds.columns.items[5].is_list);
+		try t.expectEqual(.bool, ds.columns.items[5].data_type);
+		try t.expectEqual(true, ds.columnLookup.contains("new"));
+	}
+
+	{
+		const event_list = try Event.parse(t.allocator, "{\"id\": 7, \"date\": \"2024-05-16\"}");
+		ds.record(event_list);
+		try ds.flushAppender();
+
+		var row = (try ds.conn.row("select date from dataset_test where id = 7", .{})).?;
+		defer row.deinit();
+		try t.expectEqual(.{.year = 2024, .month = 5, .day = 16}, row.get(zuckdb.Date, 0));
+
+		try t.expectEqual("date", ds.columns.items[6].name);
+		try t.expectEqual(true, ds.columns.items[6].nullable);
+		try t.expectEqual(false, ds.columns.items[6].is_list);
+		try t.expectEqual(.date, ds.columns.items[6].data_type);
+		try t.expectEqual(true, ds.columnLookup.contains("date"));
 	}
 }
 
