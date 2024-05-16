@@ -210,6 +210,9 @@ pub const Meta = struct {
 	}
 };
 
+// A pre-serialized payload of the system information (mosty versions and stuff)
+// Expires indicates the unix timestamp in seconds, where a new info should be
+// generated.
 const Info = struct {
 	json: []const u8,
 	expires: i64,
