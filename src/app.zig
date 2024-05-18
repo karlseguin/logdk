@@ -18,14 +18,10 @@ const ValidatorPool = @import("validate").Pool;
 const BufferPool = @import("zul").StringBuilder.Pool;
 
 pub const Queues = struct {
-	// order sadly matters, we want to shutdown the dataset workers before the
-	// meta workers, since dataset workers send messages to meta workers. Ouch.
 	dataset: d.Queues(DataSet),
-	meta: d.Queues(Meta),
 
 	pub fn init(allocator: Allocator) !Queues {
 		return .{
-			.meta = try d.createQueues(allocator, Meta, 1),
 			.dataset = try d.createQueues(allocator, DataSet, 4),
 		};
 	}
@@ -35,9 +31,8 @@ const Scheduler = zul.Scheduler(logdk.Tasks, *App);
 
 pub const App = struct {
 	// Because of the actor-ish nature of DataSets, our meta holds a snapshot
-	// of the current configuration. This largely exists to satisfy the important
-	// GET /describe endpoint.
-	meta: *Meta,
+	// of the current configuration.
+	meta: Meta,
 
 	// Pool of DuckDB Connections. Note that each DataSet worker (which handles
 	// the inserts and any alter statement) has its own dedicate connetion that
@@ -62,13 +57,6 @@ pub const App = struct {
 	// dataset (e.g. add a column) while safely processing inserts. To achieve
 	// this, all behavior is sent as Messages to the DataSet via the dispatcher.
 	dispatcher: d.Dispatcher(Queues),
-
-	// protects datasets when adding/getting datasets
-	_dataset_lock: Thread.RwLock,
-
-	// This is a name => actor_id lookup, we use the actor_id to send a message
-	// to the dataset via the dispatcher.
-	_datasets: std.StringHashMap(usize),
 
 	// Ephemeral background task scheduler. All scheduled task for this scheduler
 	// run in the scheduler thread. Currently only used to periodically flush the
@@ -105,17 +93,16 @@ pub const App = struct {
 		var dispatcher = try d.Dispatcher(Queues).init(allocator);
 		errdefer dispatcher.deinit();
 
-		const meta_actor = try dispatcher.create(Meta);
-		meta_actor.value = try Meta.init(allocator, meta_actor.queue);
-		errdefer meta_actor.value.deinit();
+		const meta = try Meta.init(allocator);
+		errdefer meta.value.deinit();
 
 		var scheduler = Scheduler.init(allocator);
 		errdefer scheduler.deinit();
 
 		return .{
+			.meta = meta,
 			.create_lock = .{},
 			.allocator = allocator,
-			.meta = &meta_actor.value,
 			.validators = validator_pool,
 			.settings = .{
 				._dynamic_dataset_creation = true,
@@ -124,41 +111,17 @@ pub const App = struct {
 			.buffers = buffers,
 			.scheduler = scheduler,
 			.dispatcher = dispatcher,
-			._dataset_lock = .{},
-			._datasets = std.StringHashMap(usize).init(allocator),
 		};
 	}
 
 	pub fn deinit(self: *App) void {
 		self.scheduler.deinit();
 
-		{
-			self._dataset_lock.lock();
-			defer self._dataset_lock.unlock();
-
-			{
-				// First, send a flush to each dataset
-				var it = self._datasets.valueIterator();
-				while (it.next()) |value| {
-					self.dispatcher.send(logdk.DataSet, value.*, .{.flush = {}});
-				}
-			}
-
-			// Next, stop the dispatcher, this waits until all message are processed
-			self.dispatcher.stop();
-
-			{
-				// Finally cleanup all the datsets
-				var it = self._datasets.valueIterator();
-				while (it.next()) |value| {
-					self.dispatcher.unsafeInstance(DataSet, value.*).deinit();
-				}
-			}
-
-			self._datasets.deinit();
-		}
-
+		// No one really owns the logdk.DataSets, but we make Meta responsible
+		// for cleaning them up since it knows the most about them.
+		self.meta.shutdown(&self.dispatcher);
 		self.meta.deinit();
+
 		self.dispatcher.deinit();
 
 		self.db.deinit();
@@ -166,13 +129,15 @@ pub const App = struct {
 		self.validators.deinit();
 	}
 
-	pub fn getDataSetRef(self: *App, name: []const u8) ?usize {
-		self._dataset_lock.lockShared();
-		defer self._dataset_lock.unlockShared();
-		return self._datasets.get(name);
+	pub fn getDataSet(self: *App, name: []const u8) ?Meta.DataSetArc {
+		return self.meta.getDataSet(name);
 	}
 
-	pub fn createDataSet(self: *App, env: *Env, name: []const u8, event: Event) !usize {
+	pub fn dataSetExists(self: *App, name: []const u8) bool {
+		return self.meta.dataSetExists(name);
+	}
+
+	pub fn createDataSet(self: *App, env: *Env, name: []const u8, event: Event) !Meta.DataSetArc {
 		var arena = ArenaAllocator.init(self.allocator);
 		defer arena.deinit();
 
@@ -187,8 +152,8 @@ pub const App = struct {
 		defer self.create_lock.unlock();
 
 		// under our create_lock, this check is definitive.
-		if (self._datasets.get(name)) |q| {
-			return q;
+		if (self.getDataSet(name)) |ds| {
+			return ds;
 		}
 
 		const columns = try DataSet.columnsFromEvent(aa, event, env.logger);
@@ -235,7 +200,8 @@ pub const App = struct {
 		conn.commit() catch |err| return env.dbErr("App.createDataSet.commit", err, conn);
 
 		logdk.metrics.addDataSet();
-		return self.loadDataSet(row.?);
+		try self.loadDataSet(row.?);
+		return self.getDataSet(name) orelse unreachable;
 	}
 
 	pub fn loadDataSets(self: *App) !void {
@@ -249,30 +215,24 @@ pub const App = struct {
 
 		var count: usize = 0;
 		while (try rows.next()) |row| {
-			_ = try self.loadDataSet(row);
+			try self.loadDataSet(row);
 			count += 1;
 		}
 		logz.info().ctx("App.loadDataSets").int("count", count).log();
 	}
 
 	// row could be an zuckdb.Row or a zuckdb.OwningRow
-	fn loadDataSet(self: *App, row: anytype) !usize {
+	fn loadDataSet(self: *App, row: anytype) !void {
 		var dataset = try DataSet.init(self, row);
 		errdefer dataset.deinit();
 
 		const actor_id = try self.dispatcher.add(dataset);
-
-		{
-			self._dataset_lock.lock();
-			defer self._dataset_lock.unlock();
-			try self._datasets.put(dataset.name, actor_id);
-		}
+		dataset.actor_id = actor_id;
 
 		// this dataset is going to move (and be owned by our actor), but this
 		// is safe because meta.datasetChanged clones all the data it needs for its
 		// own meta copy
 		try self.meta.datasetChanged(&dataset);
-		return actor_id;
 	}
 
 	// The app settings can be changed during runtime, so we need to encapsulate
@@ -304,7 +264,7 @@ test "App: loadDataSets" {
 	var app = tc.app;
 	try app.loadDataSets();
 
-	const ds = app.dispatcher.unsafeInstance(DataSet, app._datasets.get("system").?);
+	const ds = tc.unsafeDataSet("system");
 	try t.expectEqual("system", ds.name);
 	try t.expectEqual(4, ds.columns.items.len);
 	try t.expectEqual(.{.name = "id", .nullable = false, .is_list = false, .data_type = .integer, .parsed = false}, ds.columns.items[0]);
@@ -318,15 +278,19 @@ test "App: createDataSet success" {
 	defer tc.deinit();
 	tc.silenceLogs();
 
+	// sanity check
+	try t.expectEqual(false, tc.app.dataSetExists("metrics_1"));
+
 	// the invalid field names are ignored
 	var event_list = try Event.parse(t.allocator, "{\"id\": \"cx_312\", \"tags\": null, \"monitor\": false, \"flags\": [2, 2394, -3], \"inv\\\"alid\": 8, \"\": 9, \"value\": \"1234\", \"at\": \"2024-05-16T08:57:33Z\"}");
 	defer event_list.deinit();
 
 	{
-		const actor_id = try tc.app.createDataSet(tc.env(), "metrics_1", event_list.events[0]);
-		try t.expectEqual(actor_id, tc.app._datasets.get("metrics_1").?);
+		const arc = try tc.app.createDataSet(tc.env(), "metrics_1", event_list.events[0]);
+		defer arc.release();
+		try t.expectEqual(true, tc.app.dataSetExists("metrics_1"));
 
-		const ds = tc.app.dispatcher.unsafeInstance(DataSet, actor_id);
+		const ds = tc.app.dispatcher.unsafeInstance(DataSet, arc.value.actor_id);
 		try t.expectEqual("metrics_1", ds.name);
 
 		try t.expectEqual(6, ds.columns.items.len);

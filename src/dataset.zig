@@ -1809,10 +1809,10 @@ fn testDataSet(tc: *t.Context) !*DataSet {
 		\\ }
 	);
 	defer event_list.deinit();
-	const actor_id = try tc.app.createDataSet(tc.env(), "dataset_test", event_list.events[0]);
-	var ds = tc.app.dispatcher.unsafeInstance(DataSet, actor_id);
-	ds.actor_id = actor_id;
-	return ds;
+	var arc = try tc.app.createDataSet(tc.env(), "dataset_test", event_list.events[0]);
+	arc.release();
+
+	return tc.unsafeDataSet("dataset_test");
 }
 
 fn testDataSetWithList(tc: *t.Context) !*DataSet {
@@ -1824,6 +1824,7 @@ fn testDataSetWithList(tc: *t.Context) !*DataSet {
 		\\ }
 	);
 	defer event_list.deinit();
-	const actor_id = try tc.app.createDataSet(tc.env(), "dataset_list_test", event_list.events[0]);
-	return tc.app.dispatcher.unsafeInstance(DataSet, actor_id);
+	const arc = try tc.app.createDataSet(tc.env(), "dataset_list_test", event_list.events[0]);
+	arc.release();
+	return tc.unsafeDataSet("dataset_list_test");
 }

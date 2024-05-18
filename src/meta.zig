@@ -4,80 +4,129 @@ const logz = @import("logz");
 const httpz = @import("httpz");
 const logdk = @import("logdk.zig");
 
+const M = @This();
+
 const d = logdk.dispatcher;
 
+const RwLock = std.Thread.RwLock;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 
-// Describes the system. Used in the GET /describe and GET /info endpoints.
+// Describes the system. logdk.DataSet is an important part of this system, but
+// its record() method is also on the hot path, and it's pretty complicated.
+// A challenge for this system is that a logdk.DataSet can change, but how do
+// we handle such changes concurrently, without over-complicated and slowing
+// the record() hot path? Ideally, logdk.DataSet would be lock-free, doing its
+// own thing and unconcerned with what the rest of the code is doing.
 //
-// For Describe, in the scale of things, the system doesn't change often, so
-// this data is pretty static. If we were to get this on-demand, we'd have to
-// deal with all types of thread-safety issues. Instead, when a dataset changes,
-// it sends a message to Meta (via our actor-ish dispatcher).
+// And what's what we do.
 //
-// For Info, the data changes a bit more (e.g. size of the database), so we load
-// the info, track the timestamp, and if we try getInfo() again and the timestamp
-// is old, we refresh it. It's a bit like a cache, EXCEPT, the old info is always
-// available, so if updating info fails, we can always return the old one. B
+// We have 2 versions of a "DataSet". The first is is logdk.DataSet,
+// it's authoratative and its main purpose is to insert events, and mutate
+// the underlying table (and itself) whenever columns need changing. logdk.DataSet
+// is a bit like an "Actor", almost all of its code runs on a single thread and
+// the only way to iteract with it is by sending messages via the disaptcher.
 //
-// There's still some thread-safety issues. describe or info might get rebuilt while
-// we're writing the response to the socket. So we use thread-safe reference
-// counter. This is solved by keeping the values on the heap, behind an atomic
-// reference counter (arc). Only when the arc reaches 0 do we free the memory.
+// But, various HTTP endpoints need details about the datasets and using [async]
+// messages through the dispatcher to get this information isn't only slow, it
+// puts a burden on logdk.DataSet. Hence we have "Meta" which has its own DataSet.
+// the DataSet that you'll find in this file is almost purely data (no behavior).
+// Each meta DataSet is a deep copy of a logdk.DataSet, and it's thread safe. It
+// might be a few seconds out of date, but that's ok.
+//
+// We use something like a Mutex<Arc<DataSet>> to protect and share Meta's information.
 pub const Meta = struct {
-	_info: zul.LockRefArenaArc(Info),
-	_describe: zul.LockRefArenaArc([]const u8),
 	_allocator: Allocator,
-	_queue: *d.Queue(Meta),
-	_datasets: std.ArrayListUnmanaged(DataSet),
 
-	pub const InfoValue = *zul.LockRefArenaArc(Info).Value;
-	pub const DescribeValue = *zul.LockRefArenaArc([]const u8).Value;
+	_info: zul.LockRefArenaArc(Info),
+	_describe: zul.LockRefArenaArc(Describe),
 
-	pub fn init(allocator: Allocator, queue: *d.Queue(Meta)) !Meta {
-		var ic = try zul.LockRefArenaArc(Info).create(allocator);
-		errdefer ic.deinit();
-		// default value, because expires is 0, it'll get reloaded on demand on the first request
-		ic.value_ptr.* = .{.json = "{}", .expires = 0};
+	_datasets_lock: RwLock,
+	_datasets: std.StringHashMapUnmanaged(zul.LockRefArenaArc(DataSet)),
 
-		var dc = try zul.LockRefArenaArc([]const u8).create(allocator);
-		errdefer dc.deinit();
-		dc.value_ptr.* = try loadDescribe(dc.arena, .{.datasets = &[_]DataSet{}});
+	pub const InfoArc = *zul.LockRefArenaArc(Info).Arc;
+	pub const DataSetArc = *zul.LockRefArenaArc(DataSet).Arc;
+	pub const DescribeArc = *zul.LockRefArenaArc(Describe).Arc;
+
+	pub fn init(allocator: Allocator) !Meta {
+		const datasets = std.StringHashMapUnmanaged(zul.LockRefArenaArc(DataSet)){};
+
+		var info = try zul.LockRefArenaArc(Info).init(allocator, .{null});
+		errdefer info.deinit();
+
+		var describe = try zul.LockRefArenaArc(Describe).init(allocator, .{datasets});
+		errdefer describe.deinit();
 
 		return .{
-			._queue = queue,
-			._info = ic.ref,
-			._describe = dc.ref,
+			._info = info,
+			._describe = describe,
 			._allocator = allocator,
-			._datasets = std.ArrayListUnmanaged(DataSet){},
+			._datasets_lock = .{},
+			._datasets = datasets,
 		};
 	}
 
 	pub fn deinit(self: *Meta) void {
+		// Shutdown is normally be called before deinit. The only time this isn't
+		// true is during a startup failure, where no dataset has been loaded,
+		// and no events can possibly need flushing (because the web endpoints
+		// aren't event up).
 		self._info.deinit();
 		self._describe.deinit();
-
-		for (self._datasets.items) |ds| {
-			ds.deinit();
-		}
 		self._datasets.deinit(self._allocator);
 	}
 
-	// The mix of lock + atomic seems weird, but I believe it's correct/necessary.
-	// The lock protects the self._describe reference, wheras the _rc protects the
-	// describe itself. `arc._rc` is mutated in arc.release() which isn't
-	// lock-protected.
-	// So the lock here makes sure that we can get an arc instance, and increase its
-	// rc, without another thread being able to swap out the version in between
-	// those two operations. The atomic keeps `arc._rc` consistent across
-	// multiple-threads which aren't all under lock.
-	// I think.
-	pub fn getDescribe(self: *Meta) DescribeValue {
-		return self._describe.acquire();
+	// The logdk.DataSets aren't owned by anything. They're just floating
+	// on the heap. Someone has to be responsible for cleaning them up. Ideally
+	// that would be the logdk.App, but it's a lot easier to do here because
+	// this is where we have all the actor_ids we need to flush and then
+	// deinint them.
+	pub fn shutdown(self: *Meta, dispatcher: anytype) void {
+		{
+			// Because we're under lock, it's safe to access the arc values directly
+			self._datasets_lock.lock();
+			defer self._datasets_lock.unlock();
+
+			// First, send a flush to each dataset
+			var it = self._datasets.valueIterator();
+			while (it.next()) |ds| {
+				dispatcher.send(logdk.DataSet, ds.arc.value.actor_id, .{.flush = {}});
+			}
+		}
+
+		// Next, stop the dispatcher, this waits until all message are processed
+		dispatcher.stop();
+
+		{
+			// Finally cleanup all the datsets
+			var it = self._datasets.valueIterator();
+			while (it.next()) |ds| {
+				dispatcher.unsafeInstance(logdk.DataSet, ds.arc.value.actor_id).deinit();
+				ds.deinit();
+			}
+		}
 	}
 
-	pub fn getInfo(self: *Meta, app: *logdk.App) InfoValue {
+	pub fn getDataSet(self: *Meta, name: []const u8) ?DataSetArc {
+		self._datasets_lock.lockShared();
+		defer self._datasets_lock.unlockShared();
+		var arc = self._datasets.get(name) orelse return null;
+		return arc.acquire();
+	}
+
+	pub fn dataSetExists(self: *Meta, name: []const u8) bool {
+		self._datasets_lock.lockShared();
+		defer self._datasets_lock.unlockShared();
+		return self._datasets.contains(name);
+	}
+
+	// Returns an ARC-wrapped Info. This allows us to update _info
+	// without invalidating the reference that we just handed out.
+	// Unlike describe which is updated whenever a dataset changes or is added
+	// info gets updated periodically (because things like DB size change
+	// periodically). getInfo checks if its time to update the reference and, if
+	// so, does just that.
+	pub fn getInfo(self: *Meta, app: *logdk.App) InfoArc {
 		const arc = self._info.acquire();
 		const info = arc.value;
 
@@ -86,98 +135,163 @@ pub const Meta = struct {
 			return arc;
 		}
 
-		var new = self._info.new() catch |err| {
-			logz.err().err(err).ctx("Meta.getInfo.create").log();
-			return arc;
-		};
-
-		new.value_ptr.* = loadInfo(new.arena, app) catch |err| {
-			new.deinit();
-			logz.err().err(err).ctx("Meta.loadInfo").log();
+		// our current info has expired. We'll try to generate a new one, but
+		// if that fails, we can always return the expired one.s
+		self._info.setValue(.{app}) catch |err| {
+			logz.err().err(err).ctx("Meta.getInfo").log();
 			return arc; // return the previous value
 		};
 
-		// release the old one, now that we have a new
+		// we no longer need the old value
 		arc.release();
-
-		self._info.swap(new);
-		return new.acquire();
+		return self._info.acquire();
 	}
 
-	// This is being called from the DataSet's worker thread, so we can
+	pub fn getDescribe(self: *Meta) DescribeArc {
+		const arc = self._describe.acquire();
+		if (@atomicLoad(bool, &arc.value.stale, .monotonic) == false) {
+			return arc;
+		}
+
+		// our describe is stale, regenerate!
+		self._datasets_lock.lockShared();
+		defer self._datasets_lock.unlockShared();
+		self._describe.setValue(.{self._datasets}) catch |err| {
+			logz.err().err(err).ctx("Meta.getDescribe").log();
+			return arc; // return the previous value
+		};
+
+		// we no longer need the old value
+		arc.release();
+		return self._describe.acquire();
+
+	}
+
+	// When dataset is new, then this is being called	This is being called from the DataSet's worker thread, so we can
 	// safely access the dataset here and now. We'll create our meta version
 	// of the dataset.
 	pub fn datasetChanged(self: *Meta, dataset: *logdk.DataSet) !void {
-		var arena = ArenaAllocator.init(self._allocator);
-		errdefer arena.deinit();
-		const allocator = arena.allocator();
+		// we want to create the arc here, because we want its arena to clone
+		// the dataset.
+		{
+			const allocator = self._allocator;
 
-		var columns = try allocator.alloc(Column, dataset.columns.items.len);
-		for (dataset.columns.items, 0..) |c, i| {
-			columns[i] = .{
-				.name = try allocator.dupe(u8, c.name),
-				.is_list = c.is_list,
-				.nullable = c.nullable,
-				.data_type = @tagName(c.data_type),
+			self._datasets_lock.lock();
+			defer self._datasets_lock.unlock();
+
+			const gop = try self._datasets.getOrPut(allocator, dataset.name);
+			if (gop.found_existing == false) {
+				gop.value_ptr.* = try zul.LockRefArenaArc(DataSet).init(allocator, .{dataset});
+			} else {
+				try gop.value_ptr.setValue(.{dataset});
+			}
+
+			// not strictly necessary since out logdk.DataSet.name should be immutable
+			// but better safe than sorry
+			const arc = gop.value_ptr.acquire();
+			gop.key_ptr.* = arc.value.name;
+			arc.release();
+		}
+
+
+		const describe = self._describe.acquire();
+		defer describe.release();
+		@atomicStore(bool, &describe.value.stale, true, .monotonic);
+	}
+
+	// a "meta" representation of a DataSet. This owns all its fields, since
+	// references to the real dataset are not thread-safe
+	pub const DataSet = struct {
+		name: []const u8,
+		columns: []Column,
+		actor_id: usize,
+
+		// allocator is an Arena, we can be sloppy
+		pub fn init(allocator: Allocator, dataset: *logdk.DataSet) !DataSet {
+			var columns = try allocator.alloc(Column, dataset.columns.items.len);
+			for (dataset.columns.items, 0..) |c, i| {
+				columns[i] = .{
+					.name = try allocator.dupe(u8, c.name),
+					.is_list = c.is_list,
+					.nullable = c.nullable,
+					.data_type = @tagName(c.data_type),
+				};
+			}
+
+			return .{
+				.name = try allocator.dupe(u8, dataset.name),
+				.actor_id = dataset.actor_id,
+				.columns = columns,
 			};
 		}
 
-		// Now we want to tranfer to Meta's own worker thread. We largely want to
-		// do this because we want to limit how much time we spend blocking the
-		// dataset thread. We still need to regenerate the entire payload based
-		// on this new/changed dataset, and there's no reason to do that while
-		// blocking hte worker.
-		self._queue.send(self, .{
-			.dataset = .{
-				.arena = arena,
-				.name = try allocator.dupe(u8, dataset.name),
-				.columns = columns,
-			}
-		});
-	}
-
-	pub const Message = union(enum) {
-		dataset: DataSet,
+		pub fn jsonStringify(self: *const DataSet, jws: anytype) !void {
+			// stupid, but don't want to serialize the actor_id
+			try jws.beginObject();
+			try jws.objectField("name");
+			try jws.write(self.name);
+			try jws.objectField("columns");
+			try jws.write(self.columns);
+			try jws.endObject();
+		}
 	};
+};
 
-	pub fn handle(self: *Meta, message: Message) !void {
-		switch (message) {
-			.dataset => |dataset| return self.updateDataSet(dataset),
-		}
-	}
 
-	fn updateDataSet(self: *Meta, dataset: DataSet) !void {
-		const allocator = self._allocator;
+const Column = struct {
+	name: []const u8,
+	nullable: bool,
+	is_list: bool,
+	data_type: []const u8,
+};
 
-		blk: {
-			for (self._datasets.items) |*ds| {
-				if (std.mem.eql(u8, ds.name, dataset.name)) {
-					ds.deinit();
-					ds.* = dataset;
-					break :blk;
-				}
+const Describe = struct {
+	stale: bool,
+	json: []const u8,
+
+	// when this is called, meta._datasets_lock is under a read-lock.
+	// allocator is an arena that we aren't responsible for, so we can be sloppy.
+	pub fn init(allocator: Allocator, datasets: std.StringHashMapUnmanaged(zul.LockRefArenaArc(Meta.DataSet))) !Describe {
+		// Zig doesn't have a good way to serialize a StringHashMap
+
+		var arr = std.ArrayList(u8).init(allocator);
+		var writer = arr.writer();
+		try writer.writeAll("{\"datasets\": [");
+
+		var it = datasets.valueIterator();
+		if (it.next()) |first| {
+			try std.json.stringify(first.arc.value, .{}, writer);
+			while (it.next()) |ref| {
+				try writer.writeByte(',');
+				try std.json.stringify(ref.arc.value, .{}, writer);
 			}
-			try self._datasets.append(allocator, dataset);
 		}
+		try writer.writeAll("]}");
 
-		var new = try self._describe.new();
-		errdefer new.deinit();
-
-		new.value_ptr.* = try loadDescribe(new.arena, .{.datasets = self._datasets.items});
-		self._describe.swap(new);
+		return .{.json = arr.items, .stale = false};
 	}
+};
 
-	fn loadDescribe(allocator: Allocator, data: anytype) ![]const u8 {
-		return try std.json.stringifyAlloc(allocator, data, .{});
-	}
+// A pre-serialized payload of the system information (mosty versions and stuff)
+// Expires indicates the unix timestamp in seconds, where a new info should be
+// generated.
+// allocator is an arena that we aren't responsible for, so we can be sloppy.
+const Info = struct {
+	json: []const u8,
+	expires: i64,
 
-	fn loadInfo(allocator: Allocator, app: *logdk.App) !Info {
+	pub fn init(allocator: Allocator, app_: ?*logdk.App) !Info {
+		// app is initially not availabe. That's fine. We create an empty Info
+		// with an expiration of 0, which means next time someone tried to get the
+		// info, it'll reload.
+		const app = app_ orelse return .{.json = "{}", .expires = 0};
+
 		var conn = try app.db.acquire();
 		defer conn.release();
 
 		const duckdb_version = blk: {
 			const row = conn.row("select to_json(t) from pragma_version() t", .{}) catch |err| {
-				return logdk.dbErr("Meta.info.version", err, conn, logz.err());
+				return logdk.dbErr("Meta.Info.version", err, conn, logz.err());
 			} orelse return error.PragmaNoRow;
 			defer row.deinit();
 			break :blk try allocator.dupe(u8, row.get([]const u8, 0));
@@ -185,7 +299,7 @@ pub const Meta = struct {
 
 		const duckdb_size = blk: {
 			const row = conn.row("select to_json(t) from pragma_database_size() t", .{}) catch |err| {
-				return logdk.dbErr("Meta.info.version", err, conn, logz.err());
+				return logdk.dbErr("Meta.Info.database_size", err, conn, logz.err());
 			} orelse return error.PragmaNoRow;
 			defer row.deinit();
 			break :blk try allocator.dupe(u8, row.get([]const u8, 0));
@@ -207,41 +321,4 @@ pub const Meta = struct {
 			.expires = std.time.timestamp() + 10,
 		};
 	}
-};
-
-// A pre-serialized payload of the system information (mosty versions and stuff)
-// Expires indicates the unix timestamp in seconds, where a new info should be
-// generated.
-const Info = struct {
-	json: []const u8,
-	expires: i64,
-};
-
-// a "meta" representation of a DataSet. This owns all its fields, since
-// references to the real dataset are not thread-safe
-const DataSet = struct {
-	arena: ArenaAllocator,
-	name: []const u8,
-	columns: []Column,
-
-	pub fn deinit(self: *const DataSet) void {
-		self.arena.deinit();
-	}
-
-	pub fn jsonStringify(self: *const DataSet, jws: anytype) !void {
-		// necessary, else it'll try (and fail) to stringify the arena
-		try jws.beginObject();
-		try jws.objectField("name");
-		try jws.write(self.name);
-		try jws.objectField("columns");
-		try jws.write(self.columns);
-		try jws.endObject();
-	}
-};
-
-const Column = struct {
-	name: []const u8,
-	nullable: bool,
-	is_list: bool,
-	data_type: []const u8,
 };

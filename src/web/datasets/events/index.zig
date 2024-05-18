@@ -131,7 +131,9 @@ fn validateFilter(opt_value: ?typed.Array, context: *logdk.Validate.Context) !?t
 pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void {
 	const app = env.app;
 	const name = req.params.get("name").?;
-	_ = app.getDataSetRef(name) orelse return web.notFound(res, "dataset not found");
+	if (app.dataSetExists(name) == false) {
+		return web.notFound(res, "dataset not found");
+	}
 
 	const input = try web.validateQuery(req, input_validator, env);
 

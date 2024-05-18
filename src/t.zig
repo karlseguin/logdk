@@ -106,11 +106,17 @@ pub const Context = struct {
 		// but should be good enough for most cases. We need to flush every dataset
 		// to make sure any pending appends are written.
 		const app = self.app;
-		var it = app._datasets.valueIterator();
-		while (it.next()) |ref_ptr| {
-			app.dispatcher.send(logdk.DataSet, ref_ptr.*, .{.flush = {}});
+		var it = app.meta._datasets.valueIterator();
+		while (it.next()) |ds| {
+			app.dispatcher.send(logdk.DataSet, ds.arc.value.actor_id, .{.flush = {}});
 		}
 		app.dispatcher.stop();
+	}
+
+	pub fn unsafeDataSet(self: *Context, name: []const u8) *logdk.DataSet {
+		const arc = self.app.getDataSet(name).?;
+		defer arc.release();
+		return self.app.dispatcher.unsafeInstance(logdk.DataSet, arc.value.actor_id);
 	}
 
 	pub fn env(self: *Context) *Env {
@@ -174,9 +180,12 @@ pub const Context = struct {
 
 	pub fn createDataSet(self: *Context, name: []const u8, event_json: []const u8, insert_event: bool) !void {
 		const event_list = try logdk.Event.parse(allocator, event_json);
-		const actor_id = try self.app.createDataSet(self.env(), name, event_list.events[0]);
+
+		const arc = try self.app.createDataSet(self.env(), name, event_list.events[0]);
+		arc.release();
+
 		if (insert_event) {
-			const dataset = self.app.dispatcher.unsafeInstance(logdk.DataSet, actor_id);
+			const dataset = self.unsafeDataSet(name);
 			try dataset.handle(.{.record = event_list});
 			try dataset.handle(.{.flush = {} });
 		} else {
@@ -184,10 +193,12 @@ pub const Context = struct {
 		}
 	}
 
-	pub fn recordEvent(self: *Context, dataset_name: []const u8, event_json: []const u8) !void {
+	pub fn recordEvent(self: *Context, name: []const u8, event_json: []const u8) !void {
 		const event = try logdk.Event.parse(allocator, event_json);
-		const actor_id = self.app.getDataSetRef(dataset_name).?;
-		const dataset = self.app.dispatcher.unsafeInstance(logdk.DataSet, actor_id);
+		const arc = self.app.getDataSet(name).?;
+		arc.release();
+
+		const dataset = self.unsafeDataSet(name);
 		try dataset.handle(.{.record = event});
 		try dataset.handle(.{.flush = {} });
 	}
