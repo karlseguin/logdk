@@ -264,13 +264,33 @@ test "App: loadDataSets" {
 	var app = tc.app;
 	try app.loadDataSets();
 
-	const ds = tc.unsafeDataSet("system");
-	try t.expectEqual("system", ds.name);
-	try t.expectEqual(4, ds.columns.items.len);
-	try t.expectEqual(.{.name = "id", .nullable = false, .is_list = false, .data_type = .integer, .parsed = false}, ds.columns.items[0]);
-	try t.expectEqual(.{.name = "tags", .nullable = false, .is_list = true, .data_type = .varchar, .parsed = false}, ds.columns.items[1]);
-	try t.expectEqual(.{.name = "type", .nullable = false, .is_list = false, .data_type = .varchar, .parsed = false}, ds.columns.items[2]);
-	try t.expectEqual(.{.name = "value", .nullable = true, .is_list = false, .data_type = .double, .parsed = true}, ds.columns.items[3]);
+	{
+		// assert our "real" logdk.DataSet
+		const ds = tc.unsafeDataSet("system");
+		try t.expectEqual("system", ds.name);
+		try t.expectEqual(4, ds.columns.items.len);
+		try t.expectEqual(.{.name = "id", .nullable = false, .is_list = false, .data_type = .integer, .parsed = false}, ds.columns.items[0]);
+		try t.expectEqual(.{.name = "tags", .nullable = false, .is_list = true, .data_type = .varchar, .parsed = false}, ds.columns.items[1]);
+		try t.expectEqual(.{.name = "type", .nullable = false, .is_list = false, .data_type = .varchar, .parsed = false}, ds.columns.items[2]);
+		try t.expectEqual(.{.name = "value", .nullable = true, .is_list = false, .data_type = .double, .parsed = true}, ds.columns.items[3]);
+	}
+
+	{
+		// assert our "not real??" meta.DataSet
+		const arc = app.getDataSet("system").?;
+		defer arc.release();
+
+		const ds = arc.value;
+		try t.expectEqual("system", ds.name);
+		try t.expectEqual(4, ds.columns.len);
+		try t.expectEqual(.{.name = "id", .nullable = false, .is_list = false, .data_type = "integer", .parsed = false}, ds.columns[0]);
+		try t.expectEqual(.{.name = "tags", .nullable = false, .is_list = true, .data_type = "varchar", .parsed = false}, ds.columns[1]);
+		try t.expectEqual(.{.name = "type", .nullable = false, .is_list = false, .data_type = "varchar", .parsed = false}, ds.columns[2]);
+		try t.expectEqual(.{.name = "value", .nullable = true, .is_list = false, .data_type = "double", .parsed = true}, ds.columns[3]);
+
+		try t.expectEqual(1, ds.parsed_fields.len);
+		try t.expectEqual("value", ds.parsed_fields[0]);
+	}
 }
 
 test "App: createDataSet success" {

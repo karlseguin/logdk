@@ -1,5 +1,6 @@
 const std = @import("std");
 const httpz = @import("httpz");
+const zuckdb = @import("zuckdb");
 
 const logdk = @import("../../../logdk.zig");
 const web = logdk.web;
@@ -28,7 +29,20 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 	// once passed to the dispatcher, it becomes the datasets job to release this
 	errdefer event_list.deinit();
 
-	if (arc == null) {
+	if (arc) |a| {
+		// This DataSet already exists. That means we have a list of fields which we've
+		// previously been able to parse. Let's try to parse them again.
+		const ds = a.value;
+		for (ds.parsed_fields) |field| {
+			for (event_list.events) |event| {
+				if (event.map.getPtr(field)) |value| {
+					if (value.tryParse()) |parsed| {
+						value.* = parsed;
+					}
+				}
+			}
+		}
+	} else {
 		const validator = try env.validator();
 		logdk.Validate.validateIdentifier("dataset", name, validator) catch |err| {
 			// Even though this is (most likely) user-input error, we want to log it
@@ -39,6 +53,7 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 		};
 		arc = try app.createDataSet(env, name, event_list.events[0]);
 	}
+
 	app.dispatcher.send(logdk.DataSet, arc.?.value.actor_id, .{.record = event_list});
 	res.status = 204;
 }
@@ -85,8 +100,6 @@ test "events.create: unknown dataset, dynamic create invalid dataset name" {
 }
 
 test "events.create: creates dataset and event" {
-	const zuckdb = @import("zuckdb");
-
 	var tc = t.context(.{});
 	defer tc.deinit();
 
@@ -154,5 +167,76 @@ test "events.create: event fields are case-insensitive" {
 		try t.expectEqual(2, row.get(u8, 0));
 		try t.expectEqual("duncan", row.get([]const u8, 1));
 	}
+}
 
+test "events.create: attemps to re-parse previously parsed fields" {
+	var tc = t.context(.{});
+	defer tc.deinit();
+
+	try tc.createDataSet("reparser", "{\"id\": 1, \"active\": \"true\", \"value\": \"223\", \"at\":\"2024-05-19\", \"over\": \"9000!\"}", true);
+
+	tc.web.param("name", "reparser");
+	tc.web.body(
+		\\ [
+		\\  {"id": 2, "active": "false", "value": "-991944", "over": 4},
+		\\  {"id": 3, "at": "2030-02-10", "over": 123.33}
+		\\ ]
+	);
+	try handler(tc.env(), tc.web.req, tc.web.res);
+	tc.flushMessages();
+
+	{
+		var row = (try tc.row("select active, value, at, over from reparser where id = 2", .{})).?;
+		defer row.deinit();
+		try t.expectEqual(false, row.get(bool, 0));
+		try t.expectEqual(-991944, row.get(i32, 1));
+		try t.expectEqual(null, row.get(?zuckdb.Date, 2));
+		try t.expectEqual("4", row.get([]u8, 3));
+	}
+
+	{
+		var row = (try tc.row("select active, value, at, over from reparser where id = 3", .{})).?;
+		defer row.deinit();
+		try t.expectEqual(null, row.get(?bool, 0));
+		try t.expectEqual(null, row.get(?i32, 1));
+		try t.expectEqual(.{.year = 2030, .month = 2, .day = 10}, row.get(zuckdb.Date, 2));
+		try t.expectEqual("1.2333e2", row.get([]u8, 3));
+	}
+}
+
+test "events.create: unparsable field disabled column parsed flag" {
+	var tc = t.context(.{});
+	defer tc.deinit();
+
+	try tc.createDataSet("unparser", "{\"id\": 1, \"active\": \"true\", \"value\": \"223\"}", true);
+
+	tc.web.param("name", "unparser");
+	tc.web.body("{\"id\": 2, \"active\": \"false\", \"value\": \"nope\"}");
+	try handler(tc.env(), tc.web.req, tc.web.res);
+	tc.flushMessages();
+
+	{
+		var row = (try tc.row("select active, value from unparser where id = 2", .{})).?;
+		defer row.deinit();
+		try t.expectEqual(false, row.get(bool, 0));
+		try t.expectEqual("nope", row.get([]u8, 1));
+	}
+
+	{
+		// verify our original while we're at it
+		var row = (try tc.row("select active, value from unparser where id = 1", .{})).?;
+		defer row.deinit();
+		try t.expectEqual(true, row.get(bool, 0));
+		try t.expectEqual("223", row.get([]u8, 1));
+	}
+
+	{
+		// check the ds is updated
+		var arc = tc.app.getDataSet("unparser").?;
+		defer arc.release();
+
+		const ds = arc.value;
+		try t.expectEqual(1, ds.parsed_fields.len);
+		try t.expectEqual("active", ds.parsed_fields[0]);
+	}
 }

@@ -206,11 +206,27 @@ pub const Meta = struct {
 		columns: []Column,
 		actor_id: usize,
 
+		// A list of the fields who were parsed. Of course, all fields are parsed
+		// from the raw JSON, but here we mean a text field which we parsed into
+		// a number, bool, date, uuid, etc. For the first event of a new dataset,
+		// of a newly added column, we'll try to parse every string field. But
+		// for subsequent events, we only need to parse those string fields which
+		// were previously successfully parsed (I think this is a pretty important
+		// optimization if we're ingesting a large number of events).
+		parsed_fields: [][]const u8,
+
 		// allocator is an Arena, we can be sloppy
 		pub fn init(allocator: Allocator, dataset: *logdk.DataSet) !DataSet {
 			var columns = try allocator.alloc(Column, dataset.columns.items.len);
+
+			var parsed_count: usize = 0;
 			for (dataset.columns.items, 0..) |c, i| {
+				if (c.parsed) {
+					parsed_count += 1;
+				}
+
 				columns[i] = .{
+					.parsed = c.parsed,
 					.name = try allocator.dupe(u8, c.name),
 					.is_list = c.is_list,
 					.nullable = c.nullable,
@@ -218,8 +234,18 @@ pub const Meta = struct {
 				};
 			}
 
+			var parsed_index: usize = 0;
+			const parsed_fields = try allocator.alloc([]const u8, parsed_count);
+			for (columns) |c| {
+				if (c.parsed) {
+					parsed_fields[parsed_index] = c.name;
+					parsed_index += 1;
+				}
+			}
+
 			return .{
 				.name = try allocator.dupe(u8, dataset.name),
+				.parsed_fields = parsed_fields,
 				.actor_id = dataset.actor_id,
 				.columns = columns,
 			};
@@ -237,11 +263,11 @@ pub const Meta = struct {
 	};
 };
 
-
 const Column = struct {
 	name: []const u8,
 	nullable: bool,
 	is_list: bool,
+	parsed: bool,
 	data_type: []const u8,
 };
 

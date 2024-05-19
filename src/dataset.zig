@@ -518,6 +518,12 @@ pub const DataSet = struct {
 					const extra = if (column.is_list) "[]" else "";
 					_ = try self.execFmt("alter table \"{s}\" alter column \"{s}\" set type {s}{s}", .{self.name, column.name, @tagName(target_type), extra}, .{});
 					column.data_type = target_type;
+					if (column.parsed and target_type == .varchar) {
+						// This column was previously flagged as parsed, but this latest value
+						// was obviously not parsed (else the target_type wouldn't be varchar)
+						// so we disable the parsed flag.
+						column.parsed = false;
+					}
 				}
 			},
 		}
@@ -1728,7 +1734,9 @@ test "DataSet: record add parsed column" {
 		try t.expectEqual(false, row.get(bool, 0));
 
 		try t.expectEqual("new", ds.columns.items[5].name);
+		try t.expectEqual(true, ds.columns.items[5].parsed);
 		try t.expectEqual(true, ds.columns.items[5].nullable);
+
 		try t.expectEqual(false, ds.columns.items[5].is_list);
 		try t.expectEqual(.bool, ds.columns.items[5].data_type);
 		try t.expectEqual(true, ds.columnLookup.contains("new"));
@@ -1744,6 +1752,7 @@ test "DataSet: record add parsed column" {
 		try t.expectEqual(.{.year = 2024, .month = 5, .day = 16}, row.get(zuckdb.Date, 0));
 
 		try t.expectEqual("date", ds.columns.items[6].name);
+		try t.expectEqual(true, ds.columns.items[6].parsed);
 		try t.expectEqual(true, ds.columns.items[6].nullable);
 		try t.expectEqual(false, ds.columns.items[6].is_list);
 		try t.expectEqual(.date, ds.columns.items[6].data_type);
