@@ -564,7 +564,7 @@ const Column = struct {
 	}
 
 	pub fn writeDDL(self: *const Column, writer: anytype) !void {
-		// name should always be a valid identifier without quoting
+		// name should always be a valid identifier if quoted
 		try writer.writeByte('"');
 		try writer.writeAll(self.name);
 		try writer.writeAll("\" ");

@@ -7,8 +7,6 @@ const json = std.json;
 const Allocator = std.mem.Allocator;
 const ParseOptions = json.ParseOptions;
 
-const MAX_FLATTEN_DEPTH = 1;
-
 pub const Event = struct {
 	map: std.StringHashMapUnmanaged(Value),
 
@@ -140,9 +138,7 @@ pub const Event = struct {
 };
 
 const Parser = struct {
-	depth: usize = 0,
 	allocator: Allocator,
-	stack: [MAX_FLATTEN_DEPTH][]const u8 = undefined,
 	map: std.StringHashMapUnmanaged(Event.Value),
 
 	const Error = json.ParseError(json.Scanner);
@@ -189,38 +185,28 @@ const Parser = struct {
 		return if (parser.map.count() == 0) null else .{.map = parser.map};
 	}
 
-	fn add(self: *Parser, value: Event.Value) !void {
-		const depth = self.depth;
-		const field_name = if (depth == 0) self.stack[0] else try std.mem.join(self.allocator, ".", self.stack[0..depth+1]);
-		try self.map.put(self.allocator, field_name, value);
-	}
 
 	fn parseObject(self: *Parser, allocator: Allocator, scanner: *json.Scanner) Error!void {
+		var field_name: []const u8 = undefined;
 		while (true) {
-			switch (try scanner.nextAlloc(allocator, .alloc_if_needed)) {
-				.string, .allocated_string => |field| {
-					const depth = self.depth;
-					self.stack[depth] = field;
-					const break_on_object = depth < MAX_FLATTEN_DEPTH - 1;
+			switch (try scanner.nextAlloc(allocator, .alloc_always)) {
+				.allocated_string => |field| {
+					for (field, 0..) |c, i| {
+						field[i] = std.ascii.toLower(c);
+					}
+					field_name = field;
 					const token = try scanner.nextAlloc(allocator, .alloc_if_needed);
-					switch (try parseValue(allocator, scanner, break_on_object, false, token)) {
-						.value => |v| try self.add(v),
-						.nested_object => {
-							// if break_on_object is true, then pareValue won't parse an object and will
-							// simply return nested_object.
-							self.depth = depth + 1;
-							try self.parseObject(allocator, scanner);
-						},
+					switch (try parseValue(allocator, scanner, false, token)) {
+						.value => |v| try self.map.put(self.allocator, field_name, v),
 						.nested_list => unreachable, // since break_on_list is false, this cannot happen, as a list will always be returned as a value
 					}
 				},
-				.object_end => {
-					const depth = self.depth;
-					if (depth != 0) self.depth = depth - 1;
-					break;
-				},
+				.object_end => break,
 				.end_of_document => return,
-				else => unreachable,
+				else => |x| {
+					std.debug.print("{any}\n", .{x});
+					unreachable;
+				},
 			}
 		}
 	}
@@ -228,10 +214,9 @@ const Parser = struct {
 	const ParseValueResult = union(enum) {
 		value: Event.Value,
 		nested_list: void,
-		nested_object: void,
 	};
 
-	fn parseValue(allocator: Allocator, scanner: *json.Scanner, break_on_object: bool,  break_on_list: bool, token: json.Token) Error!ParseValueResult {
+	fn parseValue(allocator: Allocator, scanner: *json.Scanner, break_on_list: bool, token: json.Token) Error!ParseValueResult {
 		switch (token) {
 			.string, .allocated_string => |value| return .{.value = .{.string = value}},
 			.null => return .{.value = .{.null = {}}},
@@ -264,9 +249,8 @@ const Parser = struct {
 					const sub_token = try scanner.nextAlloc(allocator, .alloc_if_needed);
 					switch (sub_token) {
 						.array_end => break,
-						else => switch (try parseValue(allocator, scanner, false, true, sub_token)) {
+						else => switch (try parseValue(allocator, scanner, true, sub_token)) {
 							.value => |v| try arr.append(v),
-							.nested_object => unreachable,  // since break_on_object is false, a nested object will always be returned as a value
 							.nested_list => {
 								if (break_on_list) {
 									// If this is true, then we aren't the root list, so we just propagate this up
@@ -283,16 +267,6 @@ const Parser = struct {
 				return .{.value = .{.list = .{.json = scanner.input[array_start..scanner.cursor], .values = arr.items}}};
 			},
 			.object_begin => {
-				if (break_on_object) {
-					// Our caller doesn't want us to parse an object. So we return, telling
-					// our caller that we have a object
-					return .{.nested_object = {}};
-				}
-
-				// The caller doesn't want this nested object to be flattened. Instead,
-				// the entire object is going to be taken as-is (a string literal) and
-				// treated as a json blob.
-
 				// -1 because we already consumed the '{'
 				const object_start = scanner.cursor - 1;
 
@@ -457,7 +431,7 @@ test "Event: parse simple" {
 	const event_list = try Event.parse(t.allocator, \\{
 		\\ "key_1": true, "another_key": false,
 		\\ "key_3": null,
-		\\ "key_4": "over 9000!!",
+		\\ "KEY_4": "over 9000!!",
 		\\ "a": 0, "b": 1, "c": 6999384751, "d": -1, "e": -867211,
 		\\ "f1": 0.0, "f2": -0, "f3": 99.33929191, "f4": -1.49E10
 	\\}
@@ -499,33 +473,7 @@ test "Event: parse array past initial size" {
 	}
 }
 
-// test "Event: parse nesting flatten" {
-// 	if (MAX_FLATTEN_DEPTH != 3) return error.SkipZigTest;
-
-// 	const event = try Event.parse(t.allocator, \\{
-// 		\\ "key_1": {},
-// 		\\ "key_2": {
-// 		\\   "sub_1": true,
-// 		\\   "sub_2": "hello",
-// 		\\   "sub_3": {
-// 		\\      "other": 12345,
-// 		\\      "too_deep":  {  "handle ":  1, "x": {"even": "more", "ok": true}}
-// 		\\   }
-// 		\\ }
-// 	\\}
-// 	);
-// 	defer event.deinit();
-
-// 	try assertEvent(.{
-// 		.@"key_2.sub_1" = Event.Value{.bool = true},
-// 		.@"key_2.sub_2" = Event.Value{.string = "hello"},
-// 		.@"key_2.sub_3.other" = Event.Value{.usmallint = 12345},
-// 		.@"key_2.sub_3.too_deep" = Event.Value{.json =  "{  \"handle \":  1, \"x\": {\"even\": \"more\", \"ok\": true}}"},
-// 	}, event);
-// }
-
 test "Event: parse nesting" {
-	if (MAX_FLATTEN_DEPTH != 1) return error.SkipZigTest;
 	const event_list = try Event.parse(t.allocator, \\{
 		\\ "key_1": {},
 		\\ "key_2": {

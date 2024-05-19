@@ -125,3 +125,34 @@ test "events.create: creates dataset and event" {
 	try t.expectEqual(394, list.get(0));
 	try t.expectEqual(590.1, list.get(1));
 }
+
+test "events.create: event fields are case-insensitive" {
+	var tc = t.context(.{});
+	defer tc.deinit();
+
+	tc.web.param("name", "casing");
+	tc.web.body(
+		\\ [
+		\\  {"Id": 1, "name": "teg"},
+		\\  {"id": 2, "NAME": "duncan"}
+		\\ ]
+	);
+	try handler(tc.env(), tc.web.req, tc.web.res);
+	tc.flushMessages();
+
+	var rows = try tc.query("select id, name from casing order by id", .{});
+	defer rows.deinit();
+
+	{
+		var row = (try rows.next()).?;
+		try t.expectEqual(1, row.get(u8, 0));
+		try t.expectEqual("teg", row.get([]const u8, 1));
+	}
+
+	{
+		var row = (try rows.next()).?;
+		try t.expectEqual(2, row.get(u8, 0));
+		try t.expectEqual("duncan", row.get([]const u8, 1));
+	}
+
+}
