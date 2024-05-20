@@ -145,7 +145,3 @@ pub const StaticFile = struct {
 	// try modules.put("zul", b.addModule("zul", .{
 	// 	.root_source_file = b.path("lib/zul/src/zul.zig"),
 	// }));
-
-	// try modules.put("zul", b.addModule("zul", .{
-	// 	.root_source_file = b.path("lib/zul/src/zul.zig"),
-	// }));

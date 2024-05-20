@@ -119,18 +119,18 @@ fn translateScalar(src: anytype, column_type: zuckdb.Vector.Type.Scalar, i: usiz
 			zuckdb.c.DUCKDB_TYPE_DOUBLE => try std.fmt.format(writer, "{d}", .{src.get(f64, i)}),
 			zuckdb.c.DUCKDB_TYPE_UUID => try std.json.encodeJsonString(&src.get(zuckdb.UUID, i), .{}, writer),
 			zuckdb.c.DUCKDB_TYPE_DATE => {
-				// std.fmt's integer formatting isn't great. If we specify a padding, it
-				// always inserts the sign. Until that's fixed, we do this hack
+				// std.fmt's integer formatting is broken when dealing with signed integers
+				// we use our own formatter
 				// https://github.com/ziglang/zig/issues/19488
 				const date = src.get(zuckdb.Date, i);
 				try std.fmt.format(writer, "\"{d}-{s}-{s}\"", .{date.year, paddingTwoDigits(date.month), paddingTwoDigits(date.day)});
 			},
 			zuckdb.c.DUCKDB_TYPE_TIME => {
-				// std.fmt's integer formatting isn't great. If we specify a padding, it
-				// always inserts the sign. Until that's fixed, we do this hack
-				// https://github.com/ziglang/zig/issues/19488
+				// std.fmt's integer formatting is broken when dealing with signed integers
+				// we use our own formatter. But for micros, I'm lazy and cast it to unsigned,
+				// which std.fmt handles better.
 				const time = src.get(zuckdb.Time, i);
-				try std.fmt.format(writer, "\"{s}:{s}:{s}\"", .{paddingTwoDigits(time.hour), paddingTwoDigits(time.min), paddingTwoDigits(time.sec)});
+				try std.fmt.format(writer, "\"{s}:{s}:{s}.{d:6>0}\"", .{paddingTwoDigits(time.hour), paddingTwoDigits(time.min), paddingTwoDigits(time.sec), @as(u32, @intCast(time.micros))});
 			},
 			zuckdb.c.DUCKDB_TYPE_TIMESTAMP, zuckdb.c.DUCKDB_TYPE_TIMESTAMP_TZ  => try std.fmt.formatInt(src.get(i64, i), 10, .lower, .{}, writer),
 			else => |duckdb_type| {

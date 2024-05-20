@@ -63,7 +63,7 @@ fn validateAndBindValue(allocator: Allocator, stmt: zuckdb.Stmt, value: typed.Va
 		.real => try f32_validator.validateValue(value, validator),
 		.double => try f64_validator.validateValue(value, validator),
 		.decimal => try f64_validator.validateValue(value, validator),
-		.timestamp => try i64_validator.validateValue(value, validator),
+		.timestamp, .timestamptz => try i64_validator.validateValue(value, validator),
 		.varchar => try string_validator.validateValue(value, validator),
 		.blob => try blob_validator.validateValue(value, validator),
 		.bit => try bitstring_validator.validateValue(value, validator),
