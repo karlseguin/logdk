@@ -39,13 +39,11 @@ pub const App = struct {
 	// lives outside of the pool.
 	db: *zuckdb.Pool,
 
-	settings: Settings,
-
 	allocator: Allocator,
 
 	// We can only create 1 dataset at a time. This ensures we don't create the
 	// same dataset (same name) from 2 concurrent requests.
-	create_lock: std.Thread.Mutex,
+	_create_lock: std.Thread.Mutex,
 
 	// Thread-safe pool of pre-generated & growable []u8 for whatever we need.
 	buffers: *BufferPool,
@@ -66,6 +64,12 @@ pub const App = struct {
 	// only used for shutting down
 	_webserver: ?*logdk.web.Server = null,
 
+	// must always be access via one of the getters/setters to synchronize access
+	_settings: Settings,
+
+	// serialize persisting the settings
+	_settings_lock: Thread.Mutex,
+
 	pub fn init(allocator: Allocator, config: logdk.Config) !App{
 		var open_err: ?[]u8 = null;
 		const db = zuckdb.DB.initWithErr(allocator, config.db.path, .{.enable_external_access = false}, &open_err) catch |err| {
@@ -78,11 +82,20 @@ pub const App = struct {
 		var db_pool = try db.pool(.{.size = config.db.pool_size, .timeout = config.db.pool_timeout});
 		errdefer db_pool.deinit();
 
-		{
+		const settings = blk: {
 			var conn = try db_pool.acquire();
 			conn.release();
 			try @import("migrations/migrations.zig").run(conn);
-		}
+
+			const row = (try conn.row("select settings from logdk.settings where id = 1", .{})) orelse break :blk Settings{};
+			defer row.deinit();
+
+			const parsed = try std.json.parseFromSlice(Settings, allocator, row.get([]const u8, 0), .{});
+			defer parsed.deinit();
+
+			// Yes, we deinit parsed, but settings has no allocated fields.
+			break :blk parsed.value;
+		};
 
 		var validator_pool = try ValidatorPool(void).init(allocator, config.validator);
 		errdefer validator_pool.deinit();
@@ -101,12 +114,11 @@ pub const App = struct {
 
 		return .{
 			.meta = meta,
-			.create_lock = .{},
+			._create_lock = .{},
+			._settings = settings,
+			._settings_lock = .{},
 			.allocator = allocator,
 			.validators = validator_pool,
-			.settings = .{
-				._dynamic_dataset_creation = true,
-			},
 			.db = db_pool,
 			.buffers = buffers,
 			.scheduler = scheduler,
@@ -148,8 +160,8 @@ pub const App = struct {
 		// But this lock is under very low contention, and if there IS contention,
 		// it very well could be multiple threads trying to create the same dataset
 		// so a coarse lock seems fine.
-		self.create_lock.lock();
-		defer self.create_lock.unlock();
+		self._create_lock.lock();
+		defer self._create_lock.unlock();
 
 		// under our create_lock, this check is definitive.
 		if (self.getDataSet(name)) |ds| {
@@ -235,14 +247,60 @@ pub const App = struct {
 		try self.meta.datasetChanged(&dataset);
 	}
 
-	// The app settings can be changed during runtime, so we need to encapsulate
-	// all access in order to enforce thread-safety
-	const Settings = struct {
-		_dynamic_dataset_creation: bool,
+	pub fn allowDataSetCreation(self: *App) bool {
+		return self.readSetting(bool, "allow_dataset_creation");
+	}
+	pub fn setDataSetCreation(self: *App, value: bool) !void {
+		return self.writeSetting(bool, "allow_dataset_creation", value);
+	}
 
-		pub fn dynamicDataSetCreation(self: *const Settings) bool {
-			return @atomicLoad(bool, &self._dynamic_dataset_creation, .monotonic);
-		}
+	pub fn isSingleUser(self: *App) bool {
+		return self.readSetting(bool, "single_user");
+	}
+	pub fn setSingleUser(self: *App, value: bool) !void {
+		return self.writeSetting(bool, "single_user", value);
+	}
+
+	fn readSetting(self: *App, comptime T: type, comptime name: []const u8) T {
+		return @atomicLoad(T, &@field(self._settings, name), .monotonic);
+	}
+
+	// Thread safety around _settings is weird. We only use our lock to synchronize writes
+	// (i.e. this function). When reading a value, we use an @atomicLoad. However, in this
+	// function, when we serialize _settings (which obviously has to read each value) we
+	// don't use an @atomicLoad. What gives?
+	// We need an @atomicLoad in `isSingleUser` (for example), because another thread
+	// could be calling `writeSetting` at the same time and issuing an @atomicStore.
+	// However, once a thread is in `writeSetting` and has the lock, no other thread
+	// could be writing to the settings. Other threads might be reading a value, but
+	// as far as I know, it's fine for some threads to use @atomicLoad while other
+	// threads just read the value directly - as long as no thread is writing, which
+	// our lock guarantees.
+	fn writeSetting(self: *App, comptime T: type, comptime name: []const u8, value: T) !void {
+		self._settings_lock.lock();
+		defer self._settings_lock.unlock();
+
+		@atomicStore(T, &@field(self._settings, name), value, .monotonic);
+
+		var buf = try self.buffers.acquire();
+		defer buf.release();
+
+		try std.json.stringify(self._settings, .{}, buf.writer());
+
+		var conn = try self.db.acquire();
+		defer conn.release();
+
+		const affected = try conn.exec(
+			\\ insert into logdk.settings (id, settings) values (1, $1)
+			\\ on conflict do update set settings = $1
+		, .{buf.string()});
+
+		std.debug.assert(affected == 1);
+	}
+
+	const Settings = struct {
+		single_user: bool = true,
+		allow_dataset_creation: bool = true,
 	};
 };
 
@@ -406,4 +464,27 @@ test "App: createDataSet success" {
 	}
 
 	try t.expectEqual(null, try rows.next());
+}
+
+test "App: settings" {
+	var tc = t.context(.{});
+	defer tc.deinit();
+
+	// defaults
+	try t.expectEqual(true, tc.app.isSingleUser());
+	try t.expectEqual(true, tc.app.allowDataSetCreation());
+
+	{
+		try tc.app.setSingleUser(false);
+		try t.expectEqual(false, tc.app.isSingleUser());
+		try t.expectEqual(true, tc.app.allowDataSetCreation());
+		try t.expectEqual(false, try tc.scalar(bool, "select (settings->'single_user')::bool from logdk.settings where id = 1", .{}));
+	}
+
+	{
+		try tc.app.setDataSetCreation(false);
+		try t.expectEqual(false, tc.app.isSingleUser());
+		try t.expectEqual(false, tc.app.allowDataSetCreation());
+		try t.expectEqual(false, try tc.scalar(bool, "select (settings->'allow_dataset_creation')::bool from logdk.settings where id = 1", .{}));
+	}
 }
