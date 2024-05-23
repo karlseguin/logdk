@@ -1,6 +1,7 @@
 const std = @import("std");
 const zul = @import("zul");
 const logz = @import("logz");
+const cache = @import("cache");
 const httpz = @import("httpz");
 const typed = @import("typed");
 const validate = @import("validate");
@@ -9,11 +10,17 @@ const logdk = @import("../logdk.zig");
 
 const App = logdk.App;
 const Env = logdk.Env;
+const Config = logdk.Config;
+const User = logdk.auth.User;
+const Permission = logdk.auth.Permission;
 
 const ui = @import("ui.zig");
 const exec = @import("exec.zig");
 const info = @import("info/_info.zig");
 const datasets = @import("datasets/_datasets.zig");
+
+const SessionCache = cache.Cache(User);
+
 pub const Server = httpz.ServerCtx(*const Dispatcher, *Env);
 
 // every request gets a request_id, any log message created from a request-specific
@@ -25,8 +32,14 @@ pub fn init(builder: *logdk.Validate.Builder) !void {
 	try exec.init(builder);
 }
 
-pub fn start(app: *App, config: *const logdk.Config) !void {
+pub fn start(app: *App, config: *const Config) !void {
 	const allocator = app.allocator;
+
+	var session_cache = try SessionCache.init(allocator, .{
+		.max_size = 1000,
+		.gets_per_promote = 10,
+	});
+	defer session_cache.deinit();
 
 	const http_config = config.http;
 	var server = try Server.init(allocator, http_config, undefined);
@@ -40,13 +53,19 @@ pub fn start(app: *App, config: *const logdk.Config) !void {
 
 	const router = server.router();
 
+	// We create a dispatcher per route, since each has a unique route name, each
+	// may have its own permission, and who knows what else. But in all cases
+	// it's a &Dispatcher, just with a 1 or 2 different fields. This factory just
+	// makes creating the dispatchers a little cleaner.
+	const df = Dispatcher.Factory.init(app, &session_cache, config);
+
 	{
 		var routes = router.group("/api/1", .{});
-		routes.getC("/datasets/:name/events", datasets.events_index.handler, .{.ctx = &Dispatcher.init(app, "events_list", config)});
-		routes.postC("/datasets/:name/events", datasets.events_create.handler, .{.ctx = &Dispatcher.init(app, "events_create", config)});
-		routes.getC("/exec", exec.handler, .{.ctx = &Dispatcher.init(app, "exec_sql", config)});
-		routes.getC("/info", info.info, .{.ctx = &Dispatcher.init(app, "info", config)});
-		routes.getC("/describe", info.describe, .{.ctx = &Dispatcher.init(app, "describe", config)});
+		routes.getC("/datasets/:name/events", datasets.events_index.handler, .{.ctx = &df.create("events_list", null)});
+		routes.postC("/datasets/:name/events", datasets.events_create.handler, .{.ctx = &df.create("events_create", null)});
+		routes.getC("/exec", exec.handler, .{.ctx = &df.create("exec_sql", .raw_query)});
+		routes.getC("/info", info.info, .{.ctx = &df.create("info", null)});
+		routes.getC("/describe", info.describe, .{.ctx = &df.create("describe", null)});
 	}
 
 	router.getC("/metrics", info.metrics, .{.dispatcher = server.dispatchUndefined()});
@@ -63,20 +82,22 @@ pub fn start(app: *App, config: *const logdk.Config) !void {
 
 const Dispatcher = struct {
 	app: *App,
+
+	// The canonical name for the route. This is added to the request info log
+	// entry, as well as set in Route header of the response.
 	route: []const u8,
+
+	// Whether or not to log the request info. In case of an unhandled error, the
+	// request info is always logged and have a code value of
+	// `logdk.codes.INTERNAL_SERVER_ERROR_CAUGHT` (i.e. 1).
 	log_request: bool = false,
 
-	fn init(app: *App, route: []const u8, config: *const logdk.Config) Dispatcher {
-		return .{
-			.app = app,
-			.route = route,
-			.log_request = switch (config.log_http) {
-				.all => true,
-				.none => false,
-				.smart => std.mem.eql(u8, route, "events_create") == false,
-			}
-		};
-	}
+	// the permission needed to access the route associated with this dispatcher
+	// null means no permissions are needed
+	permission: ?Permission,
+
+	// session_id => logdk.auth.User
+	session_cache: *SessionCache,
 
 	pub fn dispatch(self: *const Dispatcher, action: httpz.Action(*Env), req: *httpz.Request, res: *httpz.Response) !void {
 		const start_time = std.time.milliTimestamp();
@@ -86,46 +107,75 @@ const Dispatcher = struct {
 		const request_id = @atomicRmw(u32, &request_counter, .Add, 1, .monotonic);
 		// every log message generated with env.logger will include this $rid
 		var logger = logz.logger().int("$rid", request_id).multiuse();
+		defer logger.release();
 
-		const app = self.app;
-
-		var env = Env{
-			.app = app,
-			.logger = logger,
-			.arena = res.arena,
-		};
-		defer env.deinit();
 
 		var code: i32 = 0;
+		var user_id: ?u32 = null;
 		var log_request = self.log_request;
 
-		action(&env, req, res) catch |err| switch (err) {
-			error.BrokenPipe, error.ConnectionResetByPeer => code = logdk.codes.CONNECTION_RESET,
-			error.InvalidJson => code = errors.InvalidJson.write(res),
-			error.Validation => {
-				code = logdk.codes.VALIDATION_ERROR;
-				res.status = 400;
-				try res.json(.{
-					.err = "validation error",
-					.code = code,
-					.validation = env._validator.?.errors(),
-				}, .{.emit_null_optional_fields = false});
-			},
-			else => {
-				code = logdk.codes.INTERNAL_SERVER_ERROR_CAUGHT;
-				const error_id = zul.UUID.v4().toHexAlloc(res.arena, .lower) catch "00000000-0000-0000-0000-000000000000";
-				res.status = 500;
-				res.header("Error-Id", error_id);
-				try res.json(.{
-					.code = code,
-					.error_id = error_id,
-					.err = "internal server error",
-				}, .{});
-
-				log_request = true;
-				_ = logger.stringSafe("error_id", error_id).err(err);
+		// Block exists only so we can break out of it should we have an authentication
+		// or authorization issue.
+		action: {
+			var user = User{.id = 0};
+			var cache_user_entry: ?*cache.Entry(User) = null;
+			if (getSessionId(req)) |session_id| {
+				if (try self.session_cache.fetch(*const Dispatcher, session_id, loadUserFromSessionId, self, .{.ttl = 1800})) |entry| {
+					user = entry.value;
+					user_id = user.id;
+					cache_user_entry = entry;
+				} else {
+					// we had a session_id, but it wasn't valid, this is always an error
+					code = errors.InvalidAuthenticationToken.write(res);
+					break: action;
+				}
 			}
-		};
+
+			defer if (cache_user_entry) |entry| entry.release();
+
+			if (self.permission) |required_permission| {
+				if (user.hasPermission(required_permission) == false) {
+					code = errors.PermissionDenied.write(res);
+					break :action;
+				}
+			}
+
+			var env = Env{
+				.app = self.app,
+				.user = user,
+				.logger = logger,
+				.arena = res.arena,
+			};
+			defer env.deinit();
+
+			action(&env, req, res) catch |err| switch (err) {
+				error.BrokenPipe, error.ConnectionResetByPeer => code = logdk.codes.CONNECTION_RESET,
+				error.InvalidJson => code = errors.InvalidJson.write(res),
+				error.Validation => {
+					code = logdk.codes.VALIDATION_ERROR;
+					res.status = 400;
+					try res.json(.{
+						.err = "validation error",
+						.code = code,
+						.validation = env._validator.?.errors(),
+					}, .{.emit_null_optional_fields = false});
+				},
+				else => {
+					code = logdk.codes.INTERNAL_SERVER_ERROR_CAUGHT;
+					const error_id = zul.UUID.v4().toHexAlloc(res.arena, .lower) catch "00000000-0000-0000-0000-000000000000";
+					res.status = 500;
+					res.header("Error-Id", error_id);
+					try res.json(.{
+						.code = code,
+						.error_id = error_id,
+						.err = "internal server error",
+					}, .{});
+
+					log_request = true;
+					_ = logger.stringSafe("error_id", error_id).err(err);
+				}
+			};
+		}
 
 		if (log_request) {
 			logger.
@@ -135,11 +185,77 @@ const Dispatcher = struct {
 				string("path", req.url.path).
 				int("status", res.status).
 				int("code", code).
+				int("uid", user_id).
 				int("ms", std.time.milliTimestamp() - start_time).
 				log();
 		}
 	}
+
+	fn loadUserFromSessionId(self: *const Dispatcher, session_id: []const u8) !?User {
+		const sql =
+			\\ select s.user_id, u.permissions
+			\\ from logdk.sessions s join logdk.users u on s.user_id = u.id
+			\\ where u.enabled and s.id = $1 and s.expires > now()
+		;
+
+		const conn = try self.app.db.acquire();
+		defer conn.release();
+
+		const row = conn.row(sql, .{session_id}) catch |err| {
+			return logdk.dbErr("Dispatcher.loadUserFromSessionId", err, conn, logz.err());
+		} orelse return null;
+
+		defer row.deinit();
+
+		const permissions = row.list([]const u8, 1).?;
+
+		var user = User{.id = row.get(u32, 0)};
+		for (0..permissions.len) |_| {
+			const permission = std.meta.stringToEnum(Permission, permissions.get(0)) orelse continue;
+			switch (permission) {
+				.admin => user.permission_admin = true,
+				.raw_query => user.permission_raw_query = true,
+			}
+		}
+		return user;
+	}
+
+	// We need to create a dispatch, but each one is quite similar, so this
+	// little factor makes it easier to create them without having to repeat
+	// their common parameters
+	const Factory = struct {
+		app: *App,
+		config: *const Config,
+		session_cache: *SessionCache,
+
+		fn init(app: *App, session_cache: *SessionCache, config: *const Config) Factory {
+			return .{
+				.app = app,
+				.config = config,
+				.session_cache = session_cache,
+			};
+		}
+
+		fn create(self: *const Factory, route: []const u8, permission: ?Permission) Dispatcher {
+			return .{
+				.app = self.app,
+				.route = route,
+				.permission = permission,
+				.session_cache = self.session_cache,
+				.log_request = switch (self.config.log_http) {
+					.all => true,
+					.none => false,
+					.smart => std.mem.eql(u8, route, "events_create") == false,
+				}
+			};
+		}
+	};
 };
+
+// public because it's used by our logout handler
+pub fn getSessionId(req: *httpz.Request) ?[]const u8 {
+	return req.header("authorization");
+}
 
 // This isn't great, but we turn out querystring args into a typed.Map where every
 // value is a typed.Value.string. Validators can be configured to parse strings.
@@ -231,6 +347,8 @@ pub const errors = struct {
 	pub const RouterNotFound = Error.init(404, codes.ROUTER_NOT_FOUND, "not found");
 	pub const InvalidJson = Error.init(400, codes.INVALID_JSON, "invalid JSON");
 	pub const IllegalDBWrite = Error.init(400, codes.ILLEGAL_DB_WRITE, "only read statements are allowed (e.g. select)");
+	pub const InvalidAuthenticationToken = Error.init(401, codes.INVALID_AUTHENTICATION_TOKEN, "invalid authentication token");
+	pub const PermissionDenied = Error.init(403, codes.PERMISSION_DENIED, "permission denied");
 };
 
 const t = logdk.testing;
@@ -241,7 +359,7 @@ test "dispatcher: handles action error" {
 	logz.setLevel(.None);
 	defer logz.setLevel(.Warn);
 
-	const dispatcher = testDispatcher(tc);
+	const dispatcher = testDispatcher(tc, .{});
 	try dispatcher.dispatch(testErrorAction, tc.web.req, tc.web.res);
 	try tc.web.expectStatus(500);
 	try tc.web.expectJson(.{.code = 1});
@@ -254,10 +372,93 @@ test "dispatcher: dispatch to actions" {
 	tc.web.url("/test_1");
 
 	request_counter = 958589;
-	const dispatcher = testDispatcher(tc);
+	const dispatcher = testDispatcher(tc, .{});
 	try dispatcher.dispatch(callableAction, tc.web.req, tc.web.res);
 	try tc.web.expectStatus(200);
 	try tc.web.expectJson(.{.url = "/test_1"});
+}
+
+test "dispatcher: permission required with no auth" {
+	var tc = t.context(.{});
+	defer tc.deinit();
+
+	tc.web.url("/");
+
+	const dispatcher = testDispatcher(tc, .{.permission = .admin});
+	try dispatcher.dispatch(callableAction, tc.web.req, tc.web.res);
+	try tc.web.expectStatus(403);
+}
+
+test "dispatcher: invalid auth token" {
+	var tc = t.context(.{});
+	defer tc.deinit();
+
+	tc.web.url("/");
+	tc.web.header("authorization", "nope");
+	const dispatcher = testDispatcher(tc, .{});
+	try dispatcher.dispatch(callableAction, tc.web.req, tc.web.res);
+	try tc.web.expectStatus(401);
+}
+
+test "dispatcher: valid auth but with wrong permission" {
+	var tc = t.context(.{});
+	defer tc.deinit();
+
+	tc.web.url("/");
+	tc.web.header("authorization", "token1");
+
+	const dispatcher = testDispatcher(tc, .{.permission = .admin});
+	dispatcher.session_cache.put("token1", User{.id = 1, .permission_raw_query = true}, .{.ttl = 300}) catch unreachable;
+
+	try dispatcher.dispatch(callableAction, tc.web.req, tc.web.res);
+	try tc.web.expectStatus(403);
+}
+
+test "dispatcher: expired session" {
+	var tc = t.context(.{});
+	defer tc.deinit();
+
+	try tc.exec("insert into logdk.users (id, username, password, enabled, permissions) values (2, 'leto', '', true, array['raw_query'])", .{});
+	try tc.exec("insert into logdk.sessions (id, user_id, expires) values ('token-x2', 2, now() - interval '1 second')", .{});
+
+	const dispatcher = testDispatcher(tc, .{.permission = .raw_query});
+	// this loads the user from the DB
+	tc.web.url("/user_2");
+	tc.web.header("authorization", "token-x3");
+
+	try dispatcher.dispatch(callableAction, tc.web.req, tc.web.res);
+	try tc.web.expectStatus(401);
+}
+
+test "dispatcher: loads user" {
+	var tc = t.context(.{});
+	defer tc.deinit();
+
+	try tc.exec("insert into logdk.users (id, username, password, enabled, permissions) values (3, 'leto', '', true, array['raw_query'])", .{});
+	try tc.exec("insert into logdk.sessions (id, user_id, expires) values ('token-x3', 3, now() + interval '1 minute')", .{});
+
+	const dispatcher = testDispatcher(tc, .{.permission = .raw_query});
+
+	{
+		// this loads the user from the DB
+		tc.web.url("/user_3");
+		tc.web.header("authorization", "token-x3");
+
+		try dispatcher.dispatch(callableAction, tc.web.req, tc.web.res);
+		try tc.web.expectJson(.{.user_id = 3});
+	}
+
+	try tc.exec("delete from logdk.users", .{});
+	try tc.exec("delete from logdk.sessions", .{});
+	{
+		// this loads the user from the cache
+		tc.reset();
+		tc.web.url("/user_3");
+		tc.web.header("authorization", "token-x3");
+
+		try dispatcher.dispatch(callableAction, tc.web.req, tc.web.res);
+		try tc.web.expectJson(.{.user_id = 3});
+	}
 }
 
 test "web: Error.write" {
@@ -278,11 +479,21 @@ test "web: notFound" {
 	try tc.web.expectJson(.{.code = 4, .err = "not found", .desc = "no spice"});
 }
 
-fn testDispatcher(tc: *t.Context) Dispatcher {
+fn testDispatcher(tc: *t.Context, opts: anytype) Dispatcher {
+	const T = @TypeOf(opts);
+
+	const session_cache = tc.arena.create(SessionCache) catch unreachable;
+	session_cache.* = SessionCache.init(tc.arena, .{
+		.max_size = 20,
+		.gets_per_promote = 10,
+	}) catch unreachable;
+
 	return .{
 		.app = tc.app,
+		.permission = if (@hasField(T, "permission")) opts.permission else null,
 		.log_request = false,
 		.route = "test-disaptcher",
+		.session_cache = session_cache,
 	};
 }
 
@@ -297,8 +508,19 @@ fn callableAction(env: *Env, req: *httpz.Request, res: *httpz.Response) !void {
 	if (std.mem.eql(u8, req.url.path, "/test_1")) {
 		try env.logger.logTo(arr.writer());
 		try t.expectEqual("@ts=9999999999999 $rid=958589\n", arr.items);
-	} else {
-		unreachable;
+		try t.expectEqual(0, env.user.id);
+		inline for (std.meta.tags(Permission)) |p| {
+			try t.expectEqual(false, env.user.hasPermission(p));
+		}
+		return res.json(.{.url = req.url.path}, .{});
 	}
-	return res.json(.{.url = req.url.path}, .{});
+
+	if (std.mem.eql(u8, req.url.path, "/user_3")) {
+		try t.expectEqual(3, env.user.id);
+		try t.expectEqual(false, env.user.permission_admin);
+		try t.expectEqual(true, env.user.permission_raw_query);
+		return res.json(.{.user_id = env.user.id}, .{});
+	}
+
+	unreachable;
 }

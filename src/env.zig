@@ -1,5 +1,6 @@
 const std = @import("std");
 const logz = @import("logz");
+const cache = @import("cache");
 const zuckdb = @import("zuckdb");
 const logdk = @import("logdk.zig");
 
@@ -17,8 +18,10 @@ pub const Env = struct {
 	// should be loaded via the env.validator() function
 	_validator: ?*logdk.Validate.Context = null,
 
+	// cannot be null, web dispatcher will set this to an anonymous user if needed
+	user: logdk.auth.User,
+
 	pub fn deinit(self: Env) void {
-		self.logger.release();
 		if (self._validator) |val| {
 			self.app.validators.release(val);
 		}

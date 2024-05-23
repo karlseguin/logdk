@@ -5,6 +5,7 @@ const zuckdb = @import("zuckdb");
 var migrations = [_]*const fn(*zuckdb.Conn) anyerror!void {
 	@import("migration_001.zig").run,
 	@import("migration_002.zig").run,
+	@import("migration_003.zig").run,
 };
 
 pub fn run(conn: *zuckdb.Conn) !void {

@@ -6,6 +6,7 @@ pub const dispatcher = @import("dispatcher.zig");
 pub const hrm = @import("hrm.zig");
 pub const binder = @import("binder.zig");
 
+pub const auth = @import("auth.zig");
 pub const App = @import("app.zig").App;
 pub const Env = @import("env.zig").Env;
 pub const Meta = @import("meta.zig").Meta;
@@ -29,6 +30,8 @@ pub const codes = struct {
 	pub const INVALID_JSON = 6;
 	pub const INVALID_SQL = 7;
 	pub const ILLEGAL_DB_WRITE = 8;
+	pub const INVALID_AUTHENTICATION_TOKEN = 9;
+	pub const PERMISSION_DENIED = 10;
 };
 
 const logz = @import("logz");

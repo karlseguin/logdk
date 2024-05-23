@@ -69,6 +69,7 @@ pub const Context = struct {
 	pub fn deinit(self: *Context) void {
 		self.web.deinit();
 		if (self._env) |e| {
+			e.logger.release();
 			e.deinit();
 		}
 		self.app.deinit();
@@ -127,6 +128,7 @@ pub const Context = struct {
 		const app = self.app;
 		const e = self.arena.create(Env) catch unreachable;
 		e.* = Env{
+			.user = .{.id = 0},
 			.app = app,
 			.arena = self.arena,
 			.logger = logz.logger().multiuse(),
