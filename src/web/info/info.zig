@@ -19,7 +19,6 @@ test "info: json" {
 	defer tc.deinit();
 
 	try handler(tc.env(), tc.web.req, tc.web.res);
-	tc.web.conn.doCallback();
 	try tc.web.expectJson(.{
 		.logdk = .{
 			.version = "commit: local-dev\nzig: local-dev\nui: local-dev\n",

@@ -274,6 +274,7 @@ const Column = struct {
 const Describe = struct {
 	stale: bool,
 	json: []const u8,
+	gzip: []const u8,
 
 	// when this is called, meta._datasets_lock is under a read-lock.
 	// allocator is an arena that we aren't responsible for, so we can be sloppy.
@@ -294,7 +295,16 @@ const Describe = struct {
 		}
 		try writer.writeAll("]}");
 
-		return .{.json = arr.items, .stale = false};
+		var compressed = std.ArrayList(u8).init(allocator);
+		var fbs = std.io.fixedBufferStream(arr.items);
+		try std.compress.gzip.compress(fbs.reader(), compressed.writer(), .{.level = .best});
+
+
+		return .{
+			.stale = false,
+			.json = arr.items,
+			.gzip = compressed.items,
+		};
 	}
 };
 

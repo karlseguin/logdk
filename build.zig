@@ -127,7 +127,7 @@ pub const StaticFile = struct {
 	// 	.root_source_file = b.path("lib/validate.zig/src/validate.zig"),
 	// 	.imports = &.{
 	// 		.{.name = "typed", .module = modules.get("typed").?},
-	// 		// .{.name = "metrics", .module = b.addModule("metrics", .{.root_source_file = .{.path = "lib/metrics.zig/src/metrics.zig"}})},
+	// 		// .{.name = "metrics", .module = b.addModule("metrics", .{.root_source_file = b.path("lib/metrics.zig/src/metrics.zig")})},
 	// 	},
 	// }));
 	//
@@ -136,7 +136,7 @@ pub const StaticFile = struct {
 	// 		.root_source_file = b.path("lib/http.zig/src/httpz.zig"),
 	// 		.imports = &.{
 	// 			.{.name = "metrics", .module = modules.get("metrics").?},
-	// 			.{.name = "websocket", .module = b.addModule("websocket", .{.root_source_file = .{.path = "lib/websocket.zig/src/websocket.zig"}})},
+	// 			.{.name = "websocket", .module = b.addModule("websocket", .{.root_source_file = b.path("lib/websocket.zig/src/websocket.zig")})},
 	// 		},
 	// 	}));
 	// 	const options = b.addOptions();
