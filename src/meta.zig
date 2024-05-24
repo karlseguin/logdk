@@ -279,35 +279,36 @@ const Describe = struct {
 	json: []const u8,
 	gzip: []const u8,
 
-	// when this is called, meta._datasets_lock is under a read-lock.
+	// When this is called, meta._datasets_lock is under a read-lock, so we can
+	// access the arc value directly since we know the underlying entry can't
+	// be swapped out on us.
 	// allocator is an arena that we aren't responsible for, so we can be sloppy.
 	pub fn init(allocator: Allocator, datasets: std.StringHashMapUnmanaged(zul.LockRefArenaArc(Meta.DataSet)), app: *logdk.App) !Describe {
-		// Zig doesn't have a good way to serialize a StringHashMap
-		// So we're doing all of this by hand.
-		var arr = std.ArrayList(u8).init(allocator);
-		var writer = arr.writer();
-		try writer.writeAll("{\"datasets\": [");
+		var dataset_list = try allocator.alloc(Meta.DataSet, datasets.count());
 
-		var it = datasets.valueIterator();
-		if (it.next()) |first| {
-			try std.json.stringify(first.arc.value, .{}, writer);
-			while (it.next()) |ref| {
-				try writer.writeByte(',');
-				try std.json.stringify(ref.arc.value, .{}, writer);
+		{
+			var i: usize = 0;
+			var it = datasets.valueIterator();
+			while (it.next()) |ds| {
+				dataset_list[i] = ds.arc.value;
+				i += 1;
 			}
 		}
-		try writer.writeAll("],\"settings\":{");
-		try writer.writeAll("\"single_user\":");
-		try writer.writeAll(if (app.isSingleUser()) "true" else "false");
-		try writer.writeAll("}}");
+
+		const json = try std.json.stringifyAlloc(allocator, .{
+			.datasets = dataset_list,
+			.settings = .{
+				.single_user = app.isSingleUser(),
+			}
+		}, .{});
 
 		var compressed = std.ArrayList(u8).init(allocator);
-		var fbs = std.io.fixedBufferStream(arr.items);
+		var fbs = std.io.fixedBufferStream(json);
 		try std.compress.gzip.compress(fbs.reader(), compressed.writer(), .{.level = .best});
 
 		return .{
 			.stale = false,
-			.json = arr.items,
+			.json = json,
 			.gzip = compressed.items,
 		};
 	}
