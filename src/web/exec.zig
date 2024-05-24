@@ -196,8 +196,8 @@ test "exec: normalize" {
 	try t.expectEqual("abc", normalize(" abc "));
 	try t.expectEqual("abc", normalize("\t \n abc\n\n\t "));
 	try t.expectEqual("abc", normalize("\t \n abc;\n\n;\t "));
-
 }
+
 test "exec: validation" {
 	var tc = t.context(.{});
 	defer tc.deinit();

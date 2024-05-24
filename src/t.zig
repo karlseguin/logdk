@@ -97,6 +97,12 @@ pub const Context = struct {
 		self.app.scheduler.start(self.app) catch unreachable;
 	}
 
+	pub fn envWithUser(self: *Context, user: logdk.auth.User) *Env {
+		var e = self.env();
+		e.user = user;
+		return e;
+	}
+
 	pub fn silenceLogs(self: *Context) void {
 		logz.setLevel(.None);
 		self.reset_log_level = true;

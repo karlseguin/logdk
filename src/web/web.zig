@@ -17,6 +17,7 @@ const Permission = logdk.auth.Permission;
 const ui = @import("ui.zig");
 const exec = @import("exec.zig");
 const info = @import("info/_info.zig");
+const session = @import("session/_session.zig");
 const datasets = @import("datasets/_datasets.zig");
 
 const SessionCache = cache.Cache(User);
@@ -66,6 +67,7 @@ pub fn start(app: *App, config: *const Config) !void {
 		routes.getC("/exec", exec.handler, .{.ctx = &df.create("exec_sql", .raw_query)});
 		routes.getC("/info", info.info, .{.ctx = &df.create("info", null)});
 		routes.getC("/describe", info.describe, .{.ctx = &df.create("describe", null)});
+		routes.getC("/session", session.show.handler, .{.ctx = &df.create("session_show.handler", null)});
 	}
 
 	router.getC("/metrics", info.metrics, .{.dispatcher = server.dispatchUndefined()});

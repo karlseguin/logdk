@@ -49,14 +49,19 @@ pub const Meta = struct {
 	pub const DescribeArc = *zul.LockRefArenaArc(Describe).Arc;
 
 	pub fn init(allocator: Allocator) !Meta {
-		const datasets = std.StringHashMapUnmanaged(zul.LockRefArenaArc(DataSet)){};
-
-		var info = try zul.LockRefArenaArc(Info).init(allocator, .{null});
+		// with expired set to 0, this is reloaded on the first call to getInfo
+		var info = try zul.LockRefArenaArc(Info).initWithValue(allocator, .{.json = "{}", .expires = 0});
 		errdefer info.deinit();
 
-		var describe = try zul.LockRefArenaArc(Describe).init(allocator, .{datasets});
+		// with stale set to true, this will get reloaded on the first call to getDescribe
+		var describe = try zul.LockRefArenaArc(Describe).initWithValue(allocator, .{
+			.stale = true,
+			.json = "{}",
+			.gzip = &[_]u8{31, 139, 8, 0, 0, 0, 0, 0, 0, 3, 171, 174, 5, 0, 67, 191, 166, 163, 2, 0, 0, 0}, //awful
+		});
 		errdefer describe.deinit();
 
+		const datasets = std.StringHashMapUnmanaged(zul.LockRefArenaArc(DataSet)){};
 		return .{
 			._info = info,
 			._describe = describe,
@@ -147,7 +152,7 @@ pub const Meta = struct {
 		return self._info.acquire();
 	}
 
-	pub fn getDescribe(self: *Meta) DescribeArc {
+	pub fn getDescribe(self: *Meta, app: *logdk.App) DescribeArc {
 		const arc = self._describe.acquire();
 		if (@atomicLoad(bool, &arc.value.stale, .monotonic) == false) {
 			return arc;
@@ -156,7 +161,7 @@ pub const Meta = struct {
 		// our describe is stale, regenerate!
 		self._datasets_lock.lockShared();
 		defer self._datasets_lock.unlockShared();
-		self._describe.setValue(.{self._datasets}) catch |err| {
+		self._describe.setValue(.{self._datasets, app}) catch |err| {
 			logz.err().err(err).ctx("Meta.getDescribe").log();
 			return arc; // return the previous value
 		};
@@ -164,7 +169,6 @@ pub const Meta = struct {
 		// we no longer need the old value
 		arc.release();
 		return self._describe.acquire();
-
 	}
 
 	// When dataset is new, then this is being called	This is being called from the DataSet's worker thread, so we can
@@ -192,7 +196,6 @@ pub const Meta = struct {
 			gop.key_ptr.* = arc.value.name;
 			arc.release();
 		}
-
 
 		const describe = self._describe.acquire();
 		defer describe.release();
@@ -278,9 +281,9 @@ const Describe = struct {
 
 	// when this is called, meta._datasets_lock is under a read-lock.
 	// allocator is an arena that we aren't responsible for, so we can be sloppy.
-	pub fn init(allocator: Allocator, datasets: std.StringHashMapUnmanaged(zul.LockRefArenaArc(Meta.DataSet))) !Describe {
+	pub fn init(allocator: Allocator, datasets: std.StringHashMapUnmanaged(zul.LockRefArenaArc(Meta.DataSet)), app: *logdk.App) !Describe {
 		// Zig doesn't have a good way to serialize a StringHashMap
-
+		// So we're doing all of this by hand.
 		var arr = std.ArrayList(u8).init(allocator);
 		var writer = arr.writer();
 		try writer.writeAll("{\"datasets\": [");
@@ -293,12 +296,14 @@ const Describe = struct {
 				try std.json.stringify(ref.arc.value, .{}, writer);
 			}
 		}
-		try writer.writeAll("]}");
+		try writer.writeAll("],\"settings\":{");
+		try writer.writeAll("\"single_user\":");
+		try writer.writeAll(if (app.isSingleUser()) "true" else "false");
+		try writer.writeAll("}}");
 
 		var compressed = std.ArrayList(u8).init(allocator);
 		var fbs = std.io.fixedBufferStream(arr.items);
 		try std.compress.gzip.compress(fbs.reader(), compressed.writer(), .{.level = .best});
-
 
 		return .{
 			.stale = false,
@@ -316,12 +321,7 @@ const Info = struct {
 	json: []const u8,
 	expires: i64,
 
-	pub fn init(allocator: Allocator, app_: ?*logdk.App) !Info {
-		// app is initially not availabe. That's fine. We create an empty Info
-		// with an expiration of 0, which means next time someone tried to get the
-		// info, it'll reload.
-		const app = app_ orelse return .{.json = "{}", .expires = 0};
-
+	pub fn init(allocator: Allocator, app: *logdk.App) !Info {
 		var conn = try app.db.acquire();
 		defer conn.release();
 

@@ -32,8 +32,8 @@
 			.hash = "12206985d852a49dc4fe6515480c7509b9ba1da089c8eca173c3b85688488237675d"
 		},
 		.zul = .{
-			.url = "https://github.com/karlseguin/zul/archive/52287aeb567fe773f8cc844e588ee45438b6c6bb.tar.gz",
-			.hash = "1220ccbe14ea7a88f124f01ac43345c98b2255c737ba32fa84c373ab8bed3a7c73ed"
+			.url = "https://github.com/karlseguin/zul/archive/ad678420de998e26263ba56bfde28285c4203b1e.tar.gz",
+			.hash = "1220ccd8a2bf6cec0eab0a45d520b3d4b57fbaabd594e94908608c0dcc83961db0a2"
 		}
 	},
 }
