@@ -9,8 +9,6 @@ const App = logdk.App;
 pub const Env = struct {
 	app: *App,
 
-	arena: std.mem.Allocator,
-
 	// This logger has the "$rid=REQUEST_ID" attributes (and maybe more) automatically
 	// added to any generated log. Managed by the dispatcher.
 	logger: logz.Logger,

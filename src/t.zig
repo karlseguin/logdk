@@ -136,7 +136,6 @@ pub const Context = struct {
 		e.* = Env{
 			.user = .{.id = 0},
 			.app = app,
-			.arena = self.arena,
 			.logger = logz.logger().multiuse(),
 		};
 		self._env = e;

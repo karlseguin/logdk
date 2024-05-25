@@ -8,8 +8,8 @@
 			.hash = "1220543762f9d3c337023acb6ab342369241c484baed23fbad9c18aa82c94e905906"
 		},
 		.httpz = .{
-			.url = "https://github.com/karlseguin/http.zig/archive/a6187a4c1446644019dce6f483588568da707c58.tar.gz",
-			.hash = "1220ccdd2a63d1ffc11c51cffbdba68359d2aa055d5a41f5feceb5c02d1e31468f8a"
+			.url = "https://github.com/karlseguin/http.zig/archive/f3ad561fd23262c3f9b8081ff7bb8a5ded0e74bd.tar.gz",
+			.hash = "1220ea0d5860657d59cf1ca0fe0e553bfabc7d9cd467005488155baffb1ddf65ecf2"
 		},
 		.logz = .{
 			.url = "https://github.com/karlseguin/log.zig/archive/adc6910d2e8f50e0ec5a4792d6a7136f46778061.tar.gz",

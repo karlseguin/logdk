@@ -137,7 +137,7 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 
 	const input = try web.validateQuery(req, input_validator, env);
 
-	var builder = try QueryBuilder.init(res.arena, env);
+	var builder = try QueryBuilder.init(req.arena, env);
 	defer builder.deinit();
 
 	try builder.select("*");

@@ -146,7 +146,6 @@ const Dispatcher = struct {
 				.app = self.app,
 				.user = user,
 				.logger = logger,
-				.arena = res.arena,
 			};
 			defer env.deinit();
 
