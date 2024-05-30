@@ -258,7 +258,15 @@ pub const App = struct {
 			, .{buf.string()});
 		}
 
-		try self._settings.setValue(new);
+		{
+			// brute force, but there could have been another thread doing some changes
+			// (ike creating a user which would change the single_user flag), so this
+			// is easier, and it isn't something we expect to do often.
+			var conn = try self.db.acquire();
+			defer conn.release();
+			try self._settings.setValue(try loadSettings(self.allocator, conn));
+		}
+
 		self.meta.describeChanged();
 	}
 
