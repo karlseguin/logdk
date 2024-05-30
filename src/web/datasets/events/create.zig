@@ -11,7 +11,7 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 	const name = req.params.get("name").?;
 
 	var arc = app.getDataSet(name) orelse blk: {
-		if (app.allowDataSetCreation() == false) {
+		if (env.settings.dataset_creation == false) {
 			return web.notFound(res, "dataset not found and dynamic creation is disabled");
 		}
 		break :blk null;
@@ -62,7 +62,7 @@ const t = logdk.testing;
 test "events.create: unknown dataset, dynamic creation disabled" {
 	var tc = t.context(.{});
 	defer tc.deinit();
-	tc.app._settings.allow_dataset_creation = false;
+	try tc.app._settings.setValue(.{.dataset_creation = false});
 
 	tc.web.param("name", "nope");
 	try handler(tc.env(), tc.web.req, tc.web.res);

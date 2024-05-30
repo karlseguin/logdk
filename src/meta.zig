@@ -152,7 +152,7 @@ pub const Meta = struct {
 		return self._info.acquire();
 	}
 
-	pub fn getDescribe(self: *Meta, app: *logdk.App) DescribeArc {
+	pub fn getDescribe(self: *Meta, settings: *const logdk.App.Settings) DescribeArc {
 		const arc = self._describe.acquire();
 		if (@atomicLoad(bool, &arc.value.stale, .monotonic) == false) {
 			return arc;
@@ -161,7 +161,7 @@ pub const Meta = struct {
 		// our describe is stale, regenerate!
 		self._datasets_lock.lockShared();
 		defer self._datasets_lock.unlockShared();
-		self._describe.setValue(.{self._datasets, app}) catch |err| {
+		self._describe.setValue(.{self._datasets, settings}) catch |err| {
 			logz.err().err(err).ctx("Meta.getDescribe").log();
 			return arc; // return the previous value
 		};
@@ -169,6 +169,13 @@ pub const Meta = struct {
 		// we no longer need the old value
 		arc.release();
 		return self._describe.acquire();
+	}
+
+	pub fn describeChanged(self: *Meta) void {
+		// flag it as stale so that, on the next get, we updte it
+		const describe = self._describe.acquire();
+		defer describe.release();
+		@atomicStore(bool, &describe.value.stale, true, .monotonic);
 	}
 
 	// When dataset is new, then this is being called	This is being called from the DataSet's worker thread, so we can
@@ -197,9 +204,7 @@ pub const Meta = struct {
 			arc.release();
 		}
 
-		const describe = self._describe.acquire();
-		defer describe.release();
-		@atomicStore(bool, &describe.value.stale, true, .monotonic);
+		self.describeChanged();
 	}
 
 	// a "meta" representation of a DataSet. This owns all its fields, since
@@ -283,7 +288,7 @@ const Describe = struct {
 	// access the arc value directly since we know the underlying entry can't
 	// be swapped out on us.
 	// allocator is an arena that we aren't responsible for, so we can be sloppy.
-	pub fn init(allocator: Allocator, datasets: std.StringHashMapUnmanaged(zul.LockRefArenaArc(Meta.DataSet)), app: *logdk.App) !Describe {
+	pub fn init(allocator: Allocator, datasets: std.StringHashMapUnmanaged(zul.LockRefArenaArc(Meta.DataSet)), settings: *const logdk.App.Settings) !Describe {
 		var dataset_list = try allocator.alloc(Meta.DataSet, datasets.count());
 
 		{
@@ -296,10 +301,8 @@ const Describe = struct {
 		}
 
 		const json = try std.json.stringifyAlloc(allocator, .{
+			.settings = settings,
 			.datasets = dataset_list,
-			.settings = .{
-				.single_user = app.isSingleUser(),
-			}
 		}, .{});
 
 		var compressed = std.ArrayList(u8).init(allocator);

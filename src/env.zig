@@ -19,6 +19,12 @@ pub const Env = struct {
 	// cannot be null, web dispatcher will set this to an anonymous user if needed
 	user: logdk.auth.User,
 
+	// App.Settings can change (settings can be updated), but this is a snapshot
+	// of settings when the request began (achieved through an Arc Mutext). This
+	// ensures a request has a consistent view of settings, and allows accessing
+	// fields without thread-safety issues.
+	settings: *const App.Settings,
+
 	pub fn deinit(self: Env) void {
 		if (self._validator) |val| {
 			self.app.validators.release(val);

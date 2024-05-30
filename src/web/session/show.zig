@@ -10,7 +10,7 @@ pub fn handler(env: *logdk.Env, _: *httpz.Request, res: *httpz.Response) !void {
 	return res.json(.{
 		.user_id = user.id,
 		.permissions = .{
-			.admin = user.permission_admin or env.app.isSingleUser(),
+			.admin = user.permission_admin or env.settings.single_user,
 			.raw_query = user.permission_raw_query,
 		}
 	}, .{});
@@ -20,7 +20,7 @@ const t = logdk.testing;
 test "session show: null user single user mode OFF" {
 	var tc = t.context(.{});
 	defer tc.deinit();
-	tc.app._settings.single_user = false;
+	try tc.app._settings.setValue(.{.single_user = false});
 
 	try handler(tc.env(), tc.web.req, tc.web.res);
 	try tc.web.expectJson(.{
@@ -35,7 +35,7 @@ test "session show: null user single user mode OFF" {
 test "session show: null user single user mode ON" {
 	var tc = t.context(.{});
 	defer tc.deinit();
-	tc.app._settings.single_user = true;
+	try tc.app._settings.setValue(.{.single_user = true});
 
 	try handler(tc.env(), tc.web.req, tc.web.res);
 	try tc.web.expectJson(.{
@@ -50,7 +50,7 @@ test "session show: null user single user mode ON" {
 test "session show: logged in user" {
 	var tc = t.context(.{});
 	defer tc.deinit();
-	tc.app._settings.single_user = false;
+	try tc.app._settings.setValue(.{.single_user = false});
 
 	{
 		try handler(tc.envWithUser(.{.id = 33, .permission_admin = true}), tc.web.req, tc.web.res);

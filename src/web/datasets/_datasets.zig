@@ -1,8 +1,13 @@
 const logdk = @import("../../logdk.zig");
 
-pub const events_index = @import("events/index.zig");
-pub const events_create = @import("events/create.zig");
+const events_list = @import("events/index.zig");
+const events_create = @import("events/create.zig");
+
+pub const events = struct {
+	pub const list = events_list.handler;
+	pub const create = events_create.handler;
+};
 
 pub fn init(builder: *logdk.Validate.Builder) !void {
-	try events_index.init(builder);
+	try events_list.init(builder);
 }

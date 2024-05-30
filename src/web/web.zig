@@ -17,6 +17,7 @@ const Permission = logdk.auth.Permission;
 const ui = @import("ui.zig");
 const exec = @import("exec.zig");
 const info = @import("info/_info.zig");
+const admin = @import("admin/_admin.zig");
 const session = @import("session/_session.zig");
 const datasets = @import("datasets/_datasets.zig");
 
@@ -31,6 +32,7 @@ var request_counter: u32 = 0;
 pub fn init(builder: *logdk.Validate.Builder) !void {
 	try datasets.init(builder);
 	try exec.init(builder);
+	try admin.init(builder);
 }
 
 pub fn start(app: *App, config: *const Config) !void {
@@ -62,16 +64,19 @@ pub fn start(app: *App, config: *const Config) !void {
 
 	{
 		var routes = router.group("/api/1", .{});
-		routes.getC("/datasets/:name/events", datasets.events_index.handler, .{.ctx = &df.create("events_list", null)});
-		routes.postC("/datasets/:name/events", datasets.events_create.handler, .{.ctx = &df.create("events_create", null)});
+		routes.getC("/datasets/:name/events", datasets.events.list, .{.ctx = &df.create("events_list", null)});
+		routes.postC("/datasets/:name/events", datasets.events.create, .{.ctx = &df.create("events_create", null)});
 		routes.getC("/exec", exec.handler, .{.ctx = &df.create("exec_sql", .raw_query)});
 		routes.getC("/info", info.info, .{.ctx = &df.create("info", null)});
 		routes.getC("/describe", info.describe, .{.ctx = &df.create("describe", null)});
-		routes.getC("/session", session.show.handler, .{.ctx = &df.create("session_show.handler", null)});
+		routes.getC("/session", session.show, .{.ctx = &df.create("session_show.handler", null)});
+
+		routes.postC("/settings", admin.settings.update, .{.ctx = &df.create("admin_settings", .admin)});
 	}
 
 	router.getC("/metrics", info.metrics, .{.dispatcher = server.dispatchUndefined()});
 	router.getC("/*", ui.handler, .{.dispatcher = server.dispatchUndefined()});
+
 	logz.info().ctx("http.listen")
 		.fmt("address", "http://{s}:{d}", .{server.config.address.?, server.config.port.?})
 		.stringSafe("log_http", @tagName(config.log_http))
@@ -116,10 +121,18 @@ const Dispatcher = struct {
 		var user_id: ?u32 = null;
 		var log_request = self.log_request;
 
+		const app = self.app;
+		var arc_settings = app.getSettings();
+		defer arc_settings.release();
+
+		const settings = &arc_settings.value;
+
 		// Block exists only so we can break out of it should we have an authentication
 		// or authorization issue.
 		action: {
-			var user = User{.id = 0};
+			// default user
+			// when in single_user mode, the default user is an admin
+			var user = User{.id = 0, .permission_admin = settings.single_user};
 			var cache_user_entry: ?*cache.Entry(User) = null;
 			if (getSessionId(req)) |session_id| {
 				if (try self.session_cache.fetch(*const Dispatcher, session_id, loadUserFromSessionId, self, .{.ttl = 1800})) |entry| {
@@ -132,9 +145,7 @@ const Dispatcher = struct {
 					break: action;
 				}
 			}
-
 			defer if (cache_user_entry) |entry| entry.release();
-
 			if (self.permission) |required_permission| {
 				if (user.hasPermission(required_permission) == false) {
 					code = errors.PermissionDenied.write(res);
@@ -143,9 +154,10 @@ const Dispatcher = struct {
 			}
 
 			var env = Env{
-				.app = self.app,
+				.app = app,
 				.user = user,
 				.logger = logger,
+				.settings = settings,
 			};
 			defer env.deinit();
 
@@ -278,6 +290,16 @@ pub fn validateQuery(req: *httpz.Request, v: *logdk.Validate.Object, env: *Env) 
 	return input orelse typed.Map.readonlyEmpty();
 }
 
+pub fn validateJson(req: *httpz.Request, v: *logdk.Validate.Object, env: *Env) !typed.Map {
+	const body = req.body() orelse return error.InvalidJson;
+	var validator = try env.validator();
+	const input = try v.validateJsonS(body, validator);
+	if (!validator.isValid()) {
+		return error.Validation;
+	}
+	return input;
+}
+
 pub fn metrics(_: *Env, _: *httpz.Request, res: *httpz.Response) !void {
 	const writer = res.writer();
 	try httpz.writeMetrics(writer);
@@ -379,9 +401,23 @@ test "dispatcher: dispatch to actions" {
 	try tc.web.expectJson(.{.url = "/test_1"});
 }
 
-test "dispatcher: permission required with no auth" {
+test "dispatcher: permission required with no auth in single user mode" {
 	var tc = t.context(.{});
 	defer tc.deinit();
+	try tc.app._settings.setValue(.{.single_user = true});
+
+	tc.web.url("/user_0");
+
+	const dispatcher = testDispatcher(tc, .{.permission = .admin});
+	try dispatcher.dispatch(callableAction, tc.web.req, tc.web.res);
+	try tc.web.expectStatus(200);
+	try tc.web.expectJson(.{.user_id = 0});
+}
+
+test "dispatcher: permission required with no auth not in single user mode" {
+	var tc = t.context(.{});
+	defer tc.deinit();
+	try tc.app._settings.setValue(.{.single_user = false});
 
 	tc.web.url("/");
 
@@ -404,6 +440,7 @@ test "dispatcher: invalid auth token" {
 test "dispatcher: valid auth but with wrong permission" {
 	var tc = t.context(.{});
 	defer tc.deinit();
+try 	tc.app._settings.setValue(.{.single_user = false});
 
 	tc.web.url("/");
 	tc.web.header("authorization", "token1");
@@ -510,10 +547,14 @@ fn callableAction(env: *Env, req: *httpz.Request, res: *httpz.Response) !void {
 		try env.logger.logTo(arr.writer());
 		try t.expectEqual("@ts=9999999999999 $rid=958589\n", arr.items);
 		try t.expectEqual(0, env.user.id);
-		inline for (std.meta.tags(Permission)) |p| {
-			try t.expectEqual(false, env.user.hasPermission(p));
-		}
 		return res.json(.{.url = req.url.path}, .{});
+	}
+
+	if (std.mem.eql(u8, req.url.path, "/user_0")) {
+		try t.expectEqual(0, env.user.id);
+		try t.expectEqual(true, env.user.permission_admin);
+		try t.expectEqual(false, env.user.permission_raw_query);
+		return res.json(.{.user_id = env.user.id}, .{});
 	}
 
 	if (std.mem.eql(u8, req.url.path, "/user_3")) {

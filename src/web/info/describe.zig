@@ -3,7 +3,7 @@ const httpz = @import("httpz");
 const logdk = @import("../../logdk.zig");
 
 pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void {
-	const describe = env.app.meta.getDescribe(env.app);
+	const describe = env.app.meta.getDescribe(env.settings);
 	res.callback(releasePayload, @ptrCast(describe));
 	res.content_type = .JSON;
 

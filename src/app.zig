@@ -64,11 +64,7 @@ pub const App = struct {
 	// only used for shutting down
 	_webserver: ?*logdk.web.Server = null,
 
-	// must always be access via one of the getters/setters to synchronize access
-	_settings: Settings,
-
-	// serialize persisting the settings
-	_settings_lock: Thread.Mutex,
+	_settings: zul.LockRefArc(Settings),
 
 	pub fn init(allocator: Allocator, config: logdk.Config) !App{
 		var open_err: ?[]u8 = null;
@@ -84,17 +80,9 @@ pub const App = struct {
 
 		const settings = blk: {
 			var conn = try db_pool.acquire();
-			conn.release();
+			defer conn.release();
 			try @import("migrations/migrations.zig").run(conn);
-
-			const row = (try conn.row("select settings from logdk.settings where id = 1", .{})) orelse break :blk Settings{};
-			defer row.deinit();
-
-			const parsed = try std.json.parseFromSlice(Settings, allocator, row.get([]const u8, 0), .{});
-			defer parsed.deinit();
-
-			// Yes, we deinit parsed, but settings has no allocated fields.
-			break :blk parsed.value;
+			break :blk try loadSettings(allocator, conn);
 		};
 
 		var validator_pool = try ValidatorPool(void).init(allocator, config.validator);
@@ -106,23 +94,25 @@ pub const App = struct {
 		var dispatcher = try d.Dispatcher(Queues).init(allocator);
 		errdefer dispatcher.deinit();
 
-		const meta = try Meta.init(allocator);
-		errdefer meta.value.deinit();
+		var meta = try Meta.init(allocator);
+		errdefer meta.deinit();
 
 		var scheduler = Scheduler.init(allocator);
 		errdefer scheduler.deinit();
 
+		var settings_ref = try zul.LockRefArc(Settings).init(allocator, settings);
+		errdefer settings_ref.deinit();
+
 		return .{
 			.meta = meta,
 			._create_lock = .{},
-			._settings = settings,
-			._settings_lock = .{},
 			.allocator = allocator,
 			.validators = validator_pool,
 			.db = db_pool,
 			.buffers = buffers,
 			.scheduler = scheduler,
 			.dispatcher = dispatcher,
+			._settings = settings_ref,
 		};
 	}
 
@@ -139,6 +129,7 @@ pub const App = struct {
 		self.db.deinit();
 		self.buffers.deinit();
 		self.validators.deinit();
+		self._settings.deinit();
 	}
 
 	pub fn getDataSet(self: *App, name: []const u8) ?Meta.DataSetArc {
@@ -247,62 +238,76 @@ pub const App = struct {
 		try self.meta.datasetChanged(&dataset);
 	}
 
-	pub fn allowDataSetCreation(self: *App) bool {
-		return self.readSetting(bool, "allow_dataset_creation");
-	}
-	pub fn setDataSetCreation(self: *App, value: bool) !void {
-		return self.writeSetting(bool, "allow_dataset_creation", value);
+	pub fn getSettings(self: *App) *zul.LockRefArc(Settings).Arc {
+		return self._settings.acquire();
 	}
 
-	pub fn isSingleUser(self: *App) bool {
-		return self.readSetting(bool, "single_user");
-	}
-	pub fn setSingleUser(self: *App, value: bool) !void {
-		return self.writeSetting(bool, "single_user", value);
-	}
+	pub fn saveSettings(self: *App, new: Settings) !void {
+		{
+			var buf = try self.buffers.acquire();
+			defer buf.release();
 
-	fn readSetting(self: *App, comptime T: type, comptime name: []const u8) T {
-		return @atomicLoad(T, &@field(self._settings, name), .monotonic);
-	}
+			try std.json.stringify(new, .{}, buf.writer());
 
-	// Thread safety around _settings is weird. We only use our lock to synchronize writes
-	// (i.e. this function). When reading a value, we use an @atomicLoad. However, in this
-	// function, when we serialize _settings (which obviously has to read each value) we
-	// don't use an @atomicLoad. What gives?
-	// We need an @atomicLoad in `isSingleUser` (for example), because another thread
-	// could be calling `writeSetting` at the same time and issuing an @atomicStore.
-	// However, once a thread is in `writeSetting` and has the lock, no other thread
-	// could be writing to the settings. Other threads might be reading a value, but
-	// as far as I know, it's fine for some threads to use @atomicLoad while other
-	// threads just read the value directly - as long as no thread is writing, which
-	// our lock guarantees.
-	fn writeSetting(self: *App, comptime T: type, comptime name: []const u8, value: T) !void {
-		self._settings_lock.lock();
-		defer self._settings_lock.unlock();
+			var conn = try self.db.acquire();
+			defer conn.release();
 
-		@atomicStore(T, &@field(self._settings, name), value, .monotonic);
+			_ = try conn.exec(
+				\\ insert into logdk.settings (id, settings) values (1, $1)
+				\\ on conflict do update set settings = $1
+			, .{buf.string()});
+		}
 
-		var buf = try self.buffers.acquire();
-		defer buf.release();
-
-		try std.json.stringify(self._settings, .{}, buf.writer());
-
-		var conn = try self.db.acquire();
-		defer conn.release();
-
-		const affected = try conn.exec(
-			\\ insert into logdk.settings (id, settings) values (1, $1)
-			\\ on conflict do update set settings = $1
-		, .{buf.string()});
-
-		std.debug.assert(affected == 1);
+		try self._settings.setValue(new);
+		self.meta.describeChanged();
 	}
 
-	const Settings = struct {
-		single_user: bool = true,
-		allow_dataset_creation: bool = true,
+	pub const Settings = struct {
+		single_user: bool = false,
+		create_tokens: bool = false,
+		dataset_creation: bool = true,
+
+		// single_us is derived, and we have no way to ignore a field when serializing
+		// so we do this to make sure it doesn't get written when saving
+		pub fn jsonStringify(self: Settings, out: anytype) !void {
+			return out.write(.{
+				.create_tokens = self.create_tokens,
+				.dataset_creation = self.dataset_creation,
+			});
+		}
 	};
 };
+
+fn loadSettings(allocator: Allocator, conn: *zuckdb.Conn) !App.Settings {
+	// single_user is true when there are no enabled users with admin permission
+	const sql =
+		\\ with settings as (
+		\\   select
+		\\     case when cnt = 0 then to_json('{}')
+		\\     else (select settings from logdk.settings)
+		\\     end as data
+		\\   from (select count(*) as cnt from logdk.settings)
+		\\ ),
+		\\   single_user as (
+		\\     select json_object('single_user', count(*) = 0) as data
+		\\     from logdk.users
+		\\     where enabled and list_contains(permissions, 'admin')
+		\\ )
+		\\ select json_merge_patch(settings.data, single_user.data)
+		\\ from settings, single_user
+	;
+
+	var row = (try conn.row(sql, .{})) orelse unreachable;
+	defer row.deinit();
+
+	const parsed = try std.json.parseFromSlice(App.Settings, allocator, row.get([]const u8, 0), .{});
+
+	// settings has no allocation, so we can free the arena that was used when
+	// parsing the string
+	parsed.deinit();
+
+	return parsed.value;
+}
 
 const t = logdk.testing;
 test "App: loadDataSets" {
@@ -470,21 +475,37 @@ test "App: settings" {
 	var tc = t.context(.{});
 	defer tc.deinit();
 
-	// defaults
-	try t.expectEqual(true, tc.app.isSingleUser());
-	try t.expectEqual(true, tc.app.allowDataSetCreation());
+	var app = tc.app;
 
 	{
-		try tc.app.setSingleUser(false);
-		try t.expectEqual(false, tc.app.isSingleUser());
-		try t.expectEqual(true, tc.app.allowDataSetCreation());
-		try t.expectEqual(false, try tc.scalar(bool, "select (settings->'single_user')::bool from logdk.settings where id = 1", .{}));
+		// defaults
+		var settings = app.getSettings();
+		defer settings.release();
+		try t.expectEqual(true, settings.value.single_user);
+		try t.expectEqual(false, settings.value.create_tokens);
+		try t.expectEqual(true, settings.value.dataset_creation);
 	}
 
 	{
-		try tc.app.setDataSetCreation(false);
-		try t.expectEqual(false, tc.app.isSingleUser());
-		try t.expectEqual(false, tc.app.allowDataSetCreation());
-		try t.expectEqual(false, try tc.scalar(bool, "select (settings->'allow_dataset_creation')::bool from logdk.settings where id = 1", .{}));
+		// single user can't be persisted
+		// (but its in-memory can be updated, which might not be the right behavior)
+		try app.saveSettings(.{.single_user = true, .create_tokens = true, .dataset_creation = false});
+		var settings = app.getSettings();
+		defer settings.release();
+		try t.expectEqual(true, settings.value.single_user);
+		try t.expectEqual(true, settings.value.create_tokens);
+		try t.expectEqual(false, settings.value.dataset_creation);
+
+		const json = try tc.scalar([]const u8, "select settings from logdk.settings", .{});
+		const parsed = try std.json.parseFromSlice(struct{
+			create_tokens: bool,
+			dataset_creation: bool,
+			single_user: i32 = 1,  // hack, if saveSettings _did_ write single_user, than we'd fail to parse its bool value
+		}, t.allocator, json, .{});
+		defer parsed.deinit();
+
+		try t.expectEqual(1, parsed.value.single_user);
+		try t.expectEqual(true, parsed.value.create_tokens);
+		try t.expectEqual(false, parsed.value.dataset_creation);
 	}
 }
