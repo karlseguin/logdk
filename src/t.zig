@@ -51,6 +51,7 @@ pub fn context(_: Context.Config) *Context {
 		.arena = aa,
 		.app = app,
 		.web = web.init(.{}),
+		.factory = .{.ctx = ctx},
 	};
 	return ctx;
 }
@@ -62,6 +63,7 @@ pub const Context = struct {
 	web: web.Testing,
 	arena: std.mem.Allocator,
 	reset_log_level: bool = false,
+	factory: Factory,
 
 	const Config = struct {
 	};
@@ -228,5 +230,44 @@ pub const Context = struct {
 	pub fn expectInvalid(self: *const Context, expectation: anytype) !void {
 		const validate = @import("validate");
 		return validate.testing.expectInvalid(expectation, self._env.?._validator.?);
+	}
+};
+
+const Factory = struct {
+	ctx: *Context,
+
+	pub fn user(self: Factory, args: anytype) void {
+		const T = @TypeOf(args);
+
+		var ctx = self.ctx;
+
+		var password = "";
+		var pw_buf: [300]u8 = undefined;
+		if (@hasField(T, "password")) {
+			const argon2 = std.crypto.pwhash.argon2;
+			password = argon2.strHash(args.password, .{
+				.allocator = ctx.arena,
+				.params = argon2.Params.fromLimits(1, 1024),
+			}, &pw_buf) catch unreachable;
+		}
+
+		// cannot yet bind arrays to duckdb prepared statements, but we can
+		// insert it as json, and duckdb will convert
+		var permissions: []const u8 = "[]";
+		if (@hasField(T, "permissions")) {
+			permissions = std.json.stringifyAlloc(ctx.arena, args.permissions, .{}) catch unreachable;
+		}
+
+		ctx.exec(
+			\\ insert into logdk.users (id, password, permissions, username, enabled, created)
+			\\ values ($1, $2, $3::json, $4, $5, $6)
+		, .{
+			args.id,
+			password,
+			permissions,
+			if (@hasField(T, "username")) args.username else "teg",
+			if (@hasField(T, "enabled")) args.enabled else true,
+			if (@hasField(T, "created")) args.created else std.time.microTimestamp(),
+		}) catch unreachable;
 	}
 };

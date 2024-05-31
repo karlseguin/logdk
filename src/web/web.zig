@@ -64,6 +64,8 @@ pub fn start(app: *App, config: *const Config) !void {
 
 	{
 		var routes = router.group("/api/1", .{});
+		router.getC("/metrics", info.metrics, .{.dispatcher = server.dispatchUndefined()});
+
 		routes.getC("/datasets/:name/events", datasets.events.list, .{.ctx = &df.create("events_list", null)});
 		routes.postC("/datasets/:name/events", datasets.events.create, .{.ctx = &df.create("events_create", null)});
 		routes.getC("/exec", exec.handler, .{.ctx = &df.create("exec_sql", .raw_query)});
@@ -71,10 +73,13 @@ pub fn start(app: *App, config: *const Config) !void {
 		routes.getC("/describe", info.describe, .{.ctx = &df.create("describe", null)});
 		routes.getC("/session", session.show, .{.ctx = &df.create("session_show.handler", null)});
 
-		routes.postC("/settings", admin.settings.update, .{.ctx = &df.create("admin_settings", .admin)});
+		routes.postC("/settings", admin.settings.update, .{.ctx = &df.create("settigs", .admin)});
+		routes.getC("/users", admin.users.list, .{.ctx = &df.create("users_list", .admin)});
+		// routes.postC("/users", admin.users.create, .{.ctx = &df.create("users_create", .admin)});
+		// routes.putC("/users/:id", admin.users.update, .{.ctx = &df.create("users_update", .admin)});
+		// routes.deleteC("/users/:id", admin.users.delete, .{.ctx = &df.create("users_delete", .admin)});
 	}
 
-	router.getC("/metrics", info.metrics, .{.dispatcher = server.dispatchUndefined()});
 	router.getC("/*", ui.handler, .{.dispatcher = server.dispatchUndefined()});
 
 	logz.info().ctx("http.listen")
