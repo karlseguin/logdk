@@ -1,9 +1,10 @@
 const zuckdb = @import("zuckdb");
 
 pub fn run(conn: *zuckdb.Conn) !void {
+	_ = try conn.exec("create sequence users_id_seq", .{});
 	_ = try conn.exec(
 		\\ create table logdk.users (
-		\\   id uinteger primary key,
+		\\   id uinteger primary key default nextval('users_id_seq'),
 		\\   username text not null,
 		\\   password text not null,
 		\\   enabled bool not null,
@@ -11,6 +12,8 @@ pub fn run(conn: *zuckdb.Conn) !void {
 		\\   created timestamptz not null default(now())
 		\\ )
 	, .{});
+
+	_ = try conn.exec("create unique index logdk_users_username on logdk.users(username)", .{});
 
 	_ = try conn.exec(
 		\\ create table logdk.sessions (

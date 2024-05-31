@@ -244,26 +244,20 @@ pub const App = struct {
 
 	pub fn saveSettings(self: *App, new: Settings) !void {
 		{
-			var buf = try self.buffers.acquire();
-			defer buf.release();
-
-			try std.json.stringify(new, .{}, buf.writer());
-
 			var conn = try self.db.acquire();
 			defer conn.release();
 
-			_ = try conn.exec(
-				\\ insert into logdk.settings (id, settings) values (1, $1)
-				\\ on conflict do update set settings = $1
-			, .{buf.string()});
-		}
+			{
+				var buf = try self.buffers.acquire();
+				defer buf.release();
+				try std.json.stringify(new, .{}, buf.writer());
 
-		{
-			// brute force, but there could have been another thread doing some changes
-			// (ike creating a user which would change the single_user flag), so this
-			// is easier, and it isn't something we expect to do often.
-			var conn = try self.db.acquire();
-			defer conn.release();
+				_ = try conn.exec(
+					\\ insert into logdk.settings (id, settings) values (1, $1)
+					\\ on conflict do update set settings = $1
+				, .{buf.string()});
+			}
+
 			try self._settings.setValue(try loadSettings(self.allocator, conn));
 		}
 

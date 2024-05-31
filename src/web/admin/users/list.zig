@@ -5,15 +5,12 @@ const logdk = @import("../../../logdk.zig");
 pub fn handler(env: *logdk.Env, _: *httpz.Request, res: *httpz.Response) !void {
 	var app = env.app;
 
-	var conn = try app.db.acquire();
-	defer conn.release();
-
 	const sql =
 		\\ select json_object('id', id, 'username', username, 'enabled', enabled, 'permissions', permissions)
 		\\ from logdk.users
 		\\ order by lower(username)
 	;
-	var rows = try conn.query(sql, .{});
+	var rows = try app.db.query(sql, .{});
 	defer rows.deinit();
 
 	res.content_type = .JSON;

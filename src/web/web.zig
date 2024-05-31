@@ -75,7 +75,8 @@ pub fn start(app: *App, config: *const Config) !void {
 
 		routes.postC("/settings", admin.settings.update, .{.ctx = &df.create("settigs", .admin)});
 		routes.getC("/users", admin.users.list, .{.ctx = &df.create("users_list", .admin)});
-		// routes.postC("/users", admin.users.create, .{.ctx = &df.create("users_create", .admin)});
+		routes.postC("/users", admin.users.create, .{.ctx = &df.create("users_create", .admin)});
+		// see the handler for why this route is disabled
 		// routes.putC("/users/:id", admin.users.update, .{.ctx = &df.create("users_update", .admin)});
 		routes.deleteC("/users/:id", admin.users.delete, .{.ctx = &df.create("users_delete", .admin)});
 	}

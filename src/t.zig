@@ -241,7 +241,7 @@ const Factory = struct {
 
 		var ctx = self.ctx;
 
-		var password = "";
+		var password: []const u8 = "";
 		var pw_buf: [300]u8 = undefined;
 		if (@hasField(T, "password")) {
 			const argon2 = std.crypto.pwhash.argon2;

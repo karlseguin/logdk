@@ -14,8 +14,8 @@ pub fn init(builder: *logdk.Validate.Builder) !void {
 
 pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void {
 	const input = try web.validateJson(req, input_validator, env);
-	const existing = env.settings;
 
+	const existing = env.settings;
 	try env.app.saveSettings(.{
 		.create_tokens = if (input.get("create_tokens")) |v| v.bool else existing.create_tokens,
 		.dataset_creation = if (input.get("dataset_creation")) |v| v.bool else existing.dataset_creation,
