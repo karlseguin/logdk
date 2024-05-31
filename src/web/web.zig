@@ -74,11 +74,16 @@ pub fn start(app: *App, config: *const Config) !void {
 		routes.getC("/session", session.show, .{.ctx = &df.create("session_show.handler", null)});
 
 		routes.postC("/settings", admin.settings.update, .{.ctx = &df.create("settigs", .admin)});
+
 		routes.getC("/users", admin.users.list, .{.ctx = &df.create("users_list", .admin)});
 		routes.postC("/users", admin.users.create, .{.ctx = &df.create("users_create", .admin)});
-		// see the handler for why this route is disabled
+		// see the handler for why this route is di
 		// routes.putC("/users/:id", admin.users.update, .{.ctx = &df.create("users_update", .admin)});
 		routes.deleteC("/users/:id", admin.users.delete, .{.ctx = &df.create("users_delete", .admin)});
+
+		routes.getC("/tokens", admin.tokens.list, .{.ctx = &df.create("tokens_list", .admin)});
+		routes.postC("/tokens", admin.tokens.create, .{.ctx = &df.create("tokens_create", .admin)});
+		routes.deleteC("/tokens/:id", admin.tokens.delete, .{.ctx = &df.create("tokens_delete", .admin)});
 	}
 
 	router.getC("/*", ui.handler, .{.dispatcher = server.dispatchUndefined()});

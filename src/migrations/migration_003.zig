@@ -23,4 +23,11 @@ pub fn run(conn: *zuckdb.Conn) !void {
 		\\  created timestamptz not null default(now())
 		\\ )
 	, .{});
+
+	_ = try conn.exec(
+		\\ create table logdk.tokens (
+		\\  id text not null primary key,
+		\\  created timestamptz not null default(now())
+		\\ )
+	, .{});
 }

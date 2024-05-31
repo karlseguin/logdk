@@ -270,4 +270,13 @@ const Factory = struct {
 			if (@hasField(T, "created")) args.created else std.time.microTimestamp(),
 		}) catch unreachable;
 	}
+
+	pub fn token(self: Factory, args: anytype) void {
+		const T = @TypeOf(args);
+
+		self.ctx.exec("insert into logdk.tokens (id, created) values ($1, $2)", .{
+			args.id,
+			if (@hasField(T, "created")) args.created else std.time.microTimestamp(),
+		}) catch unreachable;
+	}
 };
