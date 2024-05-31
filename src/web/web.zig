@@ -77,7 +77,7 @@ pub fn start(app: *App, config: *const Config) !void {
 		routes.getC("/users", admin.users.list, .{.ctx = &df.create("users_list", .admin)});
 		// routes.postC("/users", admin.users.create, .{.ctx = &df.create("users_create", .admin)});
 		// routes.putC("/users/:id", admin.users.update, .{.ctx = &df.create("users_update", .admin)});
-		// routes.deleteC("/users/:id", admin.users.delete, .{.ctx = &df.create("users_delete", .admin)});
+		routes.deleteC("/users/:id", admin.users.delete, .{.ctx = &df.create("users_delete", .admin)});
 	}
 
 	router.getC("/*", ui.handler, .{.dispatcher = server.dispatchUndefined()});
@@ -273,6 +273,17 @@ const Dispatcher = struct {
 // public because it's used by our logout handler
 pub fn getSessionId(req: *httpz.Request) ?[]const u8 {
 	return req.header("authorization");
+}
+
+pub fn parseInt(comptime T: type, field: []const u8, value: []const u8, env: *Env) !T {
+	return std.fmt.parseInt(T, value, 10) catch {
+		(try env.validator()).addInvalidField(.{
+			.field = field,
+			.err = "is not a valid number",
+			.code = logdk.Validate.TYPE_INT,
+		});
+		return error.Validation;
+	};
 }
 
 // This isn't great, but we turn out querystring args into a typed.Map where every

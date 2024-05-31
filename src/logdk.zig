@@ -32,6 +32,7 @@ pub const codes = struct {
 	pub const ILLEGAL_DB_WRITE = 8;
 	pub const INVALID_AUTHENTICATION_TOKEN = 9;
 	pub const PERMISSION_DENIED = 10;
+	pub const MUST_HAVE_ONE_ADMIN = 11;
 };
 
 const logz = @import("logz");
@@ -56,6 +57,7 @@ pub const Validate = struct {
 	pub const INT_MAX  = validate.codes.INT_MAX ;
 	pub const TYPE_BOOL = validate.codes.TYPE_BOOL;
 	pub const TYPE_ARRAY = validate.codes.TYPE_ARRAY;
+	pub const TYPE_INT = validate.codes.TYPE_INT;
 	pub const ARRAY_LEN_MIN = validate.codes.ARRAY_LEN_MIN;
 
 	pub const INVALID_IDENTIFIER = 5000;
