@@ -134,7 +134,7 @@ fn translateScalar(src: anytype, column_type: zuckdb.Vector.Type.Scalar, i: usiz
 			},
 			zuckdb.c.DUCKDB_TYPE_TIMESTAMP, zuckdb.c.DUCKDB_TYPE_TIMESTAMP_TZ  => try std.fmt.formatInt(src.get(i64, i), 10, .lower, .{}, writer),
 			else => |duckdb_type| {
-				try writer.writeAll("???");
+				try writer.writeAll("\"???\"");
 				logger.level(.Warn).ctx("serialize.unknown_type").int("duckdb_type", duckdb_type).log();
 			}
 		},
