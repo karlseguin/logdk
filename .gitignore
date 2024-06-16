@@ -1,6 +1,6 @@
 .DS_Store
 zig-out/
-zig-cache/
+.zig-cache/
 ui/
 lib/
 db.duckdb*

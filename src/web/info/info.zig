@@ -3,14 +3,13 @@ const logdk = @import("../../logdk.zig");
 
 pub fn handler(env: *logdk.Env, _: *httpz.Request, res: *httpz.Response) !void {
 	const info = env.app.meta.getInfo(env.app);
-	res.callback(releasePayload, @ptrCast(info));
+	defer info.release();
+
 	res.content_type = .JSON;
 	res.body = info.value.json;
-}
 
-fn releasePayload(state: *anyopaque) void {
-	const info: logdk.Meta.InfoArc = @alignCast(@ptrCast(state));
-	info.release();
+	// explicitly write, so that we can release our describe at the end of this function
+	try res.write();
 }
 
 const t = logdk.testing;

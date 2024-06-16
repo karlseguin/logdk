@@ -4,24 +4,23 @@ const logdk = @import("../../logdk.zig");
 
 pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void {
 	const describe = env.app.meta.getDescribe(env.settings);
-	res.callback(releasePayload, @ptrCast(describe));
-	res.content_type = .JSON;
+	defer describe.release();
 
+	res.content_type = .JSON;
 	if (servedCompressed(req)) {
 		res.header("Content-Encoding", "gzip");
 		res.body = describe.value.gzip;
 	} else {
 		res.body = describe.value.json;
 	}
+
+	// explicitly write, so that we can release our describe at the end of this function
+	try res.write();
 }
 
 fn servedCompressed(req: *httpz.Request) bool {
 	const ae = req.header("accept-encoding") orelse return false;
 	return std.mem.indexOf(u8, ae, "gzip") != null;
-}
-fn releasePayload(state: *anyopaque) void {
-	const describe: logdk.Meta.DescribeArc = @alignCast(@ptrCast(state));
-	describe.release();
 }
 
 const t = logdk.testing;
