@@ -10,7 +10,12 @@ pub fn handler(env: *logdk.Env, _: *httpz.Request, res: *httpz.Response) !void {
 		\\ from logdk.tokens
 		\\ order by id
 	;
-	var rows = try app.db.query(sql, .{});
+	var conn = try app.db.acquire();
+	defer conn.release();
+
+	var rows = conn.query(sql, .{}) catch |err| {
+		return logdk.dbErr("Tokens.list", err, conn, env.logger);
+	};
 	defer rows.deinit();
 
 	res.content_type = .JSON;

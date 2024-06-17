@@ -7,7 +7,7 @@ const logdk = @import("../../../logdk.zig");
 
 pub fn handler(env: *logdk.Env, _: *httpz.Request, res: *httpz.Response) !void {
 	const CHARS = "abcdefghijklmnopqrtuvwxyz0123456789";
-	var id: [20]u8 = undefined;
+	var id: [30]u8 = undefined;
 	std.crypto.random.bytes(&id);
 	for (&id) |*b| {
 		b.* = CHARS[@mod(b.*, CHARS.len)];
@@ -33,6 +33,6 @@ test "tokens.create" {
 	try tc.web.expectStatus(201);
 
 	const id = (try tc.web.getJson()).object.get("id").?.string;
-	try t.expectEqual(20, id.len);
+	try t.expectEqual(30, id.len);
 	try t.expectEqual(1, tc.scalar(i64, "select count(*) from logdk.tokens where id = $1", .{id}));
 }
