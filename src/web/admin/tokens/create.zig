@@ -6,21 +6,7 @@ const zuckdb = @import("zuckdb");
 const logdk = @import("../../../logdk.zig");
 
 pub fn handler(env: *logdk.Env, _: *httpz.Request, res: *httpz.Response) !void {
-	const CHARS = "abcdefghijklmnopqrtuvwxyz0123456789";
-	var id: [30]u8 = undefined;
-	std.crypto.random.bytes(&id);
-	for (&id) |*b| {
-		b.* = CHARS[@mod(b.*, CHARS.len)];
-	}
-
-	{
-		var conn = try env.app.db.acquire();
-		defer conn.release();
-		_ = conn.exec("insert into logdk.tokens (id) values ($1)", .{&id}) catch |err| {
-			return logdk.dbErr("Tokens.create", err, conn, env.logger);
-		};
-	}
-
+	const id = try env.app.tokens.create(env);
 	res.status = 201;
 	return res.json(.{.id = id}, .{});
 }

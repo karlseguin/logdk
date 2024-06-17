@@ -7,6 +7,11 @@ const web = logdk.web;
 const Event = logdk.Event;
 
 pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void {
+	if (env.settings.create_tokens and validateToken(env, req, res) == false) {
+		// validateToken writes the response
+		return;
+	}
+
 	const app = env.app;
 	const name = req.params.get("name").?;
 
@@ -56,6 +61,22 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 
 	app.dispatcher.send(logdk.DataSet, arc.?.value.actor_id, .{.record = event_list});
 	res.status = 204;
+}
+
+const MISSING_TOKEN = web.Error.init(401, logdk.codes.MISSING_TOKEN, "access token required to create events");
+const INVALID_TOKEN = web.Error.init(403, logdk.codes.INVALID_TOKEN, "access token is invalid");
+
+fn validateToken(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) bool {
+	const token = req.header("token") orelse {
+		_ = MISSING_TOKEN.write(res);
+		return false;
+	};
+
+	if (env.app.tokens.contains(token) == false) {
+		_ = INVALID_TOKEN.write(res);
+		return false;
+	}
+	return true;
 }
 
 const t = logdk.testing;
@@ -239,4 +260,50 @@ test "events.create: unparsable field disabled column parsed flag" {
 		try t.expectEqual(1, ds.parsed_fields.len);
 		try t.expectEqual("active", ds.parsed_fields[0]);
 	}
+}
+
+test "events.create: no token when token required" {
+	var tc = t.context(.{});
+	defer tc.deinit();
+	try tc.app._settings.setValue(.{.create_tokens = true});
+
+	tc.web.param("name", "logx_y");
+	try handler(tc.env(), tc.web.req, tc.web.res);
+
+	try tc.web.expectStatus(401);
+	try tc.web.expectJson(.{
+		.code = 11,
+		.err = "access token required to create events",
+	});
+}
+
+test "events.create: invalid token when token required" {
+	var tc = t.context(.{});
+	defer tc.deinit();
+	try tc.app._settings.setValue(.{.create_tokens = true});
+
+	tc.web.header("token", "hack");
+	tc.web.param("name", "logx_y");
+	try handler(tc.env(), tc.web.req, tc.web.res);
+
+	try tc.web.expectStatus(403);
+	try tc.web.expectJson(.{
+		.code = 12,
+		.err = "access token is invalid",
+	});
+}
+
+
+test "events.create: create event with correct access token" {
+	var tc = t.context(.{});
+	defer tc.deinit();
+	try tc.app._settings.setValue(.{.create_tokens = true});
+	const token = try tc.app.tokens.create(tc.env());
+
+	tc.web.header("token", &token);
+	tc.web.param("name", "logx_y");
+	tc.web.json(.{.id = 999});
+	try handler(tc.env(), tc.web.req, tc.web.res);
+
+	try tc.web.expectStatus(204);
 }

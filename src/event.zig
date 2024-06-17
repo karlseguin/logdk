@@ -123,7 +123,9 @@ pub const Event = struct {
 		var scanner = json.Scanner.initCompleteInput(aa, owned);
 		defer scanner.deinit();
 
-		const events = switch (try scanner.next()) {
+		const token = scanner.next() catch return error.InvalidJson;
+
+		const events = switch (token) {
 			.array_begin => try Parser.bulk(aa, &scanner),
 			.object_begin => try Parser.singleAsList(aa, &scanner),
 			else => return error.UnexpectedToken,

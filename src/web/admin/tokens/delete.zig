@@ -7,7 +7,7 @@ const web = logdk.web;
 
 pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void {
 	const id = req.param("id").?;
-	_ = try env.app.db.exec("delete from logdk.tokens where id = $1", .{id});
+	try env.app.tokens.delete(env, id);
 	res.status = 204;
 }
 

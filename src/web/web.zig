@@ -368,7 +368,7 @@ pub const Error = struct {
 	status: u16,
 	body: []const u8,
 
-	fn init(status: u16, comptime code: i32, comptime message: []const u8) Error {
+	pub fn init(status: u16, comptime code: i32, comptime message: []const u8) Error {
 		const body = std.fmt.comptimePrint("{{\"code\": {d}, \"err\": \"{s}\"}}", .{code, message});
 		return .{
 			.code = code,

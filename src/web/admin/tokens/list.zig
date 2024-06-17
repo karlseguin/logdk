@@ -14,7 +14,7 @@ pub fn handler(env: *logdk.Env, _: *httpz.Request, res: *httpz.Response) !void {
 	defer conn.release();
 
 	var rows = conn.query(sql, .{}) catch |err| {
-		return logdk.dbErr("Tokens.list", err, conn, env.logger);
+		return env.dbErr("Tokens.list", err, conn);
 	};
 	defer rows.deinit();
 

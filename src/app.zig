@@ -66,6 +66,9 @@ pub const App = struct {
 
 	_settings: zul.LockRefArc(Settings),
 
+	// wraps an std.StringHashMap and mutex for looking up an app token
+	tokens: Tokens,
+
 	pub fn init(allocator: Allocator, config: logdk.Config) !App{
 		var open_err: ?[]u8 = null;
 		const db = zuckdb.DB.initWithErr(allocator, config.db.path, .{.enable_external_access = false}, &open_err) catch |err| {
@@ -75,15 +78,16 @@ pub const App = struct {
 			}
 			return err;
 		};
+
 		var db_pool = try db.pool(.{.size = config.db.pool_size, .timeout = config.db.pool_timeout});
 		errdefer db_pool.deinit();
 
-		const settings = blk: {
-			var conn = try db_pool.acquire();
-			defer conn.release();
-			try @import("migrations/migrations.zig").run(conn);
-			break :blk try loadSettings(allocator, conn);
-		};
+		var conn = try db_pool.acquire();
+		defer conn.release();
+
+		try @import("migrations/migrations.zig").run(conn);
+
+		const settings = try loadSettings(allocator, conn);
 
 		var validator_pool = try ValidatorPool(void).init(allocator, config.validator);
 		errdefer validator_pool.deinit();
@@ -103,12 +107,16 @@ pub const App = struct {
 		var settings_ref = try zul.LockRefArc(Settings).init(allocator, settings);
 		errdefer settings_ref.deinit();
 
+		var tokens = try Tokens.load(allocator, conn);
+		errdefer tokens.deinit();
+
 		return .{
 			.meta = meta,
 			._create_lock = .{},
 			.allocator = allocator,
 			.validators = validator_pool,
 			.db = db_pool,
+			.tokens = tokens,
 			.buffers = buffers,
 			.scheduler = scheduler,
 			.dispatcher = dispatcher,
@@ -127,6 +135,7 @@ pub const App = struct {
 		self.dispatcher.deinit();
 
 		self.db.deinit();
+		self.tokens.deinit();
 		self.buffers.deinit();
 		self.validators.deinit();
 		self._settings.deinit();
@@ -310,6 +319,97 @@ fn loadSettings(allocator: Allocator, conn: *zuckdb.Conn) !App.Settings {
 
 	return parsed.value;
 }
+
+const Tokens = struct {
+	allocator: Allocator,
+	mutex: Thread.RwLock,
+	lookup: std.StringHashMapUnmanaged(void),
+
+	fn load(allocator: Allocator, conn: *zuckdb.Conn) !Tokens {
+		var rows = conn.query("select id from logdk.tokens", .{}) catch |err| {
+			return logdk.dbErr("Tokens.load", err, conn, logz.err());
+		};
+		defer rows.deinit();
+
+		var lookup = std.StringHashMapUnmanaged(void){};
+		while (try rows.next()) |row| {
+			const id = try allocator.dupe(u8, row.get([]const u8, 0));
+			try lookup.put(allocator, id, {});
+		}
+
+		return .{
+			.mutex = .{},
+			.lookup = lookup,
+			.allocator = allocator,
+		};
+	}
+
+	fn deinit(self: *Tokens) void {
+		const allocator = self.allocator;
+
+		var it = self.lookup.keyIterator();
+		while (it.next()) |k| {
+			allocator.free(k.*);
+		}
+		self.lookup.deinit(allocator);
+	}
+
+	pub fn contains(self: *Tokens, id: []const u8) bool {
+		self.mutex.lockShared();
+		defer self.mutex.unlockShared();
+		return self.lookup.contains(id);
+	}
+
+	pub fn create(self: *Tokens, env: *Env) ![30]u8 {
+		const allocator = self.allocator;
+		const CHARS = "abcdefghijklmnopqrtuvwxyz0123456789_-=";
+
+		var id: [30]u8 = undefined;
+		std.crypto.random.bytes(&id);
+		for (&id) |*b| {
+			b.* = CHARS[@mod(b.*, CHARS.len)];
+		}
+
+		{
+			var conn = try env.app.db.acquire();
+			defer conn.release();
+			_ = conn.exec("insert into logdk.tokens (id) values ($1)", .{&id}) catch |err| {
+				return env.dbErr("Tokens.create", err, conn);
+			};
+		}
+
+		const owned = try allocator.dupe(u8, &id);
+		errdefer allocator.free(owned);
+
+		self.mutex.lock();
+		defer self.mutex.unlock();
+		try self.lookup.put(allocator, owned, {});
+
+		// This is why `id` is an array. We need to be able to return the value
+		// to the caller. If `id` was a slice, and we used that slice as the key
+		// to our map, another thread could delete the entry and thus invalidate the slice
+		return id;
+	}
+
+	pub fn delete(self: *Tokens, env: *Env, id: []const u8) !void {
+		{
+			var conn = try env.app.db.acquire();
+			defer conn.release();
+
+			_ = conn.exec("delete from logdk.tokens where id = $1", .{id}) catch |err| {
+				return env.dbErr("Tokens.delete", err, conn);
+			};
+		}
+
+		self.mutex.lock();
+		const key = self.lookup.fetchRemove(id);
+		self.mutex.unlock();
+
+		if (key) |kv| {
+			self.allocator.free(kv.key);
+		}
+	}
+};
 
 const t = logdk.testing;
 test "App: loadDataSets" {
@@ -510,4 +610,43 @@ test "App: settings" {
 		try t.expectEqual(true, parsed.value.create_tokens);
 		try t.expectEqual(false, parsed.value.dataset_creation);
 	}
+}
+
+test "App: tokens" {
+	var tc = t.context(.{});
+	defer tc.deinit();
+
+	const env = tc.env();
+	const app = env.app;
+
+	try t.expectEqual(false, app.tokens.contains("token-x"));
+	try app.tokens.delete(env, "token-x");
+
+	const id1 = try app.tokens.create(env);
+	const id2 = try app.tokens.create(env);
+	const id3 = try app.tokens.create(env);
+
+	try t.expectEqual(false, app.tokens.contains("token-x"));
+	try app.tokens.delete(env, "token-x");
+
+	try t.expectEqual(true, app.tokens.contains(&id1));
+	try t.expectEqual(true, app.tokens.contains(&id2));
+	try t.expectEqual(true, app.tokens.contains(&id3));
+
+	try app.tokens.delete(env, &id1);
+	try t.expectEqual(false, app.tokens.contains(&id1));
+	try t.expectEqual(true, app.tokens.contains(&id2));
+	try t.expectEqual(true, app.tokens.contains(&id3));
+
+	// this is a hack, but we want to test the initial load
+	app.tokens.deinit();
+	{
+		var conn = try app.db.acquire();
+		defer conn.release();
+		app.tokens = try Tokens.load(app.allocator, conn);
+	}
+
+	try t.expectEqual(false, app.tokens.contains(&id1));
+	try t.expectEqual(true, app.tokens.contains(&id2));
+	try t.expectEqual(true, app.tokens.contains(&id3));
 }

@@ -13,7 +13,7 @@ pub fn handler(env: *logdk.Env, _: *httpz.Request, res: *httpz.Response) !void {
 	var conn = try app.db.acquire();
 	defer conn.release();
 	var rows = conn.query(sql, .{}) catch |err| {
-		return logdk.dbErr("Users.list", err, conn, env.logger);
+		return env.dbErr("Users.list", err, conn);
 	};
 	defer rows.deinit();
 

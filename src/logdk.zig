@@ -32,6 +32,8 @@ pub const codes = struct {
 	pub const ILLEGAL_DB_WRITE = 8;
 	pub const INVALID_AUTHENTICATION_TOKEN = 9;
 	pub const PERMISSION_DENIED = 10;
+	pub const MISSING_TOKEN = 11;
+	pub const INVALID_TOKEN = 12;
 };
 
 const logz = @import("logz");
