@@ -2,6 +2,8 @@ const std = @import("std");
 const httpz = @import("httpz");
 const zuckdb = @import("zuckdb");
 
+const Allocator = std.mem.Allocator;
+
 const logdk = @import("../../../logdk.zig");
 const web = logdk.web;
 const Event = logdk.Event;
@@ -22,9 +24,21 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 		break :blk null;
 	};
 
-	defer if (arc) |arc_| arc_.release();
+	defer if (arc) |a| a.release();
 
-	const event_list = Event.parse(app.allocator, req.body() orelse "") catch return error.InvalidJson;
+	var body = req.body() orelse {
+		res.status = 204;
+		return;
+	};
+
+	if (req.header("content-encoding")) |ce| {
+		// decodeBody either returns the decoded body, or null on error
+		// If null is returned, decodeBody wrote the error response already
+		body = decodeBody(env, req.arena, body, ce, res) orelse return;
+	}
+
+
+	const event_list = Event.parse(app.allocator, body) catch return error.InvalidJson;
 	if (event_list.events.len == 0) {
 		event_list.deinit();
 		res.status = 204;
@@ -53,7 +67,7 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 			// Even though this is (most likely) user-input error, we want to log it
 			// since creating datasets is fairly uncommon and intentional and the creator
 			// would probably be surprised to find out that it failed.
-			env.logger.level(.Warn).ctx("validation.dataset.name").string("name", name).log();
+			env.logger.level(.Warn).ctx("events.create.dataset.name").string("name", name).log();
 			return err;
 		};
 		arc = try app.createDataSet(env, name, event_list.events[0]);
@@ -65,6 +79,8 @@ pub fn handler(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) !void
 
 const MISSING_TOKEN = web.Error.init(401, logdk.codes.MISSING_TOKEN, "access token required to create events");
 const INVALID_TOKEN = web.Error.init(403, logdk.codes.INVALID_TOKEN, "access token is invalid");
+const UNSUPPORTED_CONTENT_ENCODING = web.Error.init(400, logdk.codes.UNSUPPORTED_CONTENT_ENCODING, "content-encoding is not supported");
+const DECOMPRESSION_ERROR = web.Error.init(400, logdk.codes.DECOMPRESSION_ERROR, "failed to decompress event(s)");
 
 fn validateToken(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) bool {
 	const token = req.header("token") orelse {
@@ -77,6 +93,20 @@ fn validateToken(env: *logdk.Env, req: *httpz.Request, res: *httpz.Response) boo
 		return false;
 	}
 	return true;
+}
+
+fn decodeBody(env: *logdk.Env, allocator: Allocator, body: []const u8, encoding: []const u8, res: *httpz.Response) ?[]const u8 {
+	if (std.mem.eql(u8, encoding, "zstd")) {
+		return std.compress.zstd.decompress.decodeAlloc(allocator, body, true, 8_388_608) catch |err| {
+			env.logger.level(.Error).ctx("events.create.decode").stringSafe("type", "zstd").err(err).log();
+			_ = DECOMPRESSION_ERROR.write(res);
+			return null;
+		};
+	}
+
+	env.logger.level(.Warn).ctx("events.create.content-encoding").string("content-encoding", encoding).log();
+	_ = UNSUPPORTED_CONTENT_ENCODING.write(res);
+	return null;
 }
 
 const t = logdk.testing;
@@ -293,7 +323,6 @@ test "events.create: invalid token when token required" {
 	});
 }
 
-
 test "events.create: create event with correct access token" {
 	var tc = t.context(.{});
 	defer tc.deinit();
@@ -306,4 +335,69 @@ test "events.create: create event with correct access token" {
 	try handler(tc.env(), tc.web.req, tc.web.res);
 
 	try tc.web.expectStatus(204);
+}
+
+test "events.create: content-encoding unsupported" {
+	var tc = t.context(.{});
+	defer tc.deinit();
+	tc.silenceLogs();
+
+	tc.web.param("name", "logx_y");
+	tc.web.body("{\"id\": 1}");
+	tc.web.header("content-encoding", "gzip");
+	try handler(tc.env(), tc.web.req, tc.web.res);
+
+	try tc.web.expectStatus(400);
+	try tc.web.expectJson(.{
+		.code = 13,
+		.err = "content-encoding is not supported",
+	});
+}
+
+test "events.create: content-encoding zstd invalid" {
+	var tc = t.context(.{});
+	defer tc.deinit();
+	tc.silenceLogs();
+
+	tc.web.param("name", "logx_y");
+	tc.web.body("{\"id\": 1}");
+	tc.web.header("content-encoding", "zstd");
+	try handler(tc.env(), tc.web.req, tc.web.res);
+
+	try tc.web.expectStatus(400);
+	try tc.web.expectJson(.{
+		.code = 14,
+		.err = "failed to decompress event(s)",
+	});
+}
+
+test "events.create: content-encoding zstd ok" {
+	var tc = t.context(.{});
+	defer tc.deinit();
+
+	tc.web.param("name", "logx_y");
+	tc.web.body(&.{0x28, 0xb5, 0x2f, 0xfd, 0x24, 0x15, 0xa9, 0x00, 0x00, 0x7b, 0x22, 0x69, 0x64, 0x22, 0x3a, 0x20, 0x22, 0x7a, 0x73, 0x74, 0x64, 0x2d, 0x65, 0x76, 0x65, 0x6e, 0x74, 0x22, 0x7d, 0x0a, 0x17, 0x51, 0xc6, 0x1d});
+	tc.web.header("content-encoding", "zstd");
+	try handler(tc.env(), tc.web.req, tc.web.res);
+
+	try tc.web.expectStatus(204);
+}
+
+test "events.create: content-encoding zstd" {
+	var tc = t.context(.{});
+	defer tc.deinit();
+
+	tc.web.param("name", "log_ce");
+	// {"id": "zstd-event"}
+	tc.web.body(&.{0x28, 0xb5, 0x2f, 0xfd, 0x24, 0x15, 0xa9, 0x00, 0x00, 0x7b, 0x22, 0x69, 0x64, 0x22, 0x3a, 0x20, 0x22, 0x7a, 0x73, 0x74, 0x64, 0x2d, 0x65, 0x76, 0x65, 0x6e, 0x74, 0x22, 0x7d, 0x0a, 0x17, 0x51, 0xc6, 0x1d});
+	tc.web.header("content-encoding", "zstd");
+	try handler(tc.env(), tc.web.req, tc.web.res);
+
+	try tc.web.expectStatus(204);
+
+	tc.flushMessages();
+
+	const row = (try tc.row("select id from log_ce", .{})).?;
+	defer row.deinit();
+	try t.expectEqual("zstd-event", row.get([]const u8, 0));
 }

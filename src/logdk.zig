@@ -34,6 +34,8 @@ pub const codes = struct {
 	pub const PERMISSION_DENIED = 10;
 	pub const MISSING_TOKEN = 11;
 	pub const INVALID_TOKEN = 12;
+	pub const UNSUPPORTED_CONTENT_ENCODING = 13;
+	pub const DECOMPRESSION_ERROR = 14;
 };
 
 const logz = @import("logz");
