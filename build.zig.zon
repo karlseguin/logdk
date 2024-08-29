@@ -31,12 +31,9 @@
       .url = "https://github.com/karlseguin/zuckdb.zig/archive/9b62c3fd6e77196245f260021e836ab136e28b7a.tar.gz",
       .hash = "1220f89a531cb5154b9c3846b5705a9ad5570bfec77e3cc466a0bb91889a5c88e8c8"
     },
-//    .zul = .{
-//      .url = "https://github.com/karlseguin/zul/archive/ae0c27350c0db6b460f22cba30b6b0c4a02d1ffd.tar.gz",
-//      .hash = "1220457e2c8867f6734520d9b335f01e1d851d6fe7adaa7f6f0756158acaf6c5e87f"
-//    }
     .zul = .{
-      .path = "../../karl/zul",
+      .url = "https://github.com/karlseguin/zul/archive/ae0c27350c0db6b460f22cba30b6b0c4a02d1ffd.tar.gz",
+      .hash = "1220457e2c8867f6734520d9b335f01e1d851d6fe7adaa7f6f0756158acaf6c5e87f"
     }
   },
 }

@@ -81,7 +81,7 @@ pub fn start(app: *App, config: *const Config) !void {
         router.delete("/api/1/tokens/:id", admin.tokens.delete, .{ .handler = &df.create("tokens_delete", .admin) });
     }
 
-    router.get("/*", ui.handler, .{ .dispatcher = undefined });
+    router.get("/*", ui.handler, .{ .dispatcher = Dispatcher.direct });
 
     logz.info().ctx("http.listen")
         .fmt("address", "http://{s}:{d}", .{ server.config.address.?, server.config.port.? })
@@ -207,6 +207,10 @@ const Dispatcher = struct {
                 .int("ms", std.time.milliTimestamp() - start_time)
                 .log();
         }
+    }
+
+    pub fn direct(_: *const Dispatcher, action: httpz.Action(*Env), req: *httpz.Request, res: *httpz.Response) !void {
+        return action(undefined, req, res);
     }
 
     fn loadUserFromSessionId(self: *const Dispatcher, session_id: []const u8) !?User {

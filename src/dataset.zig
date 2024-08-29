@@ -132,7 +132,7 @@ pub const DataSet = struct {
     }
 
     pub fn schedulePurge(self: *DataSet, first: bool) void {
-        const delay = if (first) 0 else std.time.ms_per_hour * 4
+        const delay: i64 = if (first) std.time.ms_per_min else std.time.ms_per_hour * 4;
         self.app.scheduler.scheduleIn(.{ .purge = self.actor_id }, delay) catch |err| {
             self.logger.level(.Error).ctx("DataSet.schedulePurge").err(err).log();
         };
@@ -550,7 +550,7 @@ pub const DataSet = struct {
     }
 
     fn purge(self: *DataSet) !void {
-        const purge_after_us = self.purge_after_us oresle return;
+        const purge_after_us = self.purge_after_us orelse return;
 
         defer self.schedulePurge(false);
         const cutoff = std.time.microTimestamp() - purge_after_us;
