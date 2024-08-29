@@ -1,6 +1,5 @@
 const std = @import("std");
 const logz = @import("logz");
-const cache = @import("cache");
 const zuckdb = @import("zuckdb");
 const logdk = @import("logdk.zig");
 
@@ -15,9 +14,6 @@ pub const Env = struct {
 
     // should be loaded via the env.validator() function
     _validator: ?*logdk.Validate.Context = null,
-
-    // cannot be null, web dispatcher will set this to an anonymous user if needed
-    user: logdk.auth.User,
 
     // App.Settings can change (settings can be updated), but this is a snapshot
     // of settings when the request began (achieved through an Arc Mutext). This

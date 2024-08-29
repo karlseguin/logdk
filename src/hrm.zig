@@ -5,7 +5,7 @@ const httpz = @import("httpz");
 const zuckdb = @import("zuckdb");
 const logdk = @import("logdk.zig");
 
-// hrm -> http relationalmapping.
+// hrm -> http relational mapping.
 //
 // This project is essentially taking input from HTTP and mapping it to an SQL
 // query, or taking a result from DuckDB and writing it as an HTTP response.

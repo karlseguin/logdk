@@ -98,12 +98,6 @@ pub const Context = struct {
         self.app.scheduler.start(self.app) catch unreachable;
     }
 
-    pub fn envWithUser(self: *Context, user: logdk.auth.User) *Env {
-        var e = self.env();
-        e.user = user;
-        return e;
-    }
-
     pub fn silenceLogs(self: *Context) void {
         logz.setLevel(.None);
         self.reset_log_level = true;
@@ -131,11 +125,9 @@ pub const Context = struct {
         if (self._env) |e| {
             return e;
         }
-
         const app = self.app;
         const e = self.arena.create(Env) catch unreachable;
         e.* = Env{
-            .user = .{ .id = 0 },
             .app = app,
             .settings = &app._settings.arc.value,
             .logger = logz.logger().multiuse(),
@@ -234,41 +226,6 @@ pub const Context = struct {
 
 const Factory = struct {
     ctx: *Context,
-
-    pub fn user(self: Factory, args: anytype) void {
-        const T = @TypeOf(args);
-
-        var ctx = self.ctx;
-
-        var password: []const u8 = "";
-        var pw_buf: [300]u8 = undefined;
-        if (@hasField(T, "password")) {
-            const argon2 = std.crypto.pwhash.argon2;
-            password = argon2.strHash(args.password, .{
-                .allocator = ctx.arena,
-                .params = argon2.Params.fromLimits(1, 1024),
-            }, &pw_buf) catch unreachable;
-        }
-
-        // cannot yet bind arrays to duckdb prepared statements, but we can
-        // insert it as json, and duckdb will convert
-        var permissions: []const u8 = "[]";
-        if (@hasField(T, "permissions")) {
-            permissions = std.json.stringifyAlloc(ctx.arena, args.permissions, .{}) catch unreachable;
-        }
-
-        ctx.exec(
-            \\ insert into logdk.users (id, password, permissions, username, enabled, created)
-            \\ values ($1, $2, $3::json, $4, $5, $6)
-        , .{
-            args.id,
-            password,
-            permissions,
-            if (@hasField(T, "username")) args.username else "teg",
-            if (@hasField(T, "enabled")) args.enabled else true,
-            if (@hasField(T, "created")) args.created else std.time.microTimestamp(),
-        }) catch unreachable;
-    }
 
     pub fn token(self: Factory, args: anytype) void {
         const T = @TypeOf(args);

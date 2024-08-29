@@ -294,7 +294,7 @@ test "events.create: unparsable field disabled column parsed flag" {
 test "events.create: no token when token required" {
     var tc = t.context(.{});
     defer tc.deinit();
-    try tc.app._settings.setValue(.{ .create_tokens = true });
+    try tc.app.saveSettings(.{ .create_tokens = true });
 
     tc.web.param("name", "logx_y");
     try handler(tc.env(), tc.web.req, tc.web.res);
@@ -309,7 +309,7 @@ test "events.create: no token when token required" {
 test "events.create: invalid token when token required" {
     var tc = t.context(.{});
     defer tc.deinit();
-    try tc.app._settings.setValue(.{ .create_tokens = true });
+    try tc.app.saveSettings(.{ .create_tokens = true });
 
     tc.web.header("token", "hack");
     tc.web.param("name", "logx_y");
@@ -323,10 +323,15 @@ test "events.create: invalid token when token required" {
 }
 
 test "events.create: create event with correct access token" {
+    const token = blk: {
+        var tc = t.context(.{});
+        defer tc.deinit();
+        try tc.app.saveSettings(.{ .create_tokens = true });
+        break :blk try tc.app.tokens.create(tc.env());
+    };
+
     var tc = t.context(.{});
     defer tc.deinit();
-    try tc.app._settings.setValue(.{ .create_tokens = true });
-    const token = try tc.app.tokens.create(tc.env());
 
     tc.web.header("token", &token);
     tc.web.param("name", "logx_y");

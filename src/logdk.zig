@@ -6,7 +6,6 @@ pub const dispatcher = @import("dispatcher.zig");
 pub const hrm = @import("hrm.zig");
 pub const binder = @import("binder.zig");
 
-pub const auth = @import("auth.zig");
 pub const App = @import("app.zig").App;
 pub const Env = @import("env.zig").Env;
 pub const Meta = @import("meta.zig").Meta;

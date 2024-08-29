@@ -254,31 +254,31 @@ pub const App = struct {
     pub fn getSettings(self: *App) *zul.LockRefArc(Settings).Arc {
         return self._settings.acquire();
     }
-
+    pub fn reloadSettings(self: *App) !void {
+        var conn = try self.db.acquire();
+        defer conn.release();
+        try self._settings.setValue(try loadSettings(self.allocator, conn));
+    }
     pub fn saveSettings(self: *App, new: Settings) !void {
         {
             var conn = try self.db.acquire();
             defer conn.release();
+            var buf = try self.buffers.acquire();
+            defer buf.release();
+            try std.json.stringify(new, .{}, buf.writer());
 
-            {
-                var buf = try self.buffers.acquire();
-                defer buf.release();
-                try std.json.stringify(new, .{}, buf.writer());
-
-                _ = try conn.exec(
-                    \\ insert into logdk.settings (id, settings) values (1, $1)
-                    \\ on conflict do update set settings = $1
-                , .{buf.string()});
-            }
-
-            try self._settings.setValue(try loadSettings(self.allocator, conn));
+            _ = try conn.exec(
+                \\ insert into logdk.settings (id, settings) values (1, $1)
+                \\ on conflict do update set settings = $1
+            , .{buf.string()});
         }
 
+        try self.reloadSettings();
         self.meta.describeChanged();
     }
 
     pub const Settings = struct {
-        single_user: bool = false,
+        open_access: bool = false,
         create_tokens: bool = false,
         dataset_creation: bool = true,
 
@@ -294,7 +294,7 @@ pub const App = struct {
 };
 
 fn loadSettings(allocator: Allocator, conn: *zuckdb.Conn) !App.Settings {
-    // single_user is true when there are no enabled users with admin permission
+    // open_access is true when there are no tokens
     const sql =
         \\ with settings as (
         \\   select
@@ -303,13 +303,12 @@ fn loadSettings(allocator: Allocator, conn: *zuckdb.Conn) !App.Settings {
         \\     end as data
         \\   from (select count(*) as cnt from logdk.settings)
         \\ ),
-        \\   single_user as (
-        \\     select json_object('single_user', count(*) = 0) as data
-        \\     from logdk.users
-        \\     where enabled and list_contains(permissions, 'admin')
+        \\   open_access as (
+        \\     select json_object('open_access', count(*) = 0) as data
+        \\     from logdk.tokens
         \\ )
-        \\ select json_merge_patch(settings.data, single_user.data)
-        \\ from settings, single_user
+        \\ select json_merge_patch(settings.data, open_access.data)
+        \\ from settings, open_access
     ;
 
     var row = (try conn.row(sql, .{})) orelse unreachable;
@@ -385,9 +384,17 @@ const Tokens = struct {
         const owned = try allocator.dupe(u8, &id);
         errdefer allocator.free(owned);
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        try self.lookup.put(allocator, owned, {});
+        const reload_settings = blk: {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            try self.lookup.put(allocator, owned, {});
+            break :blk self.lookup.count() == 1;
+        };
+
+        if (reload_settings) {
+            // don't want to do this under lock
+           try env.app.reloadSettings();
+        }
 
         // This is why `id` is an array. We need to be able to return the value
         // to the caller. If `id` was a slice, and we used that slice as the key
@@ -405,12 +412,17 @@ const Tokens = struct {
             };
         }
 
-        self.mutex.lock();
-        const key = self.lookup.fetchRemove(id);
-        self.mutex.unlock();
+        const key, const reload_settings = blk: {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            break :blk .{self.lookup.fetchRemove(id), self.lookup.count() == 0};
+        };
 
         if (key) |kv| {
             self.allocator.free(kv.key);
+            if (reload_settings) {
+                try env.app.reloadSettings();
+            }
         }
     }
 };
@@ -588,18 +600,18 @@ test "App: settings" {
         // defaults
         var settings = app.getSettings();
         defer settings.release();
-        try t.expectEqual(true, settings.value.single_user);
+        try t.expectEqual(true, settings.value.open_access);
         try t.expectEqual(false, settings.value.create_tokens);
         try t.expectEqual(true, settings.value.dataset_creation);
     }
 
     {
-        // single user can't be persisted
+        // open access can't be persisted
         // (but its in-memory can be updated, which might not be the right behavior)
-        try app.saveSettings(.{ .single_user = true, .create_tokens = true, .dataset_creation = false });
+        try app.saveSettings(.{ .open_access = true, .create_tokens = true, .dataset_creation = false });
         var settings = app.getSettings();
         defer settings.release();
-        try t.expectEqual(true, settings.value.single_user);
+        try t.expectEqual(true, settings.value.open_access);
         try t.expectEqual(true, settings.value.create_tokens);
         try t.expectEqual(false, settings.value.dataset_creation);
 
@@ -607,11 +619,11 @@ test "App: settings" {
         const parsed = try std.json.parseFromSlice(struct {
             create_tokens: bool,
             dataset_creation: bool,
-            single_user: i32 = 1, // hack, if saveSettings _did_ write single_user, than we'd fail to parse its bool value
+            open_access: i32 = 1, // hack, if saveSettings _did_ write single_user, than we'd fail to parse its bool value
         }, t.allocator, json, .{});
         defer parsed.deinit();
 
-        try t.expectEqual(1, parsed.value.single_user);
+        try t.expectEqual(1, parsed.value.open_access);
         try t.expectEqual(true, parsed.value.create_tokens);
         try t.expectEqual(false, parsed.value.dataset_creation);
     }

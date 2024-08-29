@@ -46,7 +46,7 @@ test "settings.update: success" {
     tc.web.json(.{
         .create_tokens = true,
         .dataset_creation = false,
-        .single_user = false, // ignored
+        .open_access = false, // ignored
         .misc = 123, // ignored
     });
 
@@ -57,7 +57,7 @@ test "settings.update: success" {
         const settings = tc.app.getSettings();
         defer settings.release();
 
-        try t.expectEqual(true, settings.value.single_user);
+        try t.expectEqual(true, settings.value.open_access);
         try t.expectEqual(true, settings.value.create_tokens);
         try t.expectEqual(false, settings.value.dataset_creation);
     }
