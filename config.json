@@ -13,8 +13,7 @@
 			"max_query_count": 32
 		},
 		"response": {
-			"max_header_count": 5,
-			"body_buffer_size": 524288
+			"max_header_count": 5
 		}
 	}
 }
