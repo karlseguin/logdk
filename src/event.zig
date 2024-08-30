@@ -600,7 +600,7 @@ fn testTryParseString(str: []const u8) ?Event.Value {
 }
 
 fn assertEvent(expected: anytype, actual: Event) !void {
-    const fields = @typeInfo(@TypeOf(expected)).Struct.fields;
+    const fields = @typeInfo(@TypeOf(expected)).@"struct".fields;
     try t.expectEqual(fields.len, actual.fieldCount());
 
     inline for (fields) |f| {

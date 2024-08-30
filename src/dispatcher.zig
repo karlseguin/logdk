@@ -45,7 +45,7 @@ pub fn Dispatcher(comptime Q: type) type {
 
         fn startWorkers(allocator: Allocator, queues: Q) ![]Thread {
             var queue_count: usize = 0;
-            inline for (@typeInfo(Q).Struct.fields) |field| {
+            inline for (@typeInfo(Q).@"struct".fields) |field| {
                 queue_count += @field(queues, field.name).list.len;
             }
 
@@ -53,7 +53,7 @@ pub fn Dispatcher(comptime Q: type) type {
             var threads = try allocator.alloc(Thread, queue_count);
             errdefer blk: {
                 var j: usize = 0;
-                inline for (@typeInfo(Q).Struct.fields) |field| {
+                inline for (@typeInfo(Q).@"struct".fields) |field| {
                     for (@field(queues, field.name).list) |*tq| {
                         tq.enqueue(.{ .stop = {} });
                         threads[j].join();
@@ -63,7 +63,7 @@ pub fn Dispatcher(comptime Q: type) type {
                 }
             }
 
-            inline for (@typeInfo(Q).Struct.fields) |field| {
+            inline for (@typeInfo(Q).@"struct".fields) |field| {
                 for (@field(queues, field.name).list) |*tq| {
                     threads[started] = try Thread.spawn(.{}, @TypeOf(tq.*).run, .{tq});
                     started += 1;
@@ -87,7 +87,7 @@ pub fn Dispatcher(comptime Q: type) type {
             if (self.threads.len == 0) return;
 
             var i: usize = 0;
-            inline for (@typeInfo(Q).Struct.fields) |field| {
+            inline for (@typeInfo(Q).@"struct".fields) |field| {
                 for (@field(self.queues, field.name).list) |*tq| {
                     tq.enqueue(.{ .stop = {} });
                     self.threads[i].join();
