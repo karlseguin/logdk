@@ -33,33 +33,34 @@ pub fn start(app: *App, config: *const Config) !void {
     const allocator = app.allocator;
 
     const http_config = config.http;
-    var server = try httpz.Server(*const Dispatcher).init(allocator, http_config, undefined);
+    var dispatcher = Dispatcher{
+        .app = app,
+    };
+
+    var server = try httpz.Server(*const Dispatcher).init(allocator, http_config, &dispatcher);
     defer server.deinit();
 
     app._webserver = &server;
 
     const router = server.router();
 
-    // We create a dispatcher per route, since each has a unique route name, each
-    // may have its own permission, and who knows what else. But in all cases
-    // it's a &Dispatcher, just with a 1 or 2 different fields. This factory just
-    // makes creating the dispatchers a little cleaner.
-    const df = Dispatcher.Factory.init(app, config);
+    const log_request = config.log_http != .none;
+
+    router.get("/metrics", info.metrics, .{ .dispatcher = Dispatcher.direct });
 
     {
-        router.get("/metrics", info.metrics, .{ .dispatcher = undefined });
+        var api_routes = router.group("/api/", .{});
+        api_routes.get("/1/datasets/:name/events", datasets.events.list, .{ .data = &Dispatcher.Route{.name = "events_list", .log = log_request }});
+        api_routes.post("/1/datasets/:name/events", datasets.events.create, .{ .data = &Dispatcher.Route{.name = "events_create", .log = config.log_http == .all  }});
+        api_routes.get("/1/exec", exec.handler, .{ .data = &Dispatcher.Route{.name = "exec_sql", .log = log_request }});
+        api_routes.get("/1/info", info.info, .{ .data = &Dispatcher.Route{.name = "info", .log = log_request }});
+        api_routes.get("/1/describe", info.describe, .{ .data = &Dispatcher.Route{.name = "describe", .log = log_request }});
 
-        router.get("/api/1/datasets/:name/events", datasets.events.list, .{ .handler = &df.create("events_list") });
-        router.post("/api/1/datasets/:name/events", datasets.events.create, .{ .handler = &df.create("events_create") });
-        router.get("/api/1/exec", exec.handler, .{ .handler = &df.create("exec_sql") });
-        router.get("/api/1/info", info.info, .{ .handler = &df.create("info") });
-        router.get("/api/1/describe", info.describe, .{ .handler = &df.create("describe") });
+        api_routes.post("/1/settings", admin.settings.update, .{ .data = &Dispatcher.Route{.name = "settigs", .log = log_request }});
 
-        router.post("/api/1/settings", admin.settings.update, .{ .handler = &df.create("settigs") });
-
-        router.get("/api/1/tokens", admin.tokens.list, .{ .handler = &df.create("tokens_list") });
-        router.post("/api/1/tokens", admin.tokens.create, .{ .handler = &df.create("tokens_create") });
-        router.delete("/api/1/tokens/:id", admin.tokens.delete, .{ .handler = &df.create("tokens_delete") });
+        api_routes.get("/1/tokens", admin.tokens.list, .{ .data = &Dispatcher.Route{.name = "tokens_list", .log = log_request }});
+        api_routes.post("/1/tokens", admin.tokens.create, .{ .data = &Dispatcher.Route{.name = "tokens_create", .log = log_request }});
+        api_routes.delete("/1/tokens/:id", admin.tokens.delete, .{ .data = &Dispatcher.Route{.name = "tokens_delete", .log = log_request }});
     }
 
     router.get("/*", ui.handler, .{ .dispatcher = Dispatcher.direct });
@@ -77,19 +78,16 @@ pub fn start(app: *App, config: *const Config) !void {
 const Dispatcher = struct {
     app: *App,
 
-    // The canonical name for the route. This is added to the request info log
-    // entry, as well as set in Route header of the response.
-    route: []const u8,
-
-    // Whether or not to log the request info. In case of an unhandled error, the
-    // request info is always logged and have a code value of
-    // `logdk.codes.INTERNAL_SERVER_ERROR_CAUGHT` (i.e. 1).
-    log_request: bool = false,
+    const Route = struct {
+        name: []const u8,
+        log: bool = true,
+    };
 
     pub fn dispatch(self: *const Dispatcher, action: httpz.Action(*Env), req: *httpz.Request, res: *httpz.Response) !void {
         const start_time = std.time.milliTimestamp();
 
-        res.header("route", self.route);
+        const route_data: *const Route = @ptrCast(@alignCast(req.route_data));
+        res.header("route", route_data.name);
 
         const request_id = @atomicRmw(u32, &request_counter, .Add, 1, .monotonic);
         // every log message generated with env.logger will include this $rid
@@ -97,7 +95,7 @@ const Dispatcher = struct {
         defer logger.release();
 
         var code: i32 = 0;
-        var log_request = self.log_request;
+        var log_request = route_data.log;
 
         const app = self.app;
         var arc_settings = app.getSettings();
@@ -144,7 +142,7 @@ const Dispatcher = struct {
             logger
                 .stringSafe("@l", "REQ")
                 .stringSafe("method", @tagName(req.method))
-                .stringSafe("route", self.route)
+                .stringSafe("route", route_data.name)
                 .string("path", req.url.path)
                 .int("status", res.status)
                 .int("code", code)
@@ -156,29 +154,6 @@ const Dispatcher = struct {
     pub fn direct(_: *const Dispatcher, action: httpz.Action(*Env), req: *httpz.Request, res: *httpz.Response) !void {
         return action(undefined, req, res);
     }
-
-    // We need to create a dispatch, but each one is quite similar, so this
-    // little factor makes it easier to create them without having to repeat
-    // their common parameters
-    const Factory = struct {
-        app: *App,
-        config: *const Config,
-
-        fn init(app: *App, config: *const Config) Factory {
-            return .{
-                .app = app,
-                .config = config,
-            };
-        }
-
-        fn create(self: *const Factory, route: []const u8) Dispatcher {
-            return .{ .app = self.app, .route = route, .log_request = switch (self.config.log_http) {
-                .all => true,
-                .none => false,
-                .smart => std.mem.eql(u8, route, "events_create") == false,
-            } };
-        }
-    };
 
     // A routing-related 404 (as opposed to an application-specific one, like a
     // request for a non-existent package). This is passed to the httpz library
