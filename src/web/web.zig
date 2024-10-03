@@ -42,7 +42,7 @@ pub fn start(app: *App, config: *const Config) !void {
 
     app._webserver = &server;
 
-    const router = server.router();
+    const router = server.router(.{});
 
     const log_request = config.log_http != .none;
 
@@ -320,7 +320,7 @@ fn testDispatcher(tc: *t.Context, opts: anytype) Dispatcher {
     _ = opts;
     return .{
         .app = tc.app,
-        .log_request = false,
+        .log = false,
         .route = "test-disaptcher",
     };
 }
