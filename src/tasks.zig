@@ -6,7 +6,6 @@ pub const Tasks = union(enum) {
     flush_dataset: usize,
 
     pub fn run(self: Tasks, app: *App, _: i64) void {
-        @import("std").debug.print("xx\n", .{});
         switch (self) {
             .purge => |actor_id| app.dispatcher.send(logdk.DataSet, actor_id, .{ .purge = {} }),
             .flush_dataset => |actor_id| app.dispatcher.send(logdk.DataSet, actor_id, .{ .flush = {} }),
